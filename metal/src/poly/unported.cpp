@@ -87,5 +87,6 @@ bool native_mmvq_slots_wide() { return false; }
 // several matrices of one input a launch (Inkling 2's projections, which Metal does not run): lin() one by one
 bool native_mmvq_jobs(int, const MmvqJobs&, int, int, int, void*) { return false; }
 bool native_rms_norm_q8_1_rows(const NormRows&, int, int, float, int, void*) { return false; }
+bool native_mmvq_jobs_mixed(const int*, const MmvqJobs&, int, int, void*) { return false; }
 
 }  // namespace strata::kernels

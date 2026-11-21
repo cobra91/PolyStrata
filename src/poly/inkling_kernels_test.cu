@@ -875,6 +875,44 @@ void test_mmvq_jobs(int type, const char* name, int n_in, int count, int rows) {
     cudaStreamDestroy(st);
 }
 
+// A visit's projections of several formats in one launch (native_mmvq_jobs_mixed(), UD-Q2_K_XL's attention) against
+// each alone, to the bit.
+void test_mmvq_jobs_mixed(int n_in, int count) {
+    namespace k = strata::kernels;
+    const int outs[8] = {3072, 3072, 384, 24, 1024, 37, 1024, 31}, types[8] = {14, 12, 8, 13, 8, 14, 13, 12};
+    void* w[8];
+    for (int i = 0; i < count; ++i) w[i] = random_weights(types[i], n_in, outs[i]);
+    cudaStream_t st;
+    ck(cudaStreamCreate(&st), "stream");
+    void* xq[3];
+    for (void*& q : xq) q = random_q8_1(n_in, 1, st);
+    size_t total = 0;
+    for (int i = 0; i < count; ++i) total += size_t(outs[i]);
+    float *ya, *yb;
+    ck(cudaMalloc(&ya, total * sizeof(float)), "malloc");
+    ck(cudaMalloc(&yb, total * sizeof(float)), "malloc");
+    k::MmvqJobs jobs{};
+    size_t at = 0;
+    for (int i = 0; i < count; ++i) {
+        const void* x = xq[i < 4 ? 0 : i % 2 ? 2 : 1];
+        k::native_mmvq(types[i], w[i], x, ya + at, n_in, outs[i], 1, st);
+        jobs.w[i] = w[i], jobs.x[i] = x, jobs.y[i] = yb + at, jobs.n_out[i] = outs[i];
+        at += size_t(outs[i]);
+    }
+    const bool took = k::native_mmvq_jobs_mixed(types, jobs, count, n_in, st);
+    const std::string what = "mmvq jobs mixed " + std::to_string(n_in) + ", " + std::to_string(count) + " matrices";
+    if (!took) {
+        std::printf("%-58s not taken  FAIL\n", what.c_str());
+        ++failures;
+    } else {
+        same_bits(what.c_str(), ya, yb, total);
+    }
+    for (int i = 0; i < count; ++i) cudaFree(w[i]);
+    for (void* p : xq) cudaFree(p);
+    cudaFree(ya), cudaFree(yb);
+    cudaStreamDestroy(st);
+}
+
 // The cached experts' launch a warp a row (MmvqSlots::lanes, MmvqIds::lanes) against each matrix alone
 // (native_mmvq()) and against the same launch without lanes, to the bit: an expert's gate and up (n_in -> n_out) of
 // `count` experts, each its own column.
@@ -2146,6 +2184,8 @@ int main(int argc, char** argv) {
         }
     }
     test_mmvq_jobs(8, "Q8_0", 2304, 2, 1);
+    for (int count : {2, 5, 8}) test_mmvq_jobs_mixed(2304, count);
+    test_mmvq_jobs_mixed(512, 8);   // 2 rows a block for every format
     // Inkling 2's experts: IQ4_NL and Q8_0 (IQ4_NL's file), Q2_0 (UD-Q2_K_XL's downs); a tail of rows
     for (int count : {1, 8}) {
         test_slots_lanes(20, "IQ4_NL", 2304, 2304, count);

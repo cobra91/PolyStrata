@@ -201,6 +201,9 @@ struct MmvqJobs {
     int n_out[kMmvqJobsMax];
 };
 bool native_mmvq_jobs(int ggml_type, const MmvqJobs& jobs, int count, int n_in, int ncols, void* stream);
+/// native_mmvq_jobs() of one column for matrices of several of its formats, types[i] matrix i's: each its bits.
+/// False, with nothing launched, as native_mmvq_jobs() declines.
+bool native_mmvq_jobs_mixed(const int* types, const MmvqJobs& jobs, int count, int n_in, void* stream);
 
 // Storage/dispatch helpers take stable GGML type IDs, avoiding a ggml runtime
 // dependency in the engine: Q4_0=2, Q5_0=6, Q8_0=8, Q2_K=10, Q3_K=11, Q4_K=12, Q5_K=13,

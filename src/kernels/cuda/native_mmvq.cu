@@ -3347,14 +3347,18 @@ struct JobsArgs {
     int count;
 };
 
-template<typename F, int NCOLS, int ROWS>
-__launch_bounds__(WARPS * WARP, 1)
-__global__ void native_mmvq_jobs_kernel(JobsArgs a, int n_in) {
-    const int b = int(blockIdx.x);
+// The job of block b: the last whose first row block is at most b.
+__device__ __forceinline__ int job_of(const int* first, int count, int b) {
     int k = 0;
 #pragma unroll
     for (int i = 1; i < kMmvqJobsMax; ++i)
-        if (i < a.count && b >= a.first[i]) k = i;
+        if (i < count && b >= first[i]) k = i;
+    return k;
+}
+
+// Job k's row block b - first[k].
+template<typename F, int NCOLS, int ROWS>
+__device__ __forceinline__ void mmvq_job_block(const JobsArgs& a, int k, int b, int n_in) {
     const auto* w = static_cast<const typename F::Block*>(a.j.w[k]);
     const auto* x = static_cast<const Q81Block*>(a.j.x[k]);
     float* y = a.j.y[k];
@@ -3396,6 +3400,38 @@ __global__ void native_mmvq_jobs_kernel(JobsArgs a, int n_in) {
         }
     }
 }
+
+template<typename F, int NCOLS, int ROWS>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void native_mmvq_jobs_kernel(JobsArgs a, int n_in) {
+    const int b = int(blockIdx.x);
+    mmvq_job_block<F, NCOLS, ROWS>(a, job_of(a.first, a.count, b), b, n_in);
+}
+
+// native_mmvq_jobs_kernel's blocks for matrices of several formats, one column: each block the one-format kernel's
+// for its matrix's format and rows a block (kind: 2 * format index + rows - 1).
+struct MixedArgs {
+    JobsArgs a;
+    int kind[kMmvqJobsMax];
+};
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void native_mmvq_jobs_mixed_kernel(MixedArgs m, int n_in) {
+    const int b = int(blockIdx.x), k = job_of(m.a.first, m.a.count, b);
+    switch (m.kind[k]) {
+    case 0: mmvq_job_block<SmallTraits<Q80Block, 8>, 1, 1>(m.a, k, b, n_in); break;
+    case 1: mmvq_job_block<SmallTraits<Q80Block, 8>, 1, 2>(m.a, k, b, n_in); break;
+    case 2: mmvq_job_block<Q4KTraits, 1, 1>(m.a, k, b, n_in); break;
+    case 3: mmvq_job_block<Q4KTraits, 1, 2>(m.a, k, b, n_in); break;
+    case 4: mmvq_job_block<Q5KTraits, 1, 1>(m.a, k, b, n_in); break;
+    case 5: mmvq_job_block<Q5KTraits, 1, 2>(m.a, k, b, n_in); break;
+    case 6: mmvq_job_block<Q6KTraits, 1, 1>(m.a, k, b, n_in); break;
+    default: mmvq_job_block<Q6KTraits, 1, 2>(m.a, k, b, n_in); break;
+    }
+}
+
+// launch_jobs_n()'s rows a block for format F and n_in.
+template<typename F>
+int job_rows(int n_in) { return n_in / F::DIV >= F::BPI ? 1 : 2; }
 
 template<typename F, int NCOLS>
 void launch_jobs_n(JobsArgs a, int n_in, cudaStream_t s) {
@@ -3455,6 +3491,42 @@ bool native_mmvq_jobs(int ggml_type, const MmvqJobs& jobs, int count, int n_in, 
     case 13: launch_jobs<Q5KTraits>(a, n_in, ncols, s); break;
     default: launch_jobs<Q6KTraits>(a, n_in, ncols, s); break;
     }
+    launch_check();
+    return true;
+#endif
+}
+
+bool native_mmvq_jobs_mixed(const int* types, const MmvqJobs& jobs, int count, int n_in, void* stream) {
+#if defined(STRATA_HIP_GFX906)
+    (void) types, (void) jobs, (void) count, (void) n_in, (void) stream;
+    return false;   // the wave layout's bits are other
+#else
+    if (count < 1 || count > kMmvqJobsMax) throw std::invalid_argument("native_mmvq_jobs_mixed requires 1 to 8 matrices");
+    validate_stream(stream);
+    MixedArgs m{};
+    m.a.j = jobs;
+    m.a.count = count;
+    m.a.first[0] = 0;
+    for (int i = 0; i < count; ++i) {
+        int index, rows;
+        switch (types[i]) {
+        case 8: index = 0, rows = job_rows<SmallTraits<Q80Block, 8>>(n_in); break;
+        case 12: index = 1, rows = job_rows<Q4KTraits>(n_in); break;
+        case 13: index = 2, rows = job_rows<Q5KTraits>(n_in); break;
+        case 14: index = 3, rows = job_rows<Q6KTraits>(n_in); break;
+        default: return false;
+        }
+        if (n_in % (types[i] == 8 ? 32 : 256)) return false;
+        if (jobs.n_out[i] <= 0) throw std::invalid_argument("native_mmvq_jobs_mixed requires n_out > 0");
+        validate_pointer(jobs.w[i]);
+        validate_pointer(jobs.x[i]);
+        validate_pointer(jobs.y[i]);
+        if (q8_packed_registry().count(jobs.w[i]) || q6_packed_registry().count(jobs.w[i])) return false;
+        m.kind[i] = 2 * index + rows - 1;
+        m.a.first[i + 1] = m.a.first[i] + (jobs.n_out[i] + rows - 1) / rows;
+    }
+    native_mmvq_jobs_mixed_kernel<<<unsigned(m.a.first[count]), dim3(WARP, WARPS), 0, static_cast<cudaStream_t>(stream)>>>(
+        m, n_in);
     launch_check();
     return true;
 #endif
