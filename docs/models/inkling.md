@@ -66,6 +66,16 @@ context with `--kv-whole` (so that a frozen 32K read has its rows), it gave the 
 (f5e5a7e) after an 8,192-token prompt with a checkpoint inside its read, after that prompt resumed with 1,985
 tokens more, and after a 32,765-token prompt read in four reads that followed a read stopped at 3 s.
 
+On a card that holds every expert, a token written on its own runs as one CUDA graph: its 48 layer runs and their
+experts are recorded once (again when the context outgrows the size they were recorded for) and replayed, so the CPU
+hands the card 4 launches a token instead of 1,059 (IQ4_NL) or 1,167 (UD-Q2_K_XL). Not recorded: several requests at
+once (`--parallel`), a window of guesses (`--window` above 1), a picture's tokens and `--dump-layers`. `--no-graphs`
+turns it off; the output is the same to the bit either way. On a rented RTX 3090 24 GB (every expert in VRAM,
+strata-poly alone, a 16K context, q8_0 caches, 256 tokens written, the build before and this one in turn, two runs each)
+writing went from 62.5-62.8 to 69.8-70.2 tokens/s with IQ4_NL after a 302-token prompt (+11%), from 60.8-61.3 to
+67.4-67.8 after 8,192 tokens, and from 71.8-72.6 to 82.1-82.6 (+14%) and 69.6-70.2 to 78.7-79.4 with UD-Q2_K_XL. A card
+that holds only some of the experts, as the 8 GB one above, runs as before.
+
 IQ4_NL's speed depends on its expert profile (`--expert-profile`, which the server keeps up to date): it chooses the
 experts the card holds. On 100 questions (50 GSM8K, 50 MMLU-Pro, greedy, medium reasoning) IQ4_NL got 49 and 44
 right, UD-Q2_K_XL 48 and 41; the two gave the same answer to 92 of the 100.
