@@ -230,6 +230,10 @@ void Inkling::load_layer(int v) {
     }
     B.phys = p;
     B.pass = 0;
+    // a token alone is recorded (Engine::run()); a window's tokens, pictures and step()'s rows take the kernels'
+    // positions by value.  step() replays a fixed layer's head without asking layer_graphs(), and its recordings are
+    // keyed by row, not position: fixed must stay off with --batch.
+    L.fixed = opt_.window == 1 && opt_.batch == 0;
     B.swa = of_layer(*meta_in(*gg_, "attention.sliding_window_pattern"), p) != 0;
     B.wq = mat("attn_q.weight", E, hq);
     B.wk = mat("attn_k.weight", E, hk);
@@ -423,6 +427,8 @@ int64_t Inkling::attn_room(const Block& B, int n) const {
     return B.swa ? (int64_t) opt_.max_context : Engine::room(n);
 }
 
+int Inkling::head_key(int il, int n) const { return blocks_[(size_t) il].swa ? 0 : room_key(n); }
+
 // A post-convolution of n rows into acc (written when `fresh`, else added), its state at `state` in the bound
 // sequence's state_, or with step()'s rows at the same place in each row's own sequence's.
 void Inkling::post_conv(const float* x, float* state, const Dev& w, float* acc, int n, bool fresh, const Row* rows) {
@@ -489,19 +495,20 @@ void Inkling::attn(Block& B, int v, const float* xq, const float* xk, const floa
         inkling_attend_seqs(q_, at, n, rel, sink_, att_, head_dim_, n_head_, n_kv_, scale, window, ring, awork_,
                             awork_n_, st_, int8_dot_);
     } else {
+        const long long* at = recording_ ? at_ : nullptr;   // a recorded launch: the position from what at_ holds
         conv_snaps(kraw_, B.conv, hk, n);
         conv_snaps(vraw_, B.conv + v_at, hk, n);
         inkling_kv_store(kraw_, vraw_, B.conv, B.conv + v_at, fp(B.k_conv), fp(B.v_conv), B.swa ? nullptr : ktap_,
                          B.swa ? nullptr : vtap_, n_kv_, head_dim_, n, qk_clip_, rms_eps_, kv_dst(q8(), B.plane, ring),
-                         pos_, k_, v_, st_);
-        inkling_clip_many(jobs, 2, n, pos_, st_);
+                         pos_, k_, v_, st_, at);
+        inkling_clip_many(jobs, 2, n, pos_, st_, at);
         dump("Qcur", v, q_, hq, n);
         dump("Kcur", v, k_, hk, n);
         dump("Vcur", v, v_, hk, n);
         dump("Rcur", v, rel_, n_head_ * n_rel_, n);
         const InklingAttnSeq c = attn_seq(q8(), B.plane, pos_, attn_room(B, n));
         inkling_attend(q_, c.kcache, c.vcache, c.kq8, c.vq8, rel, sink_, pos_, n, att_, head_dim_, n_head_, n_kv_,
-                       scale, window, ring, awork_, awork_n_, st_, c.room, int8_dot_);
+                       scale, window, ring, awork_, awork_n_, st_, c.room, int8_dot_, at);
     }
     dump("kqv_out", v, att_, hq, n);
     mul_sigmoid(att_, gate_, hq, n, hq, false, st_);

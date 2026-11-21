@@ -42,8 +42,14 @@ protected:
     bool sees() const override { return true; }   // pictures (strata-vision's rows) in place of tokens
     /// step()'s rows in one head: the products, mixes and controllers for all of them, and each row's caches,
     /// convolution states and position from its own sequence (attn(), post_conv()).  The rows' positions go to the
-    /// kernels by value, so a step is not recorded: Inkling sets no Layer::fixed, and step() records only those.
+    /// kernels by value, so a step is not recorded: with --batch Inkling sets no Layer::fixed, and step() records
+    /// only those.
     bool batch_heads() const override { return true; }
+    /// A token's launches that take the position read it from at_ when recorded (attn()); a full visit's attention
+    /// is recorded once for each room() it is sized for, a window visit's for the context.
+    int head_key(int il, int n) const override;
+    /// A token's visits are recorded only as one, when its routed experts are all on the card (Engine::run()).
+    bool layer_graphs() const override { return false; }
     int widest() const override { return std::max(n_head_ * head_dim_, 2 * n_embd_); }
     int streams() const override { return kStreams; }
     void layer_head(Layer& L, int il, int n) override;
