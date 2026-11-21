@@ -1,7 +1,8 @@
-"""Tests for setup.py's Inkling 2 Mini (docs/models/inkling.md): its three pinned files, the estimates for an 8 GB
-card, the install by GLM's steps with no draft model, the model's sampling defaults in the run config, NVIDIA only,
-and its image encoder: opt-in, built from its own llama.cpp pin into a folder of its own (the other families' encoder
-and its stamp are left alone).  Mocked like tools/test_setup_glm.py, whose harness this uses.
+"""Tests for setup.py's Inkling 2 Mini (docs/models/inkling.md): its pinned files, the estimates for an 8 GB card, the
+install by GLM's steps with no draft model unless its DSpark drafter is asked for (offered only where the card holds
+most experts), the model's sampling defaults in the run config, NVIDIA only, and its image encoder: opt-in, built from
+its own llama.cpp pin into a folder of its own (the other families' encoder and its stamp are left alone).  Mocked
+like tools/test_setup_glm.py, whose harness this uses.
 
     python -m unittest tools.test_setup_inkling
 """
@@ -23,6 +24,7 @@ FAM = setup.FAMILIES["inkling"]
 # setup's order: the size taken with the RAM for it, then Unsloth's 2-bit file (the least RAM), then 8-bit
 SIZES = [("IQ4_NL", 17627940768), ("UD-Q2_K_XL", 9138715328), ("Q8_0", 27820099264)]
 MMPROJ = "mmproj-Inkling-2-Mini-Q8_0.gguf"
+DSPARK = "dspark-Inkling-2-Mini-Q8_0.gguf"
 
 
 class Pins(unittest.TestCase):
@@ -30,7 +32,13 @@ class Pins(unittest.TestCase):
         self.assertEqual(list(setup.family_models("inkling")), [m for m, _ in SIZES])
         self.assertEqual(FAM["hf"], "https://huggingface.co/ggml-org/Inkling-2-Mini-GGUF/resolve/"
                                     "db61c5b492a6a034d986328d28274af0a439aa6c/")
-        self.assertEqual(list(FAM["sha256"]), [f"Inkling-2-Mini-{m}.gguf" for m, _ in SIZES] + [MMPROJ])
+        self.assertEqual(list(FAM["sha256"]), [f"Inkling-2-Mini-{m}.gguf" for m, _ in SIZES] + [MMPROJ, DSPARK])
+        # the DSpark drafter: Unsloth's Q8_0 file at setup's pinned revision (its LFS sha256)
+        self.assertEqual(FAM["dspark"]["hf"], "https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/"
+                                              "ae9327c5fbc7333116ba32eee78bb5d2bbefae4f/")
+        self.assertEqual(FAM["dspark"]["file"], DSPARK)
+        self.assertEqual(FAM["sha256"][DSPARK],
+                         (402278560, "2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773"))
         for size, n in SIZES:
             file = f"Inkling-2-Mini-{size}.gguf"
             d = FAM["models"][size]
@@ -204,6 +212,48 @@ class Main(unittest.TestCase):
         code, out, cfg = self.main(family="inkling", ram=64.0)
         self.assertEqual(code, 0, out)
         self.assertEqual(cfg["parallel"], 1)                # an earlier "parallel": 1 is kept too
+
+    def test_the_drafter_is_opt_in_and_offered_where_it_can_pay(self):
+        d, q2 = FAM["models"]["IQ4_NL"], FAM["models"]["UD-Q2_K_XL"]
+        self.assertFalse(setup.poly_dspark_offer(FAM, d, 8188 / 1024))   # an 8 GB card: most experts on the CPU
+        self.assertFalse(setup.poly_dspark_offer(FAM, q2, 8188 / 1024))
+        self.assertTrue(setup.poly_dspark_offer(FAM, d, 24.0))           # an RTX 3090: every expert in VRAM
+        self.assertTrue(setup.poly_dspark_offer(FAM, d, 31.84))
+        self.assertFalse(setup.poly_dspark_offer(FAM, d, 16.0))          # 16 GB: IQ4_NL's do not all fit
+        self.assertTrue(setup.poly_dspark_offer(FAM, q2, 16.0))          # UD-Q2_K_XL's do
+        # where every expert fits only without the drafter's VRAM, it is not offered
+        edge = setup.poly_beside_gb(d) + d["arena_gb"] / 1.073741824 + 0.1
+        self.assertEqual(setup.poly_held_gb(d, edge), d["arena_gb"])
+        self.assertFalse(setup.poly_dspark_offer(FAM, d, edge))
+        self.assertAlmostEqual(setup.poly_dspark_gb(FAM["dspark"]), 0.4 + 0.125)   # at 32K: its rows' 128 MiB
+        for vram, asked in ((8188 / 1024, False), (31.84, True)):
+            with self.subTest(vram=vram):
+                self.downloads = []
+                code, out, cfg = self.main(family="inkling", ram=64.0, vram=vram, answers={})   # Enter: no
+                self.assertEqual(code, 0, out)
+                self.assertEqual(any("DSpark drafter?" in q for q in self.asked), asked, self.asked)
+                self.assertNotIn("--draft-model", cfg["args"])
+                self.assertNotIn(DSPARK, " ".join(self.downloads))
+                self.assertIn("64K tokens   (1.1 GB more VRAM", out)   # the model's rows alone
+
+    def test_the_drafter_when_asked(self):
+        for vram in (31.84, 8188 / 1024):             # where it is not offered, it is still set up, with a warning
+            with self.subTest(vram=vram):
+                self.downloads, self.verified = [], []
+                code, out, cfg = self.main(["--dspark", "yes"], family="inkling", ram=64.0, vram=vram)
+                self.assertEqual(code, 0, out)
+                args = cfg["args"]
+                self.assertEqual(Path(args[args.index("--draft-model") + 1]),
+                                 self.t / "models" / "inkling2-IQ4_NL" / DSPARK)
+                if vram > 9:                          # the second run finds the file there
+                    self.assertIn(FAM["dspark"]["hf"] + DSPARK, self.downloads)
+                self.assertIn((DSPARK, *FAM["sha256"][DSPARK]), self.verified)
+                self.assertEqual(cfg["parallel"], 1)
+                self.assertEqual("expect it to be no faster or slower" in out, vram < 9, out)
+                self.assertIn("64K tokens   (1.2 GB more VRAM", out)   # and the drafter's, 4 KiB a token
+        code, out, _ = self.main(["--dspark", "yes", "--parallel", "3"], family="inkling", ram=64.0, vram=31.84)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--dspark yes does not go with --parallel", out)
 
     def test_no_images_unless_asked(self):
         code, out, cfg = self.main(family="inkling", ram=64.0, vram=8188 / 1024)      # --yes: the default, no

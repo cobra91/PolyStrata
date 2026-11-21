@@ -888,7 +888,14 @@ FAMILIES = {
     # measured with q8_0 caches in a 128K context.  "arena_gb" is the files' expert tensors (IQ4_NL: layers 0-19 IQ4_NL,
     # 20-23 Q8_0).  The experts the card does not hold stay in RAM, as for the others.  "sampling": the GGUF's
     # general.sampling.* (temperature 1.0, top_k 50, top_p 1.0, min_p 0), written into a run config that has no sampling
-    # block of its own.
+    # block of its own.  "dspark": the model's own drafter (Unsloth's DSpark file, --draft-model), opt-in, offered only
+    # where the card holds every expert of the size beside it (poly_dspark_offer()), and not with several cards or
+    # "parallel".  It guesses up to three tokens a round and the model checks them in one window: measured on a rented
+    # RTX 3090 24 GB (every expert in VRAM) it wrote code faster and prose about as fast (docs/models/inkling.md); on
+    # a rented RTX 2070 Super 8 GB (31% of IQ4_NL's experts in VRAM, 68% of UD-Q2_K_XL's) it was slower or no faster,
+    # as a window's tokens route to experts of their own on the CPU.  "vram_gb": the expert cache was 0.4 GiB smaller
+    # with it at load there (both sizes, a 1,024-token prompt batch: its weights, scratch and window layers' rings);
+    # "row_bytes": its full-attention layer's fp16 keys and values, 4 KiB a context token.
     "inkling": {"title": "Inkling 2 Mini", "by": "Thinking Machines; GGUF by ggml-org",
                 "about": "on the strata-poly engine: NVIDIA, Linux; an 18 GB file, ~22 GB of RAM beside an "
                          "8 GB card (16.5 GiB measured for the engine); a 2-bit and an 8-bit size too, images optional",
@@ -900,6 +907,8 @@ FAMILIES = {
                 "laptop_tps": {32768: "28"},
                 "windows_risk": "Inkling 2 Mini has not been built or run on Windows",
                 "sampling": {"temperature": 1.0, "top_k": 50, "top_p": 1.0},
+                "dspark": {"hf": hf("unsloth/Inkling-2-Mini-GGUF"), "file": "dspark-Inkling-2-Mini-Q8_0.gguf",
+                           "gb": 0.4, "vram_gb": 0.4, "row_bytes": 4096},
                 "models": {"IQ4_NL": {"about": "4-bit experts in layers 0-19 (imatrix), 8-bit everywhere else",
                                       "download_gb": 17.6, "ram_gb": 22, "arena_gb": 15.8, "vram_beside_gb": 4.0},
                            "UD-Q2_K_XL": {"about": "Unsloth's 2-bit experts, higher where it matters: the fastest and "
@@ -916,7 +925,9 @@ FAMILIES = {
                            "Inkling-2-Mini-Q8_0.gguf":
                            (27820099264, "d57542f8aea5d7639beba5fc4ae7f584754916f63ac5d5a69328c27f652f45da"),
                            "mmproj-Inkling-2-Mini-Q8_0.gguf":
-                           (345910944, "233287272ec5ac39b4168677aba54a4c024f202410f5629fac1830e1059f8abb")}},
+                           (345910944, "233287272ec5ac39b4168677aba54a4c024f202410f5629fac1830e1059f8abb"),
+                           "dspark-Inkling-2-Mini-Q8_0.gguf":
+                           (402278560, "2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773")}},
 }
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # Qwen3.6-35B-A3B (GGUF architecture qwen35moe), Unsloth's GGUFs with the MTP block: a family with an engine path of its
@@ -6527,6 +6538,17 @@ def poly_held_gb(d, vram_gb) -> float:
     return min(d["arena_gb"], max(0.0, vram_gb - poly_beside_gb(d)) * 1.073741824)
 
 
+def poly_dspark_gb(spark, ctx=32768) -> float:
+    """The GiB of VRAM the DSpark drafter takes at a context of ctx tokens (FAMILIES["inkling"]["dspark"])."""
+    return spark["vram_gb"] + ctx * spark["row_bytes"] / 2**30
+
+
+def poly_dspark_offer(fam, d, vram_gb) -> bool:
+    """Whether setup offers a size's DSpark drafter: where the card holds every expert of the size beside it at a 32K
+    context, which is where it was measured to pay (FAMILIES["inkling"])."""
+    return poly_held_gb(d, vram_gb - poly_dspark_gb(fam["dspark"])) >= d["arena_gb"]
+
+
 def poly_parallel_note(asked: int | None, d, vram_gb) -> list[str]:
     """What setup says of "parallel" for a strata-poly size: answers written together pay where the card holds every
     expert of the size.  Where most of them run on the CPU, different requests route to different experts and the
@@ -7138,6 +7160,30 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
             vision = auto if ask("Do you want images?", ["y", "n"], "n", a.yes) == "y" else "none"
         ok("images: " + {"none": "off", "gpu": "on", "cpu": "on (encoder on the CPU)"}[vision])
     room = max(0.0, vram - (fam["vision_vram_gb"] if vision == "gpu" else 0))   # the VRAM left for the model
+    # the model's own drafter: opt-in, asked only where it was measured to pay, never with requests at once (--batch)
+    # or on several cards; its VRAM comes out of the room for the experts and the context's rows
+    spark = None
+    if fam.get("dspark"):
+        offer = poly_dspark_offer(fam, d, room) and not (a.parallel or 0) > 1 and not multi
+        want = a.dspark
+        if want is None and offer:
+            say()
+            say(f"  Speculative decoding: {title}'s own drafter ({fam['dspark']['gb']} GB download, "
+                f"~{poly_dspark_gb(fam['dspark']):.1f} GB of VRAM) guesses")
+            say("  a few tokens ahead and the model checks them together: faster code and text that repeats, prose")
+            say("  about as fast. Answers stay the same.")
+            want = "yes" if ask("Use the DSpark drafter?", ["y", "n"], "n", a.yes) == "y" else "no"
+        if want == "yes" and (a.parallel or 0) > 1:
+            fail("--dspark yes does not go with --parallel", "leave one of them out")
+        if want == "yes" and multi:
+            fail("--dspark yes does not go with several cards", "leave it out, or choose one card")
+        if want == "yes":
+            if not offer:
+                warn("the DSpark drafter on a card that does not hold every expert: expect it to be no faster or "
+                     "slower (measured on an RTX 2070 Super 8 GB)")
+            spark = fam["dspark"]
+            room = max(0.0, room - poly_dspark_gb(spark))
+        ok("DSpark drafter: " + ("on" if spark else "off"))
     beside = poly_beside_gb(d)
     held, need_ram = poly_held_gb(d, room), poly_ram_need(d, room)
     say()
@@ -7185,7 +7231,7 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         say()
         say("  Context length = how much text the model can see at once (your chat, files, tool output).")
         say("  Longer takes VRAM from the expert cache:")
-        row = fam.get("row_bytes", GLM_ROW_BYTES)
+        row = fam.get("row_bytes", GLM_ROW_BYTES) + (spark["row_bytes"] if spark else 0)
         # writing after a prompt that fills the context, tokens/s, on the 8 GB laptop (docs/BACKENDS.md, docs/LFM.md)
         laptop = fam.get("laptop_tps") or ({32768: "52-58", 65536: "42-46", 131072: "28-30"}
                                            if fam.get("ran_on_gb") == 8 else {})
@@ -7242,7 +7288,8 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     gguf = shards[0]
     have_model = all(s.exists() and (done(s) or bool(a.gguf_dir)) for s in shards)
     # the size's draft model: beside the model's file, or, when --gguf-dir has none, where setup keeps its own
-    guesser = models_dir / Path(d["draft_model"]).name if d.get("draft_model") else None
+    guesser = models_dir / Path(d["draft_model"]).name if d.get("draft_model") else \
+        models_dir / spark["file"] if spark else None
     if guesser is not None and a.gguf_dir and not guesser.exists():
         guesser = Path(a.models_dir) / tag / guesser.name
     have_guesser = guesser is None or guesser.exists() and (done(guesser) or bool(a.gguf_dir) or whole_shard(guesser))
@@ -7326,7 +7373,7 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     if guesser is not None:
         if not have_guesser:
             say("  Its draft model lets it guess a few words ahead and check them at once (faster answers).")
-            download(d.get("hf", fam["hf"]) + d["draft_model"], guesser)
+            download(spark["hf"] + spark["file"] if spark else d.get("hf", fam["hf"]) + d["draft_model"], guesser)
         _skip_or_verify(guesser, guesser.name)
     if mmproj is not None:
         if not have_mmproj:
@@ -7441,6 +7488,8 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     # requests at once: written only when given, else an earlier "parallel" is carried over (write_setup_config)
     if a.parallel is not None:
         cfg["parallel"] = a.parallel if a.parallel >= 2 else 1
+    elif spark:                                        # the drafter guesses for one request at a time
+        cfg["parallel"] = 1
     for line in poly_parallel_note(a.parallel, d, vram):
         (ok if a.parallel is not None else say)(line if a.parallel is not None else "  " + line)
     if fam.get("sampling") and not config_has(cfg_path if cfg_path.is_file() else earlier, "sampling"):
@@ -8052,6 +8101,9 @@ def main() -> int:
                          "Kolibri, Flint, LFM2.5), int8 or int8k (Gemma 4), fp16 (the default)")
     ap.add_argument("--vision", choices=["yes", "no", "none", "gpu", "cpu"],
                     help="let the model read images (yes = the encoder on the GPU)")
+    ap.add_argument("--dspark", choices=["yes", "no"],
+                    help="Inkling 2 Mini: speculative decoding with its own DSpark drafter (a 0.4 GB download; "
+                         "offered by default only where the card holds most of the experts)")
     ap.add_argument("--vision-tokens", type=int, metavar="N",
                     help="the most image tokens a picture becomes (default 1024 with the encoder on the GPU, 300 on "
                          "the CPU): more reads small text and charts better, and takes longer to encode; remembered "
