@@ -426,6 +426,12 @@ float largest(const float* x, int n) {
 
 // The CUDA calls of a card's engine go to its card: a split's engines share the caller's thread (but in read()),
 // and the card is the thread's.  Back to the caller's card at the end.  One engine alone changes nothing.
+// A flag that holds for part of a call, false again when the call ends, also when it is cut short.
+struct Until {
+    bool& on;
+    ~Until() { on = false; }
+};
+
 class OnCard {
 public:
     OnCard(int device, bool split) : split_(split) {
@@ -4438,7 +4444,7 @@ bool Engine::moe_card(Layer& L, int il, int n) {
     const kernels::MmvqIds down{table, d_ids_, L.gu2(), q8_, kernels::native_q8_1_bytes(n_ff_exp_), 1, d_,
                                 (size_t) n_embd_, lane_slots_};
     kernels::native_mmvq_ids((int) L.d_type, down, rr, n_ff_exp_, n_embd_, st_);
-    moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
+    if (!card_sum_in_tail(n)) moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);
     return true;
 }
 
@@ -4944,6 +4950,7 @@ void Engine::run(const int32_t* tokens, int n) {
     if (pos_ + n > opt_.max_context)
         throw std::runtime_error("the context is full (" + std::to_string(opt_.max_context) + " tokens)");
     cover(pos_ + n);
+    const Until parts{card_parts_};   // from a moe_card() to the layer_tail() after it
 
     // h_r_ and h_cpu_ may still be the source of the previous call's copies
     ck(cudaStreamSynchronize(cs(st_)), "eval");
@@ -5102,12 +5109,16 @@ void Engine::run(const int32_t* tokens, int n) {
     // The routed experts on the card alone, when every one of them is in VRAM: recorded too, once a layer has
     // shown it routes there (Layer::card).
     const bool card = n < kStageRows && card_moe(n);
+    layers_in_order_ = true;
+    const Until in_order{layers_in_order_};
     const auto on_card = [&](int il, int m, size_t rec) {
         const int home = home_of(il);
         Layer& L = layers_[(size_t) home];
+        card_parts_ = false;
         if (!card) return false;
         if (replay && L.card == 1) replayed(L.card_moe, rec, [&] { moe_card(L, home, m); });
         else if (!moe_card(L, home, m)) return false;
+        card_parts_ = card_sum_in_tail(m);
         stats_.gpu_experts += m * n_used_;
         return true;
     };
@@ -5132,6 +5143,7 @@ void Engine::run(const int32_t* tokens, int n) {
                     if (!routed(L)) continue;
                     moe_shared(L, il, n);
                     moe_card(layers_[(size_t) home_of(il)], home_of(il), n);
+                    card_parts_ = card_sum_in_tail(n);
                     layer_tail(L, il, n);
                 }
             });
@@ -5170,6 +5182,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
     if (guesses && !steps_guesses()) throw std::logic_error("step: guesses need --batch-mtp, a draft block and one card");
     if (!step_seqs_.empty()) throw std::logic_error("step: the rows of the step before are not kept yet (keep_step())");
     OnCard here(device_, split_);
+    const Until parts{card_parts_};   // from a moe_card() to the layer_tail() after it
     end_read();
     const int home = bound_;
     const auto use = [&](int s) { hold(s); };
@@ -5278,10 +5291,13 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
             ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
             if (replay) replayed(L.shared, rec, [&] { moe_shared(L, il, R); });
             else moe_shared(L, il, R);
+            card_parts_ = false;
             if (card && M.card == 1 && replay) {
                 replayed(M.card_moe, rec, [&] { moe_card(M, home, R); });
+                card_parts_ = card_sum_in_tail(R);
                 stats_.gpu_experts += R * n_used_;
             } else if (card && moe_card(M, home, R)) {
+                card_parts_ = card_sum_in_tail(R);
                 stats_.gpu_experts += R * n_used_;
             } else if (moe(il, R)) {
                 moe_add(R);

@@ -466,6 +466,9 @@ protected:
     }
     /// The shared expert, into fo_.  It runs on the GPU while the host routes.
     virtual void moe_shared(const Layer& L, int il, int n) = 0;
+    /// moe_card() of n tokens leaves the experts' sum to the layer's tail: d_ holds each picked expert's output and
+    /// d_wts_ its weight, and run() sets card_parts_ for the tail that follows.
+    virtual bool card_sum_in_tail(int n) const { (void) n; return false; }
     /// The scores of a layer's router for n tokens, into rl_.  The engine's own: the router's matrix times the
     /// experts' input (xn_).
     virtual void router_scores(const Layer& L, int n);
@@ -860,6 +863,8 @@ protected:
     int snap_places_ = 0;        ///< how many states it holds
     float* snap_at_ = nullptr;   ///< where the call under way leaves the first of its states
     unsigned snap_bits_ = 0;     ///< the tokens of the call under way that leave their state, a bit a token
+    bool card_parts_ = false;    ///< the next layer_tail()'s experts went through moe_card() with their sum left to it
+    bool layers_in_order_ = false;   ///< run()'s layers are under way: a layer's tail is followed by the next one's head
     bool windowed_ = false;      ///< the call under way is a window's
     // step() with guesses: a place for every sequence's state after its first row, and what keep_step() settles
     float* step_snap_ = nullptr;
