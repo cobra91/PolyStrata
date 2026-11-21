@@ -185,11 +185,14 @@ inline constexpr int kInklingMmaRows = kInklingSplitRows + 1;
 ///    table's rows are rounded to halves, the caches' values too (a Q8_0 code times its scale), and the products sum
 ///    floats (llama.cpp's flash attention rounds Q, P and V the same way); the bias stays a float.  A token's result
 ///    does not depend on the tokens beside it in the call.
+/// `at` (null: pos): the first token's position on the card, read when the launch runs, for a launch recorded in a
+/// CUDA graph and replayed at later positions (Engine::at_).  The same kernels as for pos, so the same bits.  It
+/// takes the split path, which is then sized by room alone: room > 0 and work enough (else std::invalid_argument).
 /// Throws std::runtime_error on a launch error.
 void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, Kvq8 kq8, Kvq8 vq8,
                     InklingRel rel, const float* sinks, int64_t pos, int rows, float* out, int dim, int n_head,
                     int kv_heads, float scale, int window, int ring, float* work, size_t work_floats, void* stream,
-                    int64_t room = 0, bool int8_dot = false);
+                    int64_t room = 0, bool int8_dot = false, const long long* at = nullptr);
 
 // ---- short convolutions --------------------------------------------------------------------------------------
 
@@ -278,8 +281,9 @@ struct InklingClipJob {
     float threshold = 0.f;
     InklingTau tau;
 };
-/// count <= 4.
-void inkling_clip_many(const InklingClipJob* jobs, int count, int rows, int64_t pos, void* stream);
+/// count <= 4.  at: as inkling_attend()'s (null: pos).
+void inkling_clip_many(const InklingClipJob* jobs, int count, int rows, int64_t pos, void* stream,
+                       const long long* at = nullptr);
 
 /// Where inkling_kv_store() puts a layer's keys and values: fp16 (k, v) or Q8_0 (kc/ks, vc/vs, kernels.hpp's Kvq8
 /// layout), each row kv_heads * dim; with ring > 0 position p is row p % ring.
@@ -299,10 +303,11 @@ struct InklingKvDst {
 ///   and into k_out / v_out (rows * kv_heads * dim floats each) when they are not null.
 /// Taps (null: none) and the states as inkling_conv()'s.  dim 128.  More than 16 tokens take the separate calls
 /// (the same results), which work in k_out and v_out: both must then be given (else std::invalid_argument).
+/// at: as inkling_attend()'s (null: pos), for up to 16 tokens (else std::invalid_argument).
 void inkling_kv_store(const float* kraw, const float* vraw, float* k_state, float* v_state, const float* k_w,
                       const float* v_w, const float* k_taps, const float* v_taps, int kv_heads, int dim, int rows,
                       float k_clip, float eps, const InklingKvDst& dst, int64_t pos, float* k_out, float* v_out,
-                      void* stream);
+                      void* stream, const long long* at = nullptr);
 
 /// inkling_conv() whose output is added to acc (acc += out) instead of written: the attention's and the FFN's
 /// post-convolutions and the residual adds after them (axpy) in one launch.  The same bits as inkling_conv() then

@@ -96,11 +96,16 @@ struct ClipJobs {
     int first[5];   // the jobs' first groups, and the end
 };
 
-// Where a call's tokens are: one sequence's, from a position on (inkling_clip_many()), or each row a sequence's of
-// its own at a position of its own (inkling_clip_many_seqs()).  pos(t) - t is handed to clip_group(), which adds t.
+// Where a call's tokens are: one sequence's, from a position on (inkling_clip_many()) given by value or read on the
+// card when the launch runs, or each row a sequence's of its own at a position of its own (inkling_clip_many_seqs()).
+// pos(t) - t is handed to clip_group(), which adds t.
 struct ClipFrom {
     long long pos;
     __device__ long long first(int) const { return pos; }
+};
+struct ClipAt {
+    const long long* at;
+    __device__ long long first(int) const { return *at; }
 };
 struct ClipSeqs {
     long long pos[kInklingSeqRows];
@@ -310,12 +315,19 @@ struct AttnOne {
         return {a.kc, a.vc, a.kq, a.vq, a.pos + t, a.split, a.nslot};
     }
 };
+struct AttnAt {   // AttnOne's from the position on the card
+    const long long* at;
+    __device__ AttnRow row(const AttnArgs& a, int t) const {
+        return {a.kc, a.vc, a.kq, a.vq, *at + t, a.split, a.nslot};
+    }
+};
 struct AttnSeqs {
     AttnRow r[kInklingSeqRows];
     __device__ AttnRow row(const AttnArgs&, int t) const { return r[t]; }
 };
 // the rows of a call whose splits are of `from` keys or more
 inline int rows_from(const AttnOne&, const AttnArgs& a, int ntok, int from) { return a.split >= from ? ntok : 0; }
+inline int rows_from(const AttnAt&, const AttnArgs& a, int ntok, int from) { return a.split >= from ? ntok : 0; }
 inline int rows_from(const AttnSeqs& s, const AttnArgs&, int ntok, int from) {
     int n = 0;
     for (int t = 0; t < ntok; ++t) n += s.r[t].split >= from;
@@ -1507,13 +1519,18 @@ struct KvArgs {
 };
 
 // Where kv_store_kernel's tokens go: the call's tokens one after the other in one sequence (a block takes them all),
-// or each row a sequence's of its own (a block a row, blockIdx.z).
+// from a position given by value or read on the card when the launch runs, or each row a sequence's of its own (a
+// block a row, blockIdx.z).
 struct KvOne {
     __device__ int first(const KvArgs&) const { return 0; }
     __device__ int end(const KvArgs& a) const { return a.rows; }
     __device__ float* state(const KvArgs& a, int which, int) const { return a.state[which]; }
     __device__ const InklingKvDst& dst(const KvArgs& a, int) const { return a.dst; }
     __device__ long long pos(const KvArgs& a, int t) const { return a.pos + t; }
+};
+struct KvAt : KvOne {
+    const long long* at;
+    __device__ long long pos(const KvArgs&, int t) const { return *at + t; }
 };
 struct KvSeqs {
     InklingKvSeq row[kInklingSeqRows];
@@ -1625,8 +1642,9 @@ AttnArgs attn_args(const char* who, const float* q, const InklingRel& rel, const
 void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, Kvq8 kq8, Kvq8 vq8,
                     InklingRel rel, const float* sinks, int64_t pos, int rows, float* out, int dim, int n_head,
                     int kv_heads, float scale, int window, int ring, float* work, size_t work_floats, void* stream,
-                    int64_t room, bool int8_dot) {
+                    int64_t room, bool int8_dot, const long long* at) {
     if (rows <= 0) return;
+    if (at && room <= 0) throw std::invalid_argument("inkling_attend: the position on the card needs a room");
     AttnArgs a =
         attn_args("inkling_attend", q, rel, sinks, rows, out, dim, n_head, kv_heads, scale, window, ring, work);
     a.kc = (const half*) kcache;
@@ -1643,10 +1661,12 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
         splits_of(span_room, window, a.split, a.nslot);
         const size_t need = size_t(rows) * n_head * a.nslot * (AT_DIM + 2);
         if (need <= work_floats) {
-            launch_dec(a, AttnOne{}, rows, kq, vq, int8_dot, st);
+            if (at) launch_dec(a, AttnAt{at}, rows, kq, vq, int8_dot, st);
+            else launch_dec(a, AttnOne{}, rows, kq, vq, int8_dot, st);
             return;
         }
     }
+    if (at) throw std::invalid_argument("inkling_attend: the position on the card takes the split path and a room");
     if (rows >= kInklingMmaRows && rel.n_rel == 16 && mma_attention()) {
         const dim3 gm(grid(rows, MMA_TOKENS), kv_heads);
         if (kq && vq) attn_mma_kernel<true, true><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
@@ -1865,8 +1885,10 @@ void clip_many(const InklingClipJob* jobs, int count, int rows, const From& from
 }
 }  // namespace
 
-void inkling_clip_many(const InklingClipJob* jobs, int count, int rows, int64_t pos, void* stream) {
-    clip_many(jobs, count, rows, ClipFrom{(long long) pos}, stream);
+void inkling_clip_many(const InklingClipJob* jobs, int count, int rows, int64_t pos, void* stream,
+                       const long long* at) {
+    if (at) clip_many(jobs, count, rows, ClipAt{at}, stream);
+    else clip_many(jobs, count, rows, ClipFrom{(long long) pos}, stream);
 }
 
 void inkling_clip_many_seqs(const InklingClipJob* jobs, int count, int rows, const int64_t* pos, void* stream) {
@@ -1880,11 +1902,12 @@ void inkling_clip_many_seqs(const InklingClipJob* jobs, int count, int rows, con
 void inkling_kv_store(const float* kraw, const float* vraw, float* k_state, float* v_state, const float* k_w,
                       const float* v_w, const float* k_taps, const float* v_taps, int kv_heads, int dim, int rows,
                       float k_clip, float eps, const InklingKvDst& dst, int64_t pos, float* k_out, float* v_out,
-                      void* stream) {
+                      void* stream, const long long* at) {
     if (rows <= 0) return;
     if (dim != AT_DIM) throw std::invalid_argument("inkling_kv_store: heads of 128 values only");
     const int width = kv_heads * dim;
     if (rows > KV_ROWS) {   // a prompt batch: the separate calls
+        if (at) throw std::invalid_argument("inkling_kv_store: the position on the card takes at most 16 tokens");
         if (!k_out || !v_out) throw std::invalid_argument("inkling_kv_store: more than 16 tokens need k_out and v_out");
         inkling_conv(kraw, k_state, k_w, k_taps, kv_heads, k_out, width, rows, stream);
         inkling_conv(vraw, v_state, v_w, v_taps, kv_heads, v_out, width, rows, stream);
@@ -1916,7 +1939,8 @@ void inkling_kv_store(const float* kraw, const float* vraw, float* k_state, floa
     a.dst = dst;
     a.kv_heads = kv_heads, a.rows = rows, a.k_clip = k_clip, a.eps = eps;
     a.pos = (long long) pos;
-    kv_store_kernel<<<dim3(kv_heads, 2), AT_DIM, 0, cs(stream)>>>(a, KvOne{});
+    if (at) kv_store_kernel<<<dim3(kv_heads, 2), AT_DIM, 0, cs(stream)>>>(a, KvAt{{}, at});
+    else kv_store_kernel<<<dim3(kv_heads, 2), AT_DIM, 0, cs(stream)>>>(a, KvOne{});
     check_launch("inkling_kv_store");
 }
 

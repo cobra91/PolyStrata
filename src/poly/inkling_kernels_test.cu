@@ -4,6 +4,8 @@
 // controller, SiTU, and the attention over fp16 and Q8_0 caches, full and sliding-window (a ring), split, unsplit
 // and on the tensor cores, with and without a room past the call, for 1, 7 and more than 1,024 tokens; the calls
 // for a token of each of several sequences (Engine::step()'s rows) against a call for each row alone, to the bit;
+// the launches that take the position, recorded in a CUDA graph that reads it from the card and replayed, against
+// the same calls given it by value, to the bit;
 // and a visit's projections in one launch (native_mmvq_jobs()) and the cached experts' launches a warp a row
 // (MmvqSlots::lanes) against each matrix alone, to the bit.
 //
@@ -1170,6 +1172,136 @@ void test_attend_seqs(int rows, bool q8, int window, const std::vector<float>& t
     cudaFree(dq), cudaFree(dr), cudaFree(ds), cudaFree(o1), cudaFree(o2), cudaFree(work);
 }
 
+// ---- the position on the card (Engine::at_) ------------------------------------------------------------------------
+//
+// A visit's launches that take the position, for a decode token as Inkling::attn() makes them (inkling_kv_store(),
+// inkling_clip_many(), inkling_attend()), recorded once in a CUDA graph that reads the position from the card and
+// replayed token after token with the position written there first (Engine::run()), against the same calls given the
+// position by value, to the bit: K and V, the caches, the convolutions' state, Q and R after their clips (and tau)
+// and the attention's output.  A recording a room: a full visit's in Engine::room(1)'s steps, recorded again when the
+// rows outgrow it, a window visit's the context's.  The tokens go across a room's step, the window's edge or the
+// ring's wrap.
+void test_at(bool q8, int window, bool taps, long long first, int tokens, long long context, bool int8_dot = false) {
+    const int width = kKv * kDim, hq = kHeads * kDim, hr = kHeads * kRel;
+    const int ring = window ? window + 16 : 0, cap = ring ? ring : int(context);
+    Cache c[2];
+    {   // the rows before the first token, the same in both
+        auto k = randv(size_t(first) * width, 1.2f), v = randv(size_t(first) * width, 1.0f);
+        float *dk = up(k), *dv = up(v);
+        for (Cache& x : c) x.alloc(cap, q8), x.store(dk, dv, 0, int(first), ring);
+        cudaFree(dk), cudaFree(dv);
+    }
+    auto kw = randv(size_t(width) * 4, 0.4f), vw = randv(size_t(width) * 4, 0.4f), st0 = randv(size_t(width) * 6, 1.f),
+         qs = randv(hq, 0.3f, 1.f), rs = randv(hr, 0.3f, 1.f);
+    float *dkw = up(kw), *dvw = up(vw), *dqs = up(qs), *drs = up(rs);
+    const size_t wn = inkling_attend_work_floats(kHeads, kDim);
+    float *state[2], *ko[2], *vo[2], *yq[2], *yr[2], *out[2], *work[2];
+    for (int i = 0; i < 2; ++i) {
+        state[i] = up(st0);
+        for (auto [p, n] : {std::pair{&ko[i], width}, {&vo[i], width}, {&yq[i], hq}, {&yr[i], hr}, {&out[i], hq}})
+            ck(cudaMalloc(p, size_t(n) * 4), "malloc");
+        ck(cudaMalloc(&work[i], wn * 4), "malloc");
+    }
+    float *dk, *dv, *dkt, *dvt, *dq, *dr, *dsk;
+    for (auto [p, n] : {std::pair{&dk, width}, {&dv, width}, {&dkt, kKv * 4}, {&dvt, kKv * 4}, {&dq, hq}, {&dr, hr},
+                        {&dsk, kHeads}})
+        ck(cudaMalloc(p, size_t(n) * 4), "malloc");
+    long long* dat;
+    ck(cudaMalloc(&dat, sizeof(long long)), "malloc");
+    float* dtable = up(randv(size_t(kExtent) * kRel, 0.3f));
+    cudaStream_t st;
+    ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "stream");
+    const float scale = 1.f / std::sqrt((float) kDim);
+    // the launches of side i (0: the position by value, 1: from the card, `pos` unused)
+    const auto visit = [&](int i, long long pos, long long room) {
+        const long long* at = i ? dat : nullptr;
+        InklingKvDst d;
+        d.k = c[i].k, d.v = c[i].v, d.kc = c[i].kc, d.ks = c[i].ks, d.vc = c[i].vc, d.vs = c[i].vs, d.ring = ring;
+        inkling_kv_store(dk, dv, state[i], state[i] + size_t(width) * 3, dkw, dvw, taps ? dkt : nullptr,
+                         taps ? dvt : nullptr, kKv, kDim, 1, 22.6f, 1e-6f, d, pos, ko[i], vo[i], st, at);
+        const InklingTau tau = window ? InklingTau{} : InklingTau{0.1f, 8192};
+        InklingClipJob j[2];
+        j[0] = {dq, 0, dqs, yq[i], kDim, kHeads, 22.6f, tau};
+        j[1] = {dr, 0, drs, yr[i], kRel, kHeads, 8.f, tau};
+        inkling_clip_many(j, 2, 1, pos, st, at);
+        const Kvq8 kq = q8 ? Kvq8{c[i].kc, c[i].ks} : Kvq8{}, vq = q8 ? Kvq8{c[i].vc, c[i].vs} : Kvq8{};
+        inkling_attend(yq[i], c[i].k, c[i].v, kq, vq, {yr[i], dtable, kRel, window ? window : kExtent}, dsk, pos, 1,
+                       out[i], kDim, kHeads, kKv, scale, window, ring, work[i], wn, st, room, int8_dot, at);
+    };
+    std::vector<std::pair<long long, cudaGraphExec_t>> graphs;   // by room
+    size_t diff = 0;
+    for (long long pos = first; pos < first + tokens; ++pos) {
+        // the token's inputs, on the stream the launches go on
+        const std::pair<float*, std::vector<float>> in[] = {
+            {dk, randv(width, 1.f)},   {dv, randv(width, 1.f)}, {dkt, randv(kKv * 4, 0.3f)},
+            {dvt, randv(kKv * 4, 0.3f)}, {dq, randv(hq, 2.f)},  {dr, randv(hr, 2.f)},
+            {dsk, randv(kHeads, 2.f, 1.f)}};
+        for (const auto& [d, h] : in)
+            ck(cudaMemcpyAsync(d, h.data(), h.size() * 4, cudaMemcpyHostToDevice, st), "upload");
+        long long room = 1024;
+        while (room < pos + 1) room *= 2;
+        room = window ? context : std::min(room, context);
+        visit(0, pos, room);
+        auto g = std::find_if(graphs.begin(), graphs.end(), [&](const auto& x) { return x.first == room; });
+        if (g == graphs.end()) {
+            cudaGraph_t made;
+            ck(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "capture");
+            visit(1, 0, room);
+            ck(cudaStreamEndCapture(st, &made), "capture");
+            cudaGraphExec_t exec;
+            ck(cudaGraphInstantiateWithFlags(&exec, made, 0), "instantiate");
+            cudaGraphDestroy(made);
+            g = graphs.insert(graphs.end(), {room, exec});
+        }
+        ck(cudaMemcpyAsync(dat, &pos, sizeof(long long), cudaMemcpyHostToDevice, st), "position");
+        ck(cudaGraphLaunch(g->second, st), "replay");
+        ck(cudaStreamSynchronize(st), "replay");
+        diff += bytes_differ(ko[0], ko[1], size_t(width) * 4) + bytes_differ(vo[0], vo[1], size_t(width) * 4) +
+                bytes_differ(state[0], state[1], size_t(width) * 24) + bytes_differ(yq[0], yq[1], size_t(hq) * 4) +
+                bytes_differ(yr[0], yr[1], size_t(hr) * 4) + bytes_differ(out[0], out[1], size_t(hq) * 4) +
+                caches_differ(c[0], c[1]);
+    }
+    char name[160];
+    std::snprintf(name, sizeof name, "at vs pos, %s %s%s%s, %d tokens from %lld, %zu recordings", q8 ? "q8_0" : "fp16",
+                  window ? "window" : "full", taps ? " taps" : "", int8_dot ? " int8 dot" : "", tokens, first,
+                  graphs.size());
+    std::printf("%-58s %zu bytes differ  %s\n", name, diff, diff ? "FAIL" : "ok");
+    if (diff) ++failures;
+    for (auto& g : graphs) cudaGraphExecDestroy(g.second);
+    cudaStreamDestroy(st);
+    for (Cache& x : c) x.free_();
+    for (float* p : {dkw, dvw, dqs, drs, dk, dv, dkt, dvt, dq, dr, dsk, dtable}) cudaFree(p);
+    for (int i = 0; i < 2; ++i)
+        for (float* p : {state[i], ko[i], vo[i], yq[i], yr[i], out[i], work[i]}) cudaFree(p);
+    cudaFree(dat);
+}
+
+// The position on the card wants the split path, sized by the room: a call that would leave it is refused.
+void test_at_refuses() {
+    long long* dat;
+    ck(cudaMalloc(&dat, sizeof(long long)), "malloc");
+    int refused = 0;
+    float* dtable = up(randv(size_t(kExtent) * kRel, 0.3f));
+    for (long long room : {0, 1024}) {   // no room; a room, but no work for the split path
+        try {
+            inkling_attend(nullptr, nullptr, nullptr, {}, {}, {dtable, dtable, kRel, kExtent}, nullptr, 0, 1, nullptr,
+                           kDim, kHeads, kKv, 1.f, 0, 0, nullptr, 0, nullptr, room, false, dat);
+        } catch (const std::invalid_argument&) {
+            ++refused;
+        }
+    }
+    try {   // more tokens than one launch of the store takes
+        inkling_kv_store(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, kKv, kDim, 17, 1.f,
+                         1e-6f, InklingKvDst{}, 0, nullptr, nullptr, nullptr, dat);
+    } catch (const std::invalid_argument&) {
+        ++refused;
+    }
+    std::printf("%-58s %d of 3 refused  %s\n", "at: no room, off the split path, past 16 tokens", refused,
+                refused == 3 ? "ok" : "FAIL");
+    if (refused != 3) ++failures;
+    cudaFree(dtable), cudaFree(dat);
+}
+
 // More rows than kInklingSeqRows: each _seqs call refuses them.
 void test_seqs_refuse_rows() {
     const int rows = kInklingSeqRows + 1;
@@ -1619,6 +1751,14 @@ int main(int argc, char** argv) {
     test_attend_seqs(2, true, 0, table, dtable, {131000, 70}, 131072, false, true);
     test_int8_unchanged(table, dtable);
     test_seqs_refuse_rows();
+    test_at(false, 0, true, 1020, 8, 8192);       // a full visit across room 1024's edge
+    test_at(true, 0, true, 2044, 8, 8192);
+    test_at(true, 0, false, 2045, 6, 3000);       // a room past the context's: the context
+    test_at(false, 0, true, 8190, 4, 16384);      // tau past its floor
+    test_at(false, 1024, false, 1036, 8, 8192);   // a window visit across the ring's wrap
+    test_at(true, 1024, false, 1020, 8, 8192);    // across the window's edge
+    test_at(true, 0, false, 32765, 6, 65536, true);   // STRATA_KV_INT8: its kernel from room 32768 on
+    test_at_refuses();
     for (int rows : {1, 2, 4, 8}) {
         test_mmvq_jobs(8, "Q8_0", 2304, 8, rows);
         test_mmvq_jobs(12, "Q4_K", 2304, 8, rows);
