@@ -46,8 +46,20 @@ __device__ __forceinline__ float sigmoidf(float x) { return 1.0f / (1.0f + expf(
 //
 // native_mmvq.cu is built with --use_fast_math: its float operations flush denormals to zero and its divisions are
 // approximate.  The launches here that do its Q8_1 quantization or its RMS norm write those operations out as the
-// instructions it compiles them to, so that their bits are its bits (this file is built without fast math).
+// instructions it compiles them to, so that their bits are its bits (this file is built without fast math).  A HIP
+// build has no PTX and compiles native_mmvq.cu without fast math, so there they are the plain IEEE operations.
 namespace fm {
+#if defined(__HIPCC__)
+__device__ __forceinline__ float add(float a, float b) { return a + b; }
+__device__ __forceinline__ float add_rn(float a, float b) { return __fadd_rn(a, b); }
+__device__ __forceinline__ float mul_rn(float a, float b) { return __fmul_rn(a, b); }
+__device__ __forceinline__ float div_rn(float a, float b) { return __fdiv_rn(a, b); }
+__device__ __forceinline__ float div(float a, float b) { return a / b; }
+__device__ __forceinline__ float max(float a, float b) { return fmaxf(a, b); }
+__device__ __forceinline__ float fma_rn(float a, float b, float c) { return __fmaf_rn(a, b, c); }
+__device__ __forceinline__ float sqrt_rn(float a) { return __fsqrt_rn(a); }
+__device__ __forceinline__ float abs(float a) { return fabsf(a); }
+#else
 #define FM_BINARY(name, op)                                                  \
     __device__ __forceinline__ float name(float a, float b) {                \
         float r;                                                             \
@@ -76,6 +88,7 @@ __device__ __forceinline__ float abs(float a) {   // fabsf
     asm("abs.ftz.f32 %0, %1;" : "=f"(r) : "f"(a));
     return r;
 }
+#endif
 __device__ __forceinline__ float warp_sum(float x) {
 #pragma unroll
     for (int o = WARP / 2; o > 0; o >>= 1) x = add(x, __shfl_xor_sync(0xffffffffu, x, o, WARP));
