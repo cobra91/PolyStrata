@@ -63,6 +63,7 @@ protected:
     /// A token's (fused()), outside a window of guesses: the same for every call of one token, so that a recording
     /// of moe_card() serves run() and step() alike.
     bool card_sum_in_tail(int n) const override { return n == 1 && !opt_.dump && opt_.window == 1; }
+    bool act_rows_q8_1(const float* gate_up, void* q8, int rows, const ExpertScales* es) override;
     void finish_logits(float* logits, int rows) override;
     void shift_rows(ptrdiff_t by) override;
     size_t extra_bytes() const override;
@@ -160,6 +161,7 @@ private:
     float *in_[3] = {};                    ///< the normed (and controlled) q, k, v inputs
     float *ctl_[3] = {}, *ctl_work_ = nullptr;
     void* inq_[3] = {};                    ///< in_'s Q8_1 copies
+    void* attq_ = nullptr;                 ///< a token's gated attention output's Q8_1 copy (fused())
     float* neg_inf_ = nullptr;             ///< -inf for the padded vocabulary's scores
     float *q_ = nullptr, *kraw_ = nullptr, *k_ = nullptr, *vraw_ = nullptr, *v_ = nullptr, *rel_ = nullptr,
           *sink_ = nullptr, *gate_ = nullptr, *ktap_ = nullptr, *vtap_ = nullptr, *att_ = nullptr, *o_ = nullptr;

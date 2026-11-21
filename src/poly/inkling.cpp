@@ -375,6 +375,7 @@ void Inkling::assign_scratch() {
     for (float*& m : ctl_) m = fbuf(e);
     const size_t q8 = (n * kernels::native_q8_1_bytes(n_embd_) + sizeof(float) - 1) / sizeof(float);
     for (void*& m : inq_) m = fbuf(q8);
+    attq_ = fbuf((n * kernels::native_q8_1_bytes(n_head_ * head_dim_) + sizeof(float) - 1) / sizeof(float));
     ctl_work_ = fbuf(n * (4 * (size_t) n_embd_ + rank_));
     q_ = fbuf(hq);
     gate_ = fbuf(hq);
@@ -515,11 +516,12 @@ void Inkling::attn(Block& B, int v, const float* xq, const float* xk, const floa
         dump("Rcur", v, rel_, n_head_ * n_rel_, n);
         const InklingAttnSeq c = attn_seq(q8(), B.plane, pos_, attn_room(B, n));
         inkling_attend(q_, c.kcache, c.vcache, c.kq8, c.vq8, rel, sink_, pos_, n, att_, head_dim_, n_head_, n_kv_,
-                       scale, window, ring, awork_, awork_n_, st_, c.room, int8_dot_, at, fuse ? gate_ : nullptr);
+                       scale, window, ring, awork_, awork_n_, st_, c.room, int8_dot_, at, fuse ? gate_ : nullptr,
+                       fuse ? attq_ : nullptr);
     }
     dump("kqv_out", v, att_, hq, n);
     if (!fuse) mul_sigmoid(att_, gate_, hq, n, hq, false, st_);
-    lin(B.wo, att_, o_, n);   // the post-convolution: layer_head(), with the residual
+    lin(B.wo, att_, o_, n, fuse ? attq_ : nullptr);   // the post-convolution: layer_head(), with the residual
 }
 
 // A visit from its input to its router's copy.  The streams: see inkling.hpp.
@@ -612,8 +614,17 @@ void Inkling::layer_head(Layer& L, int v, int n) {
         m.n_query = 4;
         for (int j = 0; j < 4; ++j) m.out[j] = msg_[j];
     }
+    const int threads = sum_threads(n_embd_);
+    // the first pass's visits norm the mix's outputs in its launch (later passes' controllers come in between)
+    const bool normed = fuse && n_mix > 0 && B.attn_query.p && B.pass == 0;
     if (fuse && n_mix > 0 && B.attn_query.p) {
-        inkling_mix_conv(mixes, n_mix, last, n_embd_, norm_eps_, st_);
+        InklingMixNorm nm;
+        for (int j = 0; j < mixes[0].n_query; ++j) {
+            nm.w[j] = fp(B.swa ? L.attn_norm : j == 0 ? B.q_norm : j == 1 ? B.k_norm : B.v_norm);
+            nm.y[j] = in_[j], nm.y_q8_1[j] = inq_[j];
+        }
+        nm.eps = rms_eps_, nm.threads = threads;
+        inkling_mix_conv(mixes, n_mix, last, n_embd_, norm_eps_, st_, normed ? &nm : nullptr);
         last = nullptr;
     } else {
         flush();
@@ -634,11 +645,11 @@ void Inkling::layer_head(Layer& L, int v, int n) {
             }
         }
     }
-    const int threads = sum_threads(n_embd_);
     const void* q8[3];
     const auto norm = [&](int j, const float* x, const Dev& w) {
-        kernels::native_add_rms_norm_q8_1(const_cast<float*>(x), nullptr, fp(w), in_[j], inq_[j], n_embd_, n,
-                                          rms_eps_, threads, st_);
+        if (!normed)
+            kernels::native_add_rms_norm_q8_1(const_cast<float*>(x), nullptr, fp(w), in_[j], inq_[j], n_embd_, n,
+                                              rms_eps_, threads, st_);
         q8[j] = inq_[j];
     };
     const float* x[3];
@@ -655,7 +666,7 @@ void Inkling::layer_head(Layer& L, int v, int n) {
             x[j] = in_[j];
             q8[j] = inq_[j];
         }
-        if (!fuse || !kernels::native_rms_norm_q8_1_rows(rows, 3, n_embd_, rms_eps_, threads, st_))
+        if (!normed && (!fuse || !kernels::native_rms_norm_q8_1_rows(rows, 3, n_embd_, rms_eps_, threads, st_)))
             for (int j = 0; j < 3; ++j) norm(j, in[j], *w[j]);
     }
     attn(B, v, x[0], x[1], x[2], q8, n, fuse);
@@ -701,7 +712,9 @@ void Inkling::layer_head(Layer& L, int v, int n) {
     m.query = fp(B.ffn_query);
     m.n_query = 1;
     m.out[0] = mix_[0];
-    if (fuse) inkling_mix_conv(&m, 1, &conv, n_embd_, norm_eps_, st_);
+    InklingMixNorm nm;   // the first pass's FFN input, normed in the mix's launch
+    nm.w[0] = fp(L.ffn_norm), nm.y[0] = xn_, nm.y_q8_1[0] = xq_, nm.eps = rms_eps_, nm.threads = threads;
+    if (fuse) inkling_mix_conv(&m, 1, &conv, n_embd_, norm_eps_, st_, B.pass == 0 ? &nm : nullptr);
     else inkling_mix(m, n_embd_, n, norm_eps_, st_);
     float* f = mix_[0];
     if (B.pass > 0) {
@@ -714,7 +727,8 @@ void Inkling::layer_head(Layer& L, int v, int n) {
         }
         f = ctl_[0];
     }
-    kernels::native_add_rms_norm_q8_1(f, nullptr, fp(L.ffn_norm), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
+    if (!fuse || B.pass > 0)
+        kernels::native_add_rms_norm_q8_1(f, nullptr, fp(L.ffn_norm), xn_, xq_, n_embd_, n, rms_eps_, threads, st_);
     dump("ffn_in", v, xn_, n_embd_, n);
     if (!batched(layers_[(size_t) home_of(v)], n)) moe_router(L, n);   // the experts' layer decides (Layer::alias)
 }
@@ -824,6 +838,13 @@ bool Inkling::route_card(int il, int n, int32_t* ids, float* w) {
     const Block& B = blocks_[(size_t) il];
     route_rows(rl_, n_expert_, n_used_, n, 1, 1.f, B.probs_b_dev.p ? fp(B.probs_b_dev) : nullptr, nullptr, true,
                w_scale_, ids, w, st_);
+    return true;
+}
+
+// SiTU straight into the down products' Q8_1 input (situ_rows_q8_1()): the same bits as situ_rows() then the
+// quantization.
+bool Inkling::act_rows_q8_1(const float* gate_up, void* q8, int rows, const ExpertScales* es) {
+    situ_rows_q8_1(gate_up, q8, n_ff_exp_, rows, situ_->beta, situ_->lin_beta, st_, es);
     return true;
 }
 
