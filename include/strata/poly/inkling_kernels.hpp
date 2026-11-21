@@ -188,11 +188,14 @@ inline constexpr int kInklingMmaRows = kInklingSplitRows + 1;
 /// `at` (null: pos): the first token's position on the card, read when the launch runs, for a launch recorded in a
 /// CUDA graph and replayed at later positions (Engine::at_).  The same kernels as for pos, so the same bits.  It
 /// takes the split path, which is then sized by room alone: room > 0 and work enough (else std::invalid_argument).
+/// `gate` (null: none): the output gate, out *= sigmoid(gate) (n_head * dim a token), as mul_sigmoid() after the
+/// call gives it, the same bits; the split path applies it as it writes the output, the others with mul_sigmoid().
 /// Throws std::runtime_error on a launch error.
 void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, Kvq8 kq8, Kvq8 vq8,
                     InklingRel rel, const float* sinks, int64_t pos, int rows, float* out, int dim, int n_head,
                     int kv_heads, float scale, int window, int ring, float* work, size_t work_floats, void* stream,
-                    int64_t room = 0, bool int8_dot = false, const long long* at = nullptr);
+                    int64_t room = 0, bool int8_dot = false, const long long* at = nullptr,
+                    const float* gate = nullptr);
 
 // ---- short convolutions --------------------------------------------------------------------------------------
 
@@ -308,12 +311,41 @@ void inkling_kv_store(const float* kraw, const float* vraw, float* k_state, floa
                       const float* v_w, const float* k_taps, const float* v_taps, int kv_heads, int dim, int rows,
                       float k_clip, float eps, const InklingKvDst& dst, int64_t pos, float* k_out, float* v_out,
                       void* stream, const long long* at = nullptr);
+/// inkling_kv_store() and inkling_clip_many(jobs, count) of the same tokens in one launch, the same bits as the two
+/// calls (which more than 16 tokens, or no jobs, take).
+void inkling_kv_store_clip(const float* kraw, const float* vraw, float* k_state, float* v_state, const float* k_w,
+                           const float* v_w, const float* k_taps, const float* v_taps, int kv_heads, int dim, int rows,
+                           float k_clip, float eps, const InklingKvDst& dst, int64_t pos, float* k_out, float* v_out,
+                           const InklingClipJob* jobs, int count, void* stream, const long long* at = nullptr);
 
 /// inkling_conv() whose output is added to acc (acc += out) instead of written: the attention's and the FFN's
 /// post-convolutions and the residual adds after them (axpy) in one launch.  The same bits as inkling_conv() then
 /// axpy(out, 1, acc, add).
 void inkling_conv_acc(const float* x, float* state, const float* w, const float* taps, int heads, float* acc,
                       int channels, int rows, void* stream);
+
+/// A post-convolution of one token (inkling_conv() or inkling_conv_acc(), no taps) into the stream acc, n channels.
+/// The input is x, or with `parts` the experts' sum moe_sum() leaves in a zeroed buffer: sum over k < n_parts of
+/// weights[k] * parts[k * n + c], in that order.  With `save`, acc as it was goes there first (a block's start).
+struct InklingConvIn {
+    const float* x = nullptr;
+    const float* parts = nullptr;
+    const float* weights = nullptr;
+    int n_parts = 0;
+    float* state = nullptr;   ///< 3 past inputs a channel, as inkling_conv()'s
+    const float* w = nullptr;
+    float* acc = nullptr;
+    float* save = nullptr;
+    bool fresh = false;       ///< acc = conv (inkling_conv()), not acc += conv (inkling_conv_acc())
+};
+/// The convolution alone, a thread a channel: the same bits as inkling_conv() / inkling_conv_acc() of the input (after
+/// moe_sum() into a zeroed buffer, with parts) and the copy before it.
+void inkling_conv_in(const InklingConvIn& c, int n, void* stream);
+/// One token's inkling_mix() of each of `count` (1 or 2) mixes in one launch, a block each, and `conv` (null: none)
+/// done first by the first mix's block, whose threads keep their part of it for the mix: the same bits as
+/// inkling_conv_in(*conv) then inkling_mix() of each.  conv->acc and conv->save may be states of the first mix,
+/// not of the second.  Mixes of more than 5 states or unaligned buffers take those calls one after the other.
+void inkling_mix_conv(const InklingMix* mixes, int count, const InklingConvIn* conv, int n, float eps, void* stream);
 
 // ---- a token of each of several sequences --------------------------------------------------------------------
 //

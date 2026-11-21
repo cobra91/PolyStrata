@@ -6,8 +6,10 @@
 // for a token of each of several sequences (Engine::step()'s rows) against a call for each row alone, to the bit;
 // the launches that take the position, recorded in a CUDA graph that reads it from the card and replayed, against
 // the same calls given it by value, to the bit;
-// and a visit's projections in one launch (native_mmvq_jobs()) and the cached experts' launches a warp a row
-// (MmvqSlots::lanes) against each matrix alone, to the bit.
+// a visit's projections in one launch (native_mmvq_jobs()) and the cached experts' launches a warp a row
+// (MmvqSlots::lanes) against each matrix alone, to the bit; and a token's fused launches (K and V's store with the
+// clips, the attention with its gate, the input norms in one launch, the mixes with a post-convolution before them)
+// against the calls they stand for, to the bit.
 //
 // usage: poly_inkling_kernels_test [bench | decode]   (exit 0: every check within its tolerance; 77: no usable card;
 //        bench: also time the attention and the decode shapes; decode: only the decode-shape timings, with a
@@ -62,6 +64,16 @@ template <typename T> std::vector<T> down(const T* d, size_t n) {
     ck(cudaDeviceSynchronize(), "sync");
     ck(cudaMemcpy(v.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost), "download");
     return v;
+}
+
+// A stream of the tests' own: native_mmvq.cu's calls refuse the legacy one.
+cudaStream_t test_stream() {
+    static cudaStream_t st = [] {
+        cudaStream_t s;
+        ck(cudaStreamCreate(&s), "stream");
+        return s;
+    }();
+    return st;
 }
 
 // max |a - b| and max |a - b| / max(|b|, floor); reports and counts a failure past tol (on the absolute error)
@@ -1276,6 +1288,268 @@ void test_at(bool q8, int window, bool taps, long long first, int tokens, long l
     cudaFree(dat);
 }
 
+// ---- a token's fused launches (Inkling::fused()) against the calls they stand for, to the bit -----------------
+
+// K and V's store with the clips (inkling_kv_store_clip()) and the attention with its gate (inkling_attend()'s gate)
+// against inkling_kv_store(), inkling_clip_many(), inkling_attend() and mul_sigmoid(): the fused side recorded in a
+// CUDA graph that reads the position from the card, as a decode token's whole-token graph has them.
+void test_fused_attn(bool q8, int window, bool taps, long long first, int tokens, long long context,
+                     bool int8_dot = false) {
+    const int width = kKv * kDim, hq = kHeads * kDim, hr = kHeads * kRel;
+    const int ring = window ? window + 16 : 0, cap = ring ? ring : int(context);
+    Cache c[2];
+    {
+        auto k = randv(size_t(first) * width, 1.2f), v = randv(size_t(first) * width, 1.0f);
+        float *dk = up(k), *dv = up(v);
+        for (Cache& x : c) x.alloc(cap, q8), x.store(dk, dv, 0, int(first), ring);
+        cudaFree(dk), cudaFree(dv);
+    }
+    auto kw = randv(size_t(width) * 4, 0.4f), vw = randv(size_t(width) * 4, 0.4f), st0 = randv(size_t(width) * 6, 1.f),
+         qs = randv(hq, 0.3f, 1.f), rs = randv(hr, 0.3f, 1.f);
+    float *dkw = up(kw), *dvw = up(vw), *dqs = up(qs), *drs = up(rs);
+    const size_t wn = inkling_attend_work_floats(kHeads, kDim);
+    float *state[2], *ko[2], *vo[2], *yq[2], *yr[2], *out[2], *work[2];
+    for (int i = 0; i < 2; ++i) {
+        state[i] = up(st0);
+        for (auto [p, n] : {std::pair{&ko[i], width}, {&vo[i], width}, {&yq[i], hq}, {&yr[i], hr}, {&out[i], hq}})
+            ck(cudaMalloc(p, size_t(n) * 4), "malloc");
+        ck(cudaMalloc(&work[i], wn * 4), "malloc");
+    }
+    float *dk, *dv, *dkt, *dvt, *dq, *dr, *dsk, *dg;
+    for (auto [p, n] : {std::pair{&dk, width}, {&dv, width}, {&dkt, kKv * 4}, {&dvt, kKv * 4}, {&dq, hq}, {&dr, hr},
+                        {&dsk, kHeads}, {&dg, hq}})
+        ck(cudaMalloc(p, size_t(n) * 4), "malloc");
+    long long* dat;
+    ck(cudaMalloc(&dat, sizeof(long long)), "malloc");
+    float* dtable = up(randv(size_t(kExtent) * kRel, 0.3f));
+    cudaStream_t st;
+    ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "stream");
+    const float scale = 1.f / std::sqrt((float) kDim);
+    // side 0: the calls one by one, the position by value; side 1: fused, from the card
+    const auto visit = [&](int i, long long pos, long long room) {
+        const long long* at = i ? dat : nullptr;
+        InklingKvDst d;
+        d.k = c[i].k, d.v = c[i].v, d.kc = c[i].kc, d.ks = c[i].ks, d.vc = c[i].vc, d.vs = c[i].vs, d.ring = ring;
+        const InklingTau tau = window ? InklingTau{} : InklingTau{0.1f, 8192};
+        InklingClipJob j[2];
+        j[0] = {dq, 0, dqs, yq[i], kDim, kHeads, 22.6f, tau};
+        j[1] = {dr, 0, drs, yr[i], kRel, kHeads, 8.f, tau};
+        if (i) {
+            inkling_kv_store_clip(dk, dv, state[i], state[i] + size_t(width) * 3, dkw, dvw, taps ? dkt : nullptr,
+                                  taps ? dvt : nullptr, kKv, kDim, 1, 22.6f, 1e-6f, d, pos, ko[i], vo[i], j, 2, st, at);
+        } else {
+            inkling_kv_store(dk, dv, state[i], state[i] + size_t(width) * 3, dkw, dvw, taps ? dkt : nullptr,
+                             taps ? dvt : nullptr, kKv, kDim, 1, 22.6f, 1e-6f, d, pos, ko[i], vo[i], st, at);
+            inkling_clip_many(j, 2, 1, pos, st, at);
+        }
+        const Kvq8 kq = q8 ? Kvq8{c[i].kc, c[i].ks} : Kvq8{}, vq = q8 ? Kvq8{c[i].vc, c[i].vs} : Kvq8{};
+        inkling_attend(yq[i], c[i].k, c[i].v, kq, vq, {yr[i], dtable, kRel, window ? window : kExtent}, dsk, pos, 1,
+                       out[i], kDim, kHeads, kKv, scale, window, ring, work[i], wn, st, room, int8_dot, at,
+                       i ? dg : nullptr);
+        if (!i) mul_sigmoid(out[i], dg, hq, 1, hq, false, st);
+    };
+    std::vector<std::pair<long long, cudaGraphExec_t>> graphs;   // by room
+    size_t diff = 0;
+    for (long long pos = first; pos < first + tokens; ++pos) {
+        const std::pair<float*, std::vector<float>> in[] = {
+            {dk, randv(width, 1.f)},     {dv, randv(width, 1.f)}, {dkt, randv(kKv * 4, 0.3f)},
+            {dvt, randv(kKv * 4, 0.3f)}, {dq, randv(hq, 2.f)},    {dr, randv(hr, 2.f)},
+            {dsk, randv(kHeads, 2.f, 1.f)}, {dg, randv(hq, 2.f)}};
+        for (const auto& [d, h] : in)
+            ck(cudaMemcpyAsync(d, h.data(), h.size() * 4, cudaMemcpyHostToDevice, st), "upload");
+        long long room = 1024;
+        while (room < pos + 1) room *= 2;
+        room = window ? context : std::min(room, context);
+        visit(0, pos, room);
+        auto g = std::find_if(graphs.begin(), graphs.end(), [&](const auto& x) { return x.first == room; });
+        if (g == graphs.end()) {
+            cudaGraph_t made;
+            ck(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "capture");
+            visit(1, 0, room);
+            ck(cudaStreamEndCapture(st, &made), "capture");
+            cudaGraphExec_t exec;
+            ck(cudaGraphInstantiateWithFlags(&exec, made, 0), "instantiate");
+            cudaGraphDestroy(made);
+            g = graphs.insert(graphs.end(), {room, exec});
+        }
+        ck(cudaMemcpyAsync(dat, &pos, sizeof(long long), cudaMemcpyHostToDevice, st), "position");
+        ck(cudaGraphLaunch(g->second, st), "replay");
+        ck(cudaStreamSynchronize(st), "replay");
+        diff += bytes_differ(ko[0], ko[1], size_t(width) * 4) + bytes_differ(vo[0], vo[1], size_t(width) * 4) +
+                bytes_differ(state[0], state[1], size_t(width) * 24) + bytes_differ(yq[0], yq[1], size_t(hq) * 4) +
+                bytes_differ(yr[0], yr[1], size_t(hr) * 4) + bytes_differ(out[0], out[1], size_t(hq) * 4) +
+                caches_differ(c[0], c[1]);
+    }
+    char name[160];
+    std::snprintf(name, sizeof name, "fused vs calls, %s %s%s%s, %d tokens from %lld", q8 ? "q8_0" : "fp16",
+                  window ? "window" : "full", taps ? " taps" : "", int8_dot ? " int8" : "", tokens, first);
+    std::printf("%-58s %zu bytes differ  %s\n", name, diff, diff ? "FAIL" : "ok");
+    if (diff) ++failures;
+    for (auto& g : graphs) cudaGraphExecDestroy(g.second);
+    cudaStreamDestroy(st);
+    for (Cache& x : c) x.free_();
+    for (float* p : {dkw, dvw, dqs, drs, dk, dv, dkt, dvt, dq, dr, dsk, dg, dtable}) cudaFree(p);
+    for (int i = 0; i < 2; ++i)
+        for (float* p : {state[i], ko[i], vo[i], yq[i], yr[i], out[i], work[i]}) cudaFree(p);
+    cudaFree(dat);
+}
+
+// The gate on the paths that do not split (no work; a prompt's rows) is mul_sigmoid() after them: the same bits.
+void test_gate_unsplit(int rows) {
+    const cudaStream_t st = test_stream();
+    const int width = kKv * kDim, hq = kHeads * kDim;
+    Cache c;
+    c.alloc(rows + 40, false);
+    float *dk = up(randv(size_t(rows + 40) * width, 1.2f)), *dv = up(randv(size_t(rows + 40) * width, 1.f));
+    c.store(dk, dv, 0, rows + 40, 0);
+    float *dq = up(randv(size_t(rows) * hq, 1.2f)), *dr = up(randv(size_t(rows) * kHeads * kRel, 1.5f)),
+          *ds = up(randv(size_t(rows) * kHeads, 2.f, 1.f)), *dg = up(randv(size_t(rows) * hq, 2.f));
+    float* dtable = up(randv(size_t(kExtent) * kRel, 0.3f));
+    float *o0, *o1;
+    ck(cudaMalloc(&o0, size_t(rows) * hq * 4), "malloc"), ck(cudaMalloc(&o1, size_t(rows) * hq * 4), "malloc");
+    const InklingRel rel{dr, dtable, kRel, kExtent};
+    const float scale = 1.f / std::sqrt((float) kDim);
+    inkling_attend(dq, c.k, c.v, {}, {}, rel, ds, 40, rows, o0, kDim, kHeads, kKv, scale, 0, 0, nullptr, 0, st);
+    mul_sigmoid(o0, dg, hq, rows, hq, false, st);
+    inkling_attend(dq, c.k, c.v, {}, {}, rel, ds, 40, rows, o1, kDim, kHeads, kKv, scale, 0, 0, nullptr, 0, st, 0,
+                   false, nullptr, dg);
+    same_bits(("attend's gate unsplit, rows " + std::to_string(rows)).c_str(), o0, o1, size_t(rows) * hq);
+    c.free_();
+    for (float* p : {dk, dv, dq, dr, ds, dg, dtable, o0, o1}) cudaFree(p);
+}
+
+// A visit's three input norms in one launch (native_rms_norm_q8_1_rows()) against a call each.
+void test_norm_rows(int count) {
+    const cudaStream_t st = test_stream();
+    namespace k = strata::kernels;
+    const int n = 2304, threads = sum_threads(n);
+    const size_t qb = k::native_q8_1_bytes(n);
+    k::NormRows rows{};
+    float *y0[4], *x[4];
+    void* q0[4];
+    for (int j = 0; j < count; ++j) {
+        auto h = randv(n, 1.f + j);
+        for (int i = j; i < n; i += 97) h[i] *= 40.f;   // a few large values, as the model's streams have
+        x[j] = up(h);
+        rows.x[j] = x[j];
+        rows.w[j] = up(randv(n, 0.2f, 1.f));
+        ck(cudaMalloc(&rows.y[j], n * 4), "malloc"), ck(cudaMalloc(&y0[j], n * 4), "malloc");
+        ck(cudaMalloc(&rows.y_q8_1[j], qb), "malloc"), ck(cudaMalloc(&q0[j], qb), "malloc");
+        k::native_add_rms_norm_q8_1(x[j], nullptr, rows.w[j], y0[j], q0[j], n, 1, 1e-6f, threads, st);
+    }
+    const bool ran = k::native_rms_norm_q8_1_rows(rows, count, n, 1e-6f, threads, st);
+    size_t diff = ran ? 0 : 1;
+    for (int j = 0; j < count && ran; ++j)
+        diff += bytes_differ(y0[j], rows.y[j], size_t(n) * 4) + bytes_differ(q0[j], rows.y_q8_1[j], qb);
+    std::printf("%-58s %zu bytes differ  %s\n", ("norm rows " + std::to_string(count)).c_str(), diff,
+                diff ? "FAIL" : "ok");
+    if (diff) ++failures;
+    for (int j = 0; j < count; ++j)
+        cudaFree(x[j]), cudaFree((void*) rows.w[j]), cudaFree(rows.y[j]), cudaFree(y0[j]), cudaFree(rows.y_q8_1[j]),
+            cudaFree(q0[j]);
+}
+
+// One token's mixes with a post-convolution before them (inkling_mix_conv(), inkling_conv_in()) against
+// moe_sum() into a zeroed buffer, the copy, inkling_conv() / inkling_conv_acc() and inkling_mix() of each.
+// nb: the blocks before the stream in the first mix; the stream (acc) is its last state.
+struct MixConvCase {
+    const char* name;
+    int nb, nq;            // the first mix's blocks and queries
+    bool msg;              // a second mix (a later pass's messages: 2 states, 4 queries)
+    int conv;              // 0: none, 1: x, 2: parts (8 experts)
+    bool fresh;            // written, with the stream's old value saved into block save_k
+    int save_k;
+    bool alone;            // inkling_conv_in() only, no mix
+};
+void test_mix_conv(const MixConvCase& tc) {
+    const cudaStream_t st = test_stream();
+    const int n = 2304, parts = 8;
+    std::vector<std::vector<float>> hs;   // the first mix's states (the stream last), then the second's
+    for (int k = 0; k <= tc.nb; ++k) hs.push_back(randv(n, 0.5f + k, 0.1f * k));
+    for (int k = 0; k < 2; ++k) hs.push_back(randv(n, 1.f + k));
+    const auto q1 = randv(size_t(tc.nq) * n, 1.f), q2 = randv(size_t(4) * n, 1.f), hx = randv(n, 1.f),
+               hp = randv(size_t(parts) * n, 1.f), hw = randv(parts, 0.3f, 0.2f), hst = randv(size_t(n) * 3, 1.f),
+               hcw = randv(size_t(n) * 4, 0.4f);
+    float *dq1 = up(q1), *dq2 = up(q2), *dx = up(hx), *dp = up(hp), *dw = up(hw), *dcw = up(hcw);
+    struct Side {
+        std::vector<float*> s;
+        float *state, *fo, *out[8];
+    } side[2];
+    for (Side& d : side) {
+        for (const auto& h : hs) d.s.push_back(up(h));
+        d.state = up(hst);
+        ck(cudaMalloc(&d.fo, n * 4), "malloc");
+        for (float*& o : d.out) ck(cudaMalloc(&o, n * 4), "malloc");
+    }
+    const auto mixes = [&](Side& d, InklingMix* m) {
+        m[0] = InklingMix{};
+        for (int k = 0; k <= tc.nb; ++k) m[0].state[k] = d.s[k];
+        m[0].n_state = tc.nb + 1, m[0].query = dq1, m[0].n_query = tc.nq;
+        for (int j = 0; j < tc.nq; ++j) m[0].out[j] = d.out[j];
+        m[1] = InklingMix{};
+        m[1].state[0] = d.s[tc.nb + 1], m[1].state[1] = d.s[tc.nb + 2];
+        m[1].n_state = 2, m[1].query = dq2, m[1].n_query = 4;
+        for (int j = 0; j < 4; ++j) m[1].out[j] = d.out[4 + j];
+        return tc.msg ? 2 : 1;
+    };
+    const auto conv_of = [&](Side& d) {
+        InklingConvIn c;
+        if (tc.conv == 2) c.parts = dp, c.weights = dw, c.n_parts = parts;
+        else c.x = dx;
+        c.state = d.state, c.w = dcw, c.acc = d.s[tc.nb], c.fresh = tc.fresh;
+        if (tc.fresh) c.save = d.s[tc.save_k];
+        return c;
+    };
+    {   // the calls
+        Side& d = side[0];
+        if (tc.conv) {
+            const float* x = dx;
+            if (tc.conv == 2) {
+                ck(cudaMemsetAsync(d.fo, 0, n * 4, st), "memset");
+                moe_sum(dp, dw, d.fo, n, parts, 1, st);
+                x = d.fo;
+            }
+            if (tc.fresh) {
+                ck(cudaMemcpyAsync(d.s[tc.save_k], d.s[tc.nb], n * 4, cudaMemcpyDeviceToDevice, st), "copy");
+                inkling_conv(x, d.state, dcw, nullptr, 0, d.s[tc.nb], n, 1, st);
+            } else {
+                inkling_conv_acc(x, d.state, dcw, nullptr, 0, d.s[tc.nb], n, 1, st);
+            }
+        }
+        if (!tc.alone) {
+            InklingMix m[2];
+            const int count = mixes(d, m);
+            for (int k = 0; k < count; ++k) inkling_mix(m[k], n, 1, 1e-6f, st);
+        }
+    }
+    {   // fused
+        Side& d = side[1];
+        const InklingConvIn c = conv_of(d);
+        if (tc.alone) {
+            inkling_conv_in(c, n, st);
+        } else {
+            InklingMix m[2];
+            const int count = mixes(d, m);
+            inkling_mix_conv(m, count, tc.conv ? &c : nullptr, n, 1e-6f, st);
+        }
+    }
+    size_t diff = bytes_differ(side[0].state, side[1].state, size_t(n) * 12);
+    for (size_t k = 0; k < hs.size(); ++k) diff += bytes_differ(side[0].s[k], side[1].s[k], size_t(n) * 4);
+    if (!tc.alone) {
+        for (int j = 0; j < tc.nq; ++j) diff += bytes_differ(side[0].out[j], side[1].out[j], size_t(n) * 4);
+        for (int j = 0; j < 4 && tc.msg; ++j) diff += bytes_differ(side[0].out[4 + j], side[1].out[4 + j], size_t(n) * 4);
+    }
+    std::printf("%-58s %zu bytes differ  %s\n", (std::string("mix conv ") + tc.name).c_str(), diff,
+                diff ? "FAIL" : "ok");
+    if (diff) ++failures;
+    for (Side& d : side) {
+        for (float* p : d.s) cudaFree(p);
+        cudaFree(d.state), cudaFree(d.fo);
+        for (float* o : d.out) cudaFree(o);
+    }
+    for (float* p : {dq1, dq2, dx, dp, dw, dcw}) cudaFree(p);
+}
+
 // The position on the card wants the split path, sized by the room: a call that would leave it is refused.
 void test_at_refuses() {
     long long* dat;
@@ -1759,6 +2033,25 @@ int main(int argc, char** argv) {
     test_at(true, 1024, false, 1020, 8, 8192);    // across the window's edge
     test_at(true, 0, false, 32765, 6, 65536, true);   // STRATA_KV_INT8: its kernel from room 32768 on
     test_at_refuses();
+    test_fused_attn(false, 0, true, 1020, 8, 8192);       // full: a room's edge, one split and more
+    test_fused_attn(true, 0, true, 8190, 4, 16384);       // tau past its floor
+    test_fused_attn(false, 1024, false, 1036, 8, 8192);   // window: the ring's wrap
+    test_fused_attn(true, 1024, false, 20, 6, 8192);      // a few keys: one split, the block writes the output
+    test_fused_attn(false, 0, false, 3, 4, 4096);
+    test_fused_attn(true, 0, false, 32765, 6, 65536, true);   // STRATA_KV_INT8's kernel from room 32768 on
+    for (int rows : {1, 5, 40}) test_gate_unsplit(rows);
+    for (int count : {1, 3}) test_norm_rows(count);
+    for (const MixConvCase& tc : std::vector<MixConvCase>{
+             {"window, tail sum, messages", 2, 1, true, 2, false, 0, false},
+             {"full, tail x", 3, 3, false, 1, false, 0, false},
+             {"full, tail sum, messages", 4, 3, true, 2, false, 0, false},
+             {"ffn, attention conv", 3, 1, false, 1, false, 0, false},
+             {"ffn, block start", 2, 1, false, 1, true, 1, false},
+             {"ffn, block start, first block", 1, 1, false, 1, true, 0, false},
+             {"no conv, messages", 1, 1, true, 0, false, 0, false},
+             {"conv alone, sum", 1, 1, false, 2, false, 0, true},
+             {"conv alone, block start", 3, 1, false, 1, true, 1, true}})
+        test_mix_conv(tc);
     for (int rows : {1, 2, 4, 8}) {
         test_mmvq_jobs(8, "Q8_0", 2304, 8, rows);
         test_mmvq_jobs(12, "Q4_K", 2304, 8, rows);

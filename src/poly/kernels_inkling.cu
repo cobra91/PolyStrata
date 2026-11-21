@@ -113,8 +113,7 @@ struct ClipSeqs {
 };
 
 template <class From>
-__global__ void clip_many_kernel(ClipJobs c, int count, From from) {
-    const int gi = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP;
+__device__ __forceinline__ void clip_many_group(const ClipJobs& c, int count, const From& from, int gi) {
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
         if (k >= count) return;
@@ -126,6 +125,11 @@ __global__ void clip_many_kernel(ClipJobs c, int count, From from) {
             return;
         }
     }
+}
+
+template <class From>
+__global__ void clip_many_kernel(ClipJobs c, int count, From from) {
+    clip_many_group(c, count, from, blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP);
 }
 
 // ---- attention -------------------------------------------------------------------------------------------------
@@ -149,6 +153,7 @@ struct AttnArgs {
     int nslot;   // the split path's splits a token's partials have room for
     int i8_from;  // the split path's rows of splits of this many keys or more take attn_dec_i8_kernel (0: none)
     float* out;
+    const float* gate;   // the split path's output gate: out = o * sigmoid(gate) (null: none)
     float* work;
 };
 
@@ -353,7 +358,9 @@ __global__ void attn_join_kernel(AttnArgs a, Rows rows) {
         denom += ws[1] * f;
         sum += ws[2 + d] * f;
     }
-    a.out[size_t(th) * AT_DIM + d] = sum / denom;
+    const size_t i = size_t(th) * AT_DIM + d;
+    const float o = sum / denom;
+    a.out[i] = a.gate ? o * sigmoidf(a.gate[i]) : o;
 }
 
 // The split path's kernel: one token of one group, the keys of one split.  No tiles in shared memory and no
@@ -560,7 +567,8 @@ __global__ void __launch_bounds__(DEC_WARPS * WARP, 5) attn_dec_kernel(AttnArgs 
             const float mx = fmaxf(M, sink);
             const float f = M == -INFINITY ? 0.0f : expf(M - mx);
             const float denom = L * f + (sink == -INFINITY ? 0.0f : expf(sink - mx));
-            a.out[th * AT_DIM + d] = O * f / denom;
+            const float o = O * f / denom;
+            a.out[th * AT_DIM + d] = a.gate ? o * sigmoidf(a.gate[th * AT_DIM + d]) : o;
         }
     }
 }
@@ -781,7 +789,8 @@ __global__ void __launch_bounds__(I8_WARPS * WARP) attn_dec_i8_kernel(AttnArgs a
             const float mx = fmaxf(M, sink);
             const float f = M == -INFINITY ? 0.0f : expf(M - mx);
             const float denom = L * f + (sink == -INFINITY ? 0.0f : expf(sink - mx));
-            a.out[th * AT_DIM + d] = O * f / denom;
+            const float o = O * f / denom;
+            a.out[th * AT_DIM + d] = a.gate ? o * sigmoidf(a.gate[th * AT_DIM + d]) : o;
         }
     }
 }
@@ -1261,13 +1270,31 @@ __global__ void __launch_bounds__(MIX_THREADS) mix_kernel(InklingMix m, int n, f
 constexpr int MIX4_MAX = 768;   // threads: a float4 each, so n <= 3072
 // mix_kernel for n a multiple of 4 up to 4 * MIX4_MAX, NS states: a thread a float4 of every state, read once into
 // registers and kept for the output, so that a token's whole read is on its way at once.  The same sums otherwise.
+// States a thread of mix4_body() has in registers already (a convolution's output before it): their values at
+// the thread's float4.
+struct Given {
+    const float* p[2] = {};
+    float4 v[2];
+    __device__ float4 at(const float* s, int i) const {
+        return s == p[0] ? v[0] : s == p[1] ? v[1] : reinterpret_cast<const float4*>(s)[i];
+    }
+};
+
+constexpr int MIX4_SUMS = kInklingMaxStates * 5;
+struct Mix4Smem {
+    float part[MIX4_MAX / WARP][MIX4_SUMS];
+    float tot[MIX4_SUMS];
+    float wts[4][kInklingMaxStates];
+};
+
+// mix4_kernel's token t; `given` only for one token (t 0).
 template <int NS>
-__global__ void __launch_bounds__(MIX4_MAX) mix4_kernel(InklingMix m, int n, float eps) {
+__device__ __forceinline__ void mix4_body(const InklingMix& m, int n, float eps, size_t t, const Given& given,
+                                          Mix4Smem& sm) {
     constexpr int SUMS = NS * 5;
-    __shared__ float part[MIX4_MAX / WARP][SUMS];
-    __shared__ float tot[SUMS];
-    __shared__ float wts[4][NS];
-    const size_t t = blockIdx.x;
+    auto& part = sm.part;
+    auto& tot = sm.tot;
+    auto& wts = sm.wts;
     const int nq = m.n_query, lane = threadIdx.x % WARP, warp = threadIdx.x / WARP;
     const int i = threadIdx.x, n4 = n / 4;
     const bool own = i < n4;
@@ -1281,7 +1308,7 @@ __global__ void __launch_bounds__(MIX4_MAX) mix4_kernel(InklingMix m, int n, flo
         for (int q = 0; q < 4; ++q)
             qv[q] = q < nq ? reinterpret_cast<const float4*>(m.query + size_t(q) * n)[i] : make_float4(0, 0, 0, 0);
 #pragma unroll
-        for (int k = 0; k < NS; ++k) xs[k] = reinterpret_cast<const float4*>(m.state[k] + t * n)[i];
+        for (int k = 0; k < NS; ++k) xs[k] = given.at(m.state[k] + t * n, i);
 #pragma unroll
         for (int k = 0; k < NS; ++k) {
             const float4 x = xs[k];
@@ -1336,6 +1363,12 @@ __global__ void __launch_bounds__(MIX4_MAX) mix4_kernel(InklingMix m, int n, flo
     }
 }
 
+template <int NS>
+__global__ void __launch_bounds__(MIX4_MAX) mix4_kernel(InklingMix m, int n, float eps) {
+    __shared__ Mix4Smem sm;
+    mix4_body<NS>(m, n, eps, blockIdx.x, Given{}, sm);
+}
+
 void launch_mix4(const InklingMix& m, int n, int rows, float eps, cudaStream_t st) {
     const int threads = (n / 4 + WARP - 1) / WARP * WARP;
     switch (m.n_state) {
@@ -1349,6 +1382,82 @@ void launch_mix4(const InklingMix& m, int n, int rows, float eps, cudaStream_t s
         default: mix4_kernel<8><<<rows, threads, 0, st>>>(m, n, eps); break;
     }
 }
+
+// ---- a token's post-convolution in the launch that reads it -----------------------------------------------------
+
+struct ConvIn {
+    const float* x;
+    const float* parts;
+    const float* wts;
+    int n_parts;
+    float* state;
+    const float* w;
+    float* acc;
+    float* save;
+    bool fresh;
+    float scale;
+};
+
+// Channel ch of InklingConvIn's convolution for one token, given acc's value there: the input (with parts, the sum
+// moe_sum() leaves in a zeroed buffer), conv_walk_kernel's convolution and state, and acc's new value.
+__device__ __forceinline__ float conv_in_one(const ConvIn& c, int n, int ch, float old) {
+    float v;
+    if (c.parts) {
+        float s = 0.0f;
+        for (int k = 0; k < c.n_parts; ++k) s += c.wts[k] * c.parts[size_t(k) * n + ch];
+        v = __fadd_rn(0.0f, s);
+    } else {
+        v = c.x[ch];
+    }
+    float* st = c.state + size_t(ch) * 3;
+    const float s0 = st[0], s1 = st[1], s2 = st[2];
+    const float y = conv_one(s0, s1, s2, v, c.w + 4 * size_t(ch), nullptr, c.scale);
+    st[0] = s1, st[1] = s2, st[2] = v;
+    return c.fresh ? y : __fadd_rn(old, y);
+}
+
+__global__ void conv_in_kernel(ConvIn c, int n) {
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= n) return;
+    const float old = c.acc[ch];
+    if (c.save) c.save[ch] = old;
+    c.acc[ch] = conv_in_one(c, n, ch, old);
+}
+
+constexpr int MIX_CONV_STATES = 5;   // inkling_mix_conv()'s most states a mix
+struct MixPair {
+    InklingMix m[2];
+};
+
+// One token's mixes, a block each, mix4_kernel's work; the first block's threads first do the convolution of
+// their float4 of c.acc, which its mix then reads from their registers.
+__global__ void __launch_bounds__(MIX4_MAX) mix_conv_kernel(MixPair mp, ConvIn c, int n, float eps) {
+    __shared__ Mix4Smem sm;
+    const InklingMix& m = mp.m[blockIdx.x];
+    const int i = threadIdx.x;
+    Given g;
+    if (blockIdx.x == 0 && c.acc && i < n / 4) {
+        float4* a4 = reinterpret_cast<float4*>(c.acc) + i;
+        const float4 old = *a4;
+        if (c.save) reinterpret_cast<float4*>(c.save)[i] = old;
+        float4 y;
+        y.x = conv_in_one(c, n, 4 * i, old.x);
+        y.y = conv_in_one(c, n, 4 * i + 1, old.y);
+        y.z = conv_in_one(c, n, 4 * i + 2, old.z);
+        y.w = conv_in_one(c, n, 4 * i + 3, old.w);
+        *a4 = y;
+        g.p[0] = c.acc, g.v[0] = y;
+        g.p[1] = c.save, g.v[1] = old;
+    }
+    switch (m.n_state) {
+        case 1: mix4_body<1>(m, n, eps, 0, g, sm); break;
+        case 2: mix4_body<2>(m, n, eps, 0, g, sm); break;
+        case 3: mix4_body<3>(m, n, eps, 0, g, sm); break;
+        case 4: mix4_body<4>(m, n, eps, 0, g, sm); break;
+        default: mix4_body<5>(m, n, eps, 0, g, sm); break;
+    }
+}
+static_assert(MIX_CONV_STATES == 5, "mix_conv_kernel's cases");
 
 // ---- controller, SiTU ------------------------------------------------------------------------------------------
 
@@ -1541,10 +1650,10 @@ struct KvSeqs {
     __device__ long long pos(const KvArgs&, int t) const { return (long long) row[t].pos; }
 };
 
+// A block's head g of K (which 0) or of V (1); part: AT_DIM / WARP floats of shared memory.
 template <class Rows>
-__global__ void __launch_bounds__(AT_DIM) kv_store_kernel(KvArgs a, Rows rows) {
-    __shared__ float part[AT_DIM / WARP];
-    const int g = blockIdx.x, which = blockIdx.y, d = threadIdx.x, lane = d % WARP;
+__device__ __forceinline__ void kv_store_head(const KvArgs& a, const Rows& rows, int g, int which, float* part) {
+    const int d = threadIdx.x, lane = d % WARP;
     const int channels = a.kv_heads * AT_DIM, c = g * AT_DIM + d;
     const float* x = a.raw[which];
     const float* taps = a.taps[which];
@@ -1596,6 +1705,25 @@ __global__ void __launch_bounds__(AT_DIM) kv_store_kernel(KvArgs a, Rows rows) {
     st[0] = s0, st[1] = s1, st[2] = s2;
 }
 
+template <class Rows>
+__global__ void __launch_bounds__(AT_DIM) kv_store_kernel(KvArgs a, Rows rows) {
+    __shared__ float part[AT_DIM / WARP];
+    kv_store_head(a, rows, blockIdx.x, blockIdx.y, part);
+}
+
+// kv_store_kernel's blocks (a head of K, then of V, by blockIdx.x) and then clip_many_kernel's warps, AT_DIM / WARP
+// a block, in one launch: the same work, a block or a warp as each of the two would give it.
+template <class Rows, class From>
+__global__ void __launch_bounds__(AT_DIM) kv_clip_kernel(KvArgs a, Rows rows, ClipJobs c, int count, From from) {
+    __shared__ float part[AT_DIM / WARP];
+    const int b = blockIdx.x, kv = 2 * a.kv_heads;
+    if (b < kv) {
+        kv_store_head(a, rows, b % a.kv_heads, b / a.kv_heads, part);
+        return;
+    }
+    clip_many_group(c, count, from, (b - kv) * (AT_DIM / WARP) + int(threadIdx.x) / WARP);
+}
+
 }  // namespace
 
 // ================================================================================================================
@@ -1642,7 +1770,7 @@ AttnArgs attn_args(const char* who, const float* q, const InklingRel& rel, const
 void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, Kvq8 kq8, Kvq8 vq8,
                     InklingRel rel, const float* sinks, int64_t pos, int rows, float* out, int dim, int n_head,
                     int kv_heads, float scale, int window, int ring, float* work, size_t work_floats, void* stream,
-                    int64_t room, bool int8_dot, const long long* at) {
+                    int64_t room, bool int8_dot, const long long* at, const float* gate) {
     if (rows <= 0) return;
     if (at && room <= 0) throw std::invalid_argument("inkling_attend: the position on the card needs a room");
     AttnArgs a =
@@ -1661,6 +1789,7 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
         splits_of(span_room, window, a.split, a.nslot);
         const size_t need = size_t(rows) * n_head * a.nslot * (AT_DIM + 2);
         if (need <= work_floats) {
+            a.gate = gate;
             if (at) launch_dec(a, AttnAt{at}, rows, kq, vq, int8_dot, st);
             else launch_dec(a, AttnOne{}, rows, kq, vq, int8_dot, st);
             return;
@@ -1674,6 +1803,7 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
         else if (vq) attn_mma_kernel<false, true><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
         else attn_mma_kernel<false, false><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
         check_launch("inkling_attend");
+        if (gate) mul_sigmoid(out, gate, n_head * dim, rows, n_head * dim, false, stream);
         return;
     }
     const int tq = rows >= 8 ? 8 : rows >= 4 ? 4 : rows >= 2 ? 2 : 1;
@@ -1685,6 +1815,7 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
         default: launch_attn_q<1>(a, g, st, kq, vq); break;
     }
     check_launch("inkling_attend");
+    if (gate) mul_sigmoid(out, gate, n_head * dim, rows, n_head * dim, false, stream);
 }
 
 void inkling_attend_seqs(const float* q, const InklingAttnSeq* seqs, int rows, InklingRel rel, const float* sinks,
@@ -1795,6 +1926,45 @@ void inkling_mix(const InklingMix& m, int n, int rows, float eps, void* stream) 
     check_launch("inkling_mix");
 }
 
+namespace {
+ConvIn conv_in(const InklingConvIn& c) {
+    if (!c.acc || !c.state || !c.w || (!c.x && !(c.parts && c.weights && c.n_parts > 0)))
+        throw std::invalid_argument("inkling_conv_in: acc, state, w and an input");
+    return ConvIn{c.x, c.parts, c.weights, c.n_parts, c.state, c.w, c.acc, c.save, c.fresh, conv_scale(nullptr)};
+}
+bool aligned16(const void* p) { return (uintptr_t(p) & 15) == 0; }
+}  // namespace
+
+void inkling_conv_in(const InklingConvIn& c, int n, void* stream) {
+    conv_in_kernel<<<grid(n, 256), 256, 0, cs(stream)>>>(conv_in(c), n);
+    check_launch("inkling_conv_in");
+}
+
+void inkling_mix_conv(const InklingMix* mixes, int count, const InklingConvIn* conv, int n, float eps, void* stream) {
+    if (count < 1 || count > 2) throw std::invalid_argument("inkling_mix_conv: 1 or 2 mixes");
+    bool fits = n % 4 == 0 && n / 4 <= MIX4_MAX;
+    MixPair mp{};
+    for (int k = 0; k < count; ++k) {
+        const InklingMix& m = mixes[k];
+        if (m.n_state < 1 || m.n_state > kInklingMaxStates || m.n_query < 1 || m.n_query > 4)
+            throw std::invalid_argument("inkling_mix_conv: 1 to 8 states and 1 to 4 queries");
+        fits = fits && m.n_state <= MIX_CONV_STATES && aligned16(m.query);
+        for (int j = 0; j < m.n_state; ++j) fits = fits && aligned16(m.state[j]);
+        for (int q = 0; q < m.n_query; ++q) fits = fits && aligned16(m.out[q]);
+        mp.m[k] = m;
+    }
+    if (conv) fits = fits && aligned16(conv->acc) && aligned16(conv->save);
+    if (!fits) {   // the calls one after the other
+        if (conv) inkling_conv_in(*conv, n, stream);
+        for (int k = 0; k < count; ++k) inkling_mix(mixes[k], n, 1, eps, stream);
+        return;
+    }
+    const int threads = (n / 4 + WARP - 1) / WARP * WARP;   // launch_mix4()'s
+    const ConvIn c = conv ? conv_in(*conv) : ConvIn{};
+    mix_conv_kernel<<<count, threads, 0, cs(stream)>>>(mp, c, n, eps);
+    check_launch("inkling_mix_conv");
+}
+
 void inkling_control(void* blas, const float* cur, const float* msg, const float* down, const float* gain,
                      const float* forget, float* work, float* out, int n, int rank, int rows, float eps,
                      void* stream) {
@@ -1868,9 +2038,7 @@ void inkling_gemv(const float* w, const float* x, float* y, int n_in, int n_out,
 }
 
 namespace {
-template <class From>
-void clip_many(const InklingClipJob* jobs, int count, int rows, const From& from, void* stream) {
-    if (rows <= 0 || count <= 0) return;
+ClipJobs clip_jobs(const InklingClipJob* jobs, int count, int rows) {
     if (count > 4) throw std::invalid_argument("inkling_clip_many: at most 4 jobs");
     ClipJobs c{};
     c.first[0] = 0;
@@ -1879,6 +2047,13 @@ void clip_many(const InklingClipJob* jobs, int count, int rows, const From& from
         c.j[k] = jobs[k];
         c.first[k + 1] = c.first[k] + rows * jobs[k].heads;
     }
+    return c;
+}
+
+template <class From>
+void clip_many(const InklingClipJob* jobs, int count, int rows, const From& from, void* stream) {
+    if (rows <= 0 || count <= 0) return;
+    const ClipJobs c = clip_jobs(jobs, count, rows);
     const int per_block = 256 / WARP;
     clip_many_kernel<From><<<grid(c.first[count], per_block), 256, 0, cs(stream)>>>(c, count, from);
     check_launch("inkling_clip_many");
@@ -1898,6 +2073,23 @@ void inkling_clip_many_seqs(const InklingClipJob* jobs, int count, int rows, con
     for (int t = 0; t < rows; ++t) from.pos[t] = (long long) pos[t];
     clip_many(jobs, count, rows, from, stream);
 }
+
+namespace {
+KvArgs kv_args(const float* kraw, const float* vraw, float* k_state, float* v_state, const float* k_w, const float* v_w,
+               const float* k_taps, const float* v_taps, int kv_heads, int rows, float k_clip, float eps,
+               const InklingKvDst& dst, int64_t pos, float* k_out, float* v_out) {
+    KvArgs a{};
+    a.raw[0] = kraw, a.raw[1] = vraw;
+    a.state[0] = k_state, a.state[1] = v_state;
+    a.w[0] = k_w, a.w[1] = v_w;
+    a.taps[0] = k_taps, a.taps[1] = v_taps;
+    a.out[0] = k_out, a.out[1] = v_out;
+    a.dst = dst;
+    a.kv_heads = kv_heads, a.rows = rows, a.k_clip = k_clip, a.eps = eps;
+    a.pos = (long long) pos;
+    return a;
+}
+}  // namespace
 
 void inkling_kv_store(const float* kraw, const float* vraw, float* k_state, float* v_state, const float* k_w,
                       const float* v_w, const float* k_taps, const float* v_taps, int kv_heads, int dim, int rows,
@@ -1930,18 +2122,32 @@ void inkling_kv_store(const float* kraw, const float* vraw, float* k_state, floa
         check_launch("inkling_kv_store");
         return;
     }
-    KvArgs a{};
-    a.raw[0] = kraw, a.raw[1] = vraw;
-    a.state[0] = k_state, a.state[1] = v_state;
-    a.w[0] = k_w, a.w[1] = v_w;
-    a.taps[0] = k_taps, a.taps[1] = v_taps;
-    a.out[0] = k_out, a.out[1] = v_out;
-    a.dst = dst;
-    a.kv_heads = kv_heads, a.rows = rows, a.k_clip = k_clip, a.eps = eps;
-    a.pos = (long long) pos;
+    const KvArgs a = kv_args(kraw, vraw, k_state, v_state, k_w, v_w, k_taps, v_taps, kv_heads, rows, k_clip, eps, dst,
+                             pos, k_out, v_out);
     if (at) kv_store_kernel<<<dim3(kv_heads, 2), AT_DIM, 0, cs(stream)>>>(a, KvAt{{}, at});
     else kv_store_kernel<<<dim3(kv_heads, 2), AT_DIM, 0, cs(stream)>>>(a, KvOne{});
     check_launch("inkling_kv_store");
+}
+
+void inkling_kv_store_clip(const float* kraw, const float* vraw, float* k_state, float* v_state, const float* k_w,
+                           const float* v_w, const float* k_taps, const float* v_taps, int kv_heads, int dim, int rows,
+                           float k_clip, float eps, const InklingKvDst& dst, int64_t pos, float* k_out, float* v_out,
+                           const InklingClipJob* jobs, int count, void* stream, const long long* at) {
+    if (rows <= 0) return;
+    if (rows > KV_ROWS || count <= 0) {
+        inkling_kv_store(kraw, vraw, k_state, v_state, k_w, v_w, k_taps, v_taps, kv_heads, dim, rows, k_clip, eps, dst,
+                         pos, k_out, v_out, stream, at);
+        inkling_clip_many(jobs, count, rows, pos, stream, at);
+        return;
+    }
+    if (dim != AT_DIM) throw std::invalid_argument("inkling_kv_store_clip: heads of 128 values only");
+    const KvArgs a = kv_args(kraw, vraw, k_state, v_state, k_w, v_w, k_taps, v_taps, kv_heads, rows, k_clip, eps, dst,
+                             pos, k_out, v_out);
+    const ClipJobs c = clip_jobs(jobs, count, rows);
+    const int blocks = 2 * kv_heads + grid(c.first[count], AT_DIM / WARP);
+    if (at) kv_clip_kernel<<<blocks, AT_DIM, 0, cs(stream)>>>(a, KvAt{{}, at}, c, count, ClipAt{at});
+    else kv_clip_kernel<<<blocks, AT_DIM, 0, cs(stream)>>>(a, KvOne{}, c, count, ClipFrom{(long long) pos});
+    check_launch("inkling_kv_store_clip");
 }
 
 void inkling_kv_store_seqs(const float* kraw, const float* vraw, const InklingKvSeq* seqs, const float* k_w,
