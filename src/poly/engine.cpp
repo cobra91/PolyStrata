@@ -4311,8 +4311,10 @@ bool Engine::moe(int visit, int n, const std::function<void()>* first) {
                 }
                 ExpertScales es = expert_scales(L);
                 for (int j = 0; j < m && (es.gate || es.up); ++j) es.e[j] = cached[i0 + j].e;
-                act_rows(g_, h_, m, limit, &es);
-                kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_, m, st_);
+                if (!act_rows_q8_1(g_, q8_, m, &es)) {
+                    act_rows(g_, h_, m, limit, &es);
+                    kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_, m, st_);
+                }
                 if (!(slots && kernels::native_mmvq_slots((int) L.d_type, down, m, n_ff_exp_, n_embd_, st_)))
                     for (int j = 0; j < m; ++j)
                         kernels::native_mmvq((int) L.d_type, down.w[j], down.x[j], down.y[j], n_ff_exp_, n_embd_, 1,
@@ -4438,9 +4440,10 @@ bool Engine::moe_card(Layer& L, int il, int n) {
         kernels::native_mmvq_ids((int) L.u_type, up, rr, n_embd_, n_ff_exp_, st_);
     }
     const ExpertScales es = expert_scales(L, d_ids_);
-    act_rows(g_, h_, rr, clamp_exp_[(size_t) il], &es);
+    const bool act_q8 = act_rows_q8_1(g_, q8_, rr, &es);
+    if (!act_q8) act_rows(g_, h_, rr, clamp_exp_[(size_t) il], &es);
     if (!L.h_s_down.empty()) expert_weights(d_wts_, fp(L.s_down), d_ids_, rr, st_);
-    kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * rr, 1, st_);   // the rows back to back, as one vector
+    if (!act_q8) kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * rr, 1, st_);   // the rows back to back, as one vector
     const kernels::MmvqIds down{table, d_ids_, L.gu2(), q8_, kernels::native_q8_1_bytes(n_ff_exp_), 1, d_,
                                 (size_t) n_embd_, lane_slots_};
     kernels::native_mmvq_ids((int) L.d_type, down, rr, n_ff_exp_, n_embd_, st_);

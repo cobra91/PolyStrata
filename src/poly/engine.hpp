@@ -469,6 +469,13 @@ protected:
     /// moe_card() of n tokens leaves the experts' sum to the layer's tail: d_ holds each picked expert's output and
     /// d_wts_ its weight, and run() sets card_parts_ for the tail that follows.
     virtual bool card_sum_in_tail(int n) const { (void) n; return false; }
+    /// The routed experts' activation of `rows` rows of gate_up straight into q8, the Q8_1 blocks of the down
+    /// products' input: what act_rows() into h_ and native_quantize_q8_1() of the rows give, in fewer launches.
+    /// true: done (h_ is not written); false (the default): those two run.
+    virtual bool act_rows_q8_1(const float* gate_up, void* q8, int rows, const ExpertScales* es) {
+        (void) gate_up, (void) q8, (void) rows, (void) es;
+        return false;
+    }
     /// The scores of a layer's router for n tokens, into rl_.  The engine's own: the router's matrix times the
     /// experts' input (xn_).
     virtual void router_scores(const Layer& L, int n);
