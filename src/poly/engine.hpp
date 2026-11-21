@@ -534,6 +534,8 @@ protected:
     /// The other names of a tensor or a metadata key in the files of this architecture, or null.
     virtual const Names* tensor_alias(const char* name) const { (void) name; return nullptr; }
     virtual const Names* meta_alias(const char* key) const { (void) key; return nullptr; }
+    /// The file's layer that layer il runs (Inkling's visits: their physical layer), for the log.
+    virtual int physical(int il) const { return il; }
 
     // ---- what it builds on ----
     /// Whether layer il is this engine's: one of [lo_, hi_), or the draft block on the card that ends the model.

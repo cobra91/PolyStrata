@@ -112,6 +112,22 @@ const Names* Inkling::meta_alias(const char* key) const {
     return nullptr;
 }
 
+void Inkling::split_layers(const Shards& file, int& n_layer, int& keep_lo, int& keep_hi) {
+    const std::string pre = file.get("general.architecture")->s + ".";
+    const auto num = [&](const char* key) {
+        const MetaValue* v = file.get(pre + key);
+        for (const Names& n : kMetaNames)
+            if (!v && std::strcmp(n.name, key) == 0)
+                for (const char* other : n.other)
+                    if (other && !v) v = file.get(pre + other);
+        if (!v) throw std::runtime_error(std::string("unsupported model: no ") + pre + key);
+        return (int) v->u;
+    };
+    keep_lo = num("loop.start");
+    keep_hi = num("loop.end");
+    if (pre == "inkling2.") n_layer -= (num("loop.count") - 1) * (keep_hi - keep_lo);   // Unsloth's: every visit
+}
+
 void Inkling::load_geometry() {
     load_shape();
     auto find = [&](const char* key) { return meta_in(*gg_, key); };
@@ -185,14 +201,20 @@ void Inkling::load_geometry() {
     clamp_exp_.assign((size_t) n_layer_ + 1, INFINITY);
     clamp_shexp_ = clamp_exp_;
 
-    // Not supported yet: a draft model and a split over cards.
+    // Not supported yet: a draft model.
     if (!opt_.draft_model.empty()) throw std::runtime_error("Inkling 2: --draft-model is not supported yet");
     // step()'s rows are a sequence's each, and the _seqs kernels take kInklingSeqRows of them a launch
     if (opt_.batch + 1 > kInklingSeqRows)
         throw std::runtime_error("Inkling 2: --batch takes at most " + std::to_string(kInklingSeqRows - 1));
     if (opt_.kv_format != KvFmt::kFp16 && opt_.kv_format != KvFmt::kQ8_0)
         throw std::runtime_error("Inkling 2: the attention cache is fp16 or q8_0");
-    if (!opt_.layer_split.empty()) throw std::runtime_error("Inkling 2: --layer-split is not supported yet");
+    // A card of a split has a run of physical layers (split_layers()), here its visits: the core's on one card.
+    const auto visit = [&](int p) {
+        if (p > core_start_ && p < core_end_) throw std::logic_error("Inkling 2: a card starts inside the loop");
+        return p <= core_start_ ? p : p + (n_passes_ - 1) * (core_end_ - core_start_);
+    };
+    lo_ = visit(lo_);
+    if (end_ >= 0) end_ = visit(end_);
     // The file has no block that guesses ahead, so a window's guesses come from the conversation's repeats
     // (--lookup) only: opt-in with --window, a token at a time by default.
     if (opt_.window == 0) opt_.window = 1;
@@ -223,10 +245,10 @@ void Inkling::load_layer(int v) {
     auto mat = [&](const char* n, int64_t a, int64_t b) { return upload(tensor(p, n), blk(p, n), a, b, kAnyMat); };
     const int64_t E = n_embd_, hq = (int64_t) n_head_ * head_dim_, hk = (int64_t) n_kv_ * head_dim_;
 
-    if (v == 0) {   // the model's own small tensors, beside the first layer's
-        const TensorInfo* tn = gg_->find("token_embd_norm.weight");
-        tok_norm_ = upload(tn, "token_embd_norm.weight", E, 1, kF32);
-        out_query_ = upload(gg_->find("output_res_query.weight"), "output_res_query.weight", E, 1, kF32);
+    if (v == lo_) {   // the model's own small tensors, beside the card's first layer: the input's and the output's
+        if (lo_ == 0) tok_norm_ = upload(gg_->find("token_embd_norm.weight"), "token_embd_norm.weight", E, 1, kF32);
+        if (hi_ == n_layer_)
+            out_query_ = upload(gg_->find("output_res_query.weight"), "output_res_query.weight", E, 1, kF32);
     }
     B.phys = p;
     B.pass = 0;

@@ -16,8 +16,9 @@
 // attention cache and convolution state.
 //
 // In the engine a run of a layer is a "visit": 48 of them in the order they run (layers_, n_layer_), each with the
-// weights of its physical layer.  The reference for the math is llama.cpp's src/models/inkling2.cpp and
-// inkling2-loop.cpp (29b52d398b).
+// weights of its physical layer.  On several cards a card has a run of physical layers, and the loop's are on one
+// card: a card starts at layer 1 to 6 or 18 to 22.  The reference for the math is llama.cpp's
+// src/models/inkling2.cpp and inkling2-loop.cpp (29b52d398b).
 #pragma once
 
 #include "engine.hpp"
@@ -29,6 +30,10 @@ namespace strata::poly {
 
 class Inkling final : public Engine {
 public:
+    /// For a layer split (Engine::open()): the file's layers (n_layer: its block_count, which in Unsloth's files
+    /// counts every visit) as physical ones, and the loop's [keep_lo, keep_hi), which runs on one card: a later visit
+    /// runs the first one's experts (Layer::alias) and weights.
+    static void split_layers(const Shards& file, int& n_layer, int& keep_lo, int& keep_hi);
     size_t card_row_bytes() const override;
     void save_card_rows(int64_t first, int64_t n, uint8_t* dst) override;
     void load_card_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) override;
@@ -71,6 +76,7 @@ protected:
     void load_extra(const uint8_t* src, int64_t pos) override;
     const Names* tensor_alias(const char* name) const override;
     const Names* meta_alias(const char* key) const override;
+    int physical(int v) const override { return phys_of(v); }
 
 private:
     /// The residual streams of a token in r_, n_embd_ floats each: the stream itself, the four blocks' starts

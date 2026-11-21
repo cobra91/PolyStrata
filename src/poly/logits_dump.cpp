@@ -34,6 +34,7 @@ const char* const kUsage =
     "  --no-graphs            no recorded launches\n"
     "  --no-gpu-experts       every routed expert on the CPU\n"
     "  --vram-reserve-mib N   VRAM left free after the expert cache is filled, as strata-poly's\n"
+    "  --layer-split auto|N[,N...]  the layers across the cards, as strata-poly's (STRATA_POLY_CARDS=2: two on one)\n"
     "  --reload               after the prompt, save the state and rows, reset, feed other tokens, load them back\n"
     "  --images FILE          pictures: strata-vision's records (SVE1), one a run of --image-pad in the prompt\n"
     "  --image-pad ID         the token that stands for a picture's rows (Inkling 2: 200054)\n";
@@ -145,6 +146,7 @@ int main(int argc, char** argv) {
             else if (a == "--no-graphs") o.graphs = false;
             else if (a == "--no-gpu-experts") o.gpu_experts = false;
             else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(val());
+            else if (a == "--layer-split") o.layer_split = val();
             else if (a == "--reload") reload = true;
             else if (a == "--images") images = val();
             else if (a == "--image-pad") image_pad = (int32_t) std::atoi(val());

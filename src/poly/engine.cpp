@@ -481,9 +481,13 @@ private:
 // The first layer of each card's share of n_layer layers, for Options::layer_split on `cards` cards; empty: no
 // split.  "auto" shares the layers' bytes out by each card's free VRAM, less what every card's engine takes beside
 // its layers and, on the last card, the output and the draft block.  Then every card caches about the same share
-// of its layers' experts, which is where a byte of VRAM on one is worth as much as on another.
-std::vector<int> layer_starts(const std::string& split, const Shards& file, int n_layer, int cards) {
+// of its layers' experts, which is where a byte of VRAM on one is worth as much as on another.  No card starts
+// inside [keep_lo, keep_hi) but at keep_lo: those layers run on one card (Inkling's loop); "auto" takes the
+// nearer of keep_lo and keep_hi by the layers' bytes.
+std::vector<int> layer_starts(const std::string& split, const Shards& file, int n_layer, int cards, int keep_lo = 0,
+                              int keep_hi = 0) {
     if (split.empty() || cards < 2) return {};
+    const auto inside = [&](int il) { return il > keep_lo && il < keep_hi; };
     std::vector<int> starts{0};
     if (split != "auto") {
         for (size_t at = 0; at < split.size();) {
@@ -496,6 +500,11 @@ std::vector<int> layer_starts(const std::string& split, const Shards& file, int 
                 throw std::runtime_error("--layer-split " + split + ": the first layer of each later card, rising, "
                                          "between 1 and " + std::to_string(n_layer - 2) + " (\"auto\" shares them "
                                          "out by each card's free VRAM)");
+            if (inside((int) v))
+                throw std::runtime_error("--layer-split " + split + ": layers " + std::to_string(keep_lo) + " to " +
+                                         std::to_string(keep_hi - 1) + " run on one card, so a card starts at layer " +
+                                         std::to_string(keep_lo) + " or " + std::to_string(keep_hi) +
+                                         ", or outside them");
             starts.push_back((int) v);
             at = comma + 1;
         }
@@ -531,7 +540,18 @@ std::vector<int> layer_starts(const std::string& split, const Shards& file, int 
     for (int d = 1; d < cards; ++d) {
         share += room[(size_t) d - 1] / all_room;
         int il = starts.back() + 1;   // card d starts where the layers before it pass the cards before it's share
-        while (il < n_layer - 2 * (cards - d) && before[(size_t) il] < share * before[(size_t) n_layer]) ++il;
+        const int most = n_layer - 2 * (cards - d);
+        while (il < most && before[(size_t) il] < share * before[(size_t) n_layer]) ++il;
+        if (inside(il)) {
+            const double want = share * before[(size_t) n_layer];
+            const bool lo_ok = keep_lo > starts.back(), hi_ok = keep_hi <= most;
+            if (!lo_ok && !hi_ok)
+                throw std::runtime_error("layers " + std::to_string(keep_lo) + " to " + std::to_string(keep_hi - 1) +
+                                         " run on one card: there is no place for card " + std::to_string(d) +
+                                         " to start");
+            il = !hi_ok || (lo_ok && want - before[(size_t) keep_lo] <= before[(size_t) keep_hi] - want) ? keep_lo
+                                                                                                          : keep_hi;
+        }
         starts.push_back(il);
     }
     return starts;
@@ -1720,9 +1740,13 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
         const MetaValue* blocks = file.get(name + ".block_count");
         const MetaValue* nextn = file.get(name + ".nextn_predict_layers");
         if (!blocks) throw std::runtime_error("the GGUF has no " + name + ".block_count");
+        int n_layer = (int) blocks->u - (nextn ? (int) nextn->u : 0), keep_lo = 0, keep_hi = 0;
+#if !defined(STRATA_GPU_METAL)
+        if (inkling) Inkling::split_layers(file, n_layer, keep_lo, keep_hi);
+#endif
         int was = 0;
         ck(cudaGetDevice(&was), "cudaGetDevice");
-        starts = layer_starts(o.layer_split, file, (int) blocks->u - (nextn ? (int) nextn->u : 0), cards);
+        starts = layer_starts(o.layer_split, file, n_layer, cards, keep_lo, keep_hi);
         ck(cudaSetDevice(was), "cudaSetDevice");
     }
     if (starts.empty()) {
@@ -1764,7 +1788,8 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
     int k = 0;
     for (const Engine* e = first.get(); e; e = e->next_.get(), ++k)
         std::fprintf(stderr, "strata-poly: layers %d to %d on card %d: %d of %d routed experts in VRAM (%.1f GiB)\n",
-                     e->lo_, e->hi_ - 1, k, e->cached_, e->n_moe_ * e->n_expert_, double(e->exp_at_) / double(1ull << 30));
+                     e->physical(e->lo_), e->physical(e->hi_ - 1), k, e->cached_, e->n_moe_ * e->n_expert_,
+                     double(e->exp_at_) / double(1ull << 30));
     return first;
 }
 
