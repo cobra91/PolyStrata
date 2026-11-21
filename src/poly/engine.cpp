@@ -5003,7 +5003,7 @@ void Engine::run(const int32_t* tokens, int n) {
     const auto up = [&](int il, int m, size_t rec) {
         Layer& L = layers_[(size_t) il];
         const size_t head = (size_t) head_key(il, m) * recs + rec;
-        if (replay && L.fixed) replayed(L.heads, head, [&] { layer_head(L, il, m); });
+        if (replay && L.fixed && layer_graphs()) replayed(L.heads, head, [&] { layer_head(L, il, m); });
         else layer_head(L, il, m);
         if (!routed(L) || batched(layers_[(size_t) home_of(il)], m)) return;
         ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
@@ -5013,7 +5013,7 @@ void Engine::run(const int32_t* tokens, int n) {
     const auto tail = [&](int il, int m, size_t rec) {
         Layer& L = layers_[(size_t) il];
         dbg("ffn", il, fo_, n_embd_);
-        if (replay && L.fixed) replayed(L.tail, rec, [&] { layer_tail(L, il, m); });
+        if (replay && L.fixed && layer_graphs()) replayed(L.tail, rec, [&] { layer_tail(L, il, m); });
         else layer_tail(L, il, m);
     };
 
