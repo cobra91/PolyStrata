@@ -184,10 +184,11 @@ inline constexpr int kInklingMmaRows = kInklingSplitRows + 1;
 ///    batch.  One block walks all the keys of 21 tokens of a group; the queries, R, the softmax's weights and the bias
 ///    table's rows are rounded to halves, the caches' values too (a Q8_0 code times its scale), and the products sum
 ///    floats (llama.cpp's flash attention rounds Q, P and V the same way); the bias stays a float.  A token's result
-///    does not depend on the tokens beside it in the call.  On an A100 (sm_80) blocks of 85 tokens take each key
-///    and value to twice the rows and copy the next keys in while they work, to the same bits; `mma` =
-///    InklingMma::turing or ::fa2 asks for one kernel or the other on any card of the path (a test, to compare them;
-///    ::fa2 throws std::invalid_argument on a card without the shared memory, 94 KB a block).
+///    does not depend on the tokens beside it in the call.  On an A100 (sm_80), in a full layer's call that reaches
+///    past position 2,048, blocks of 85 tokens take each key and value to twice the rows and copy the next keys in
+///    while they work, to the same bits; `mma` = InklingMma::turing or ::fa2 asks for one kernel or the other on any
+///    card of the path (a test, to compare them; ::fa2 throws std::invalid_argument on a card without the shared
+///    memory, 94 KB a block).
 /// `at` (null: pos): the first token's position on the card, read when the launch runs, for a launch recorded in a
 /// CUDA graph and replayed at later positions (Engine::at_).  The same kernels as for pos, so the same bits.  It
 /// takes the split path, which is then sized by room alone: room > 0 and work enough (else std::invalid_argument).

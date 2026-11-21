@@ -746,8 +746,8 @@ void bench_attend_tiers(const std::vector<float>& table, float* dtable) {
     for (bool quant : {true, false})
         for (int w : {0, window})
             for (const std::pair<int, long long> call : {std::pair<int, long long>{4096, ctx - 4096},
-                                                         {1024, ctx - 1024}, {1024, 0}, {1024, 1024}, {1024, 3072},
-                                                         {1024, 7168}}) {
+                                                         {1024, ctx - 1024}, {1024, 0}, {1024, 1024}, {1024, 2048},
+                                                         {1024, 3072}, {1024, 7168}}) {
                 const int rows = call.first;
                 const long long pos = call.second;
                 double flop = 0;
