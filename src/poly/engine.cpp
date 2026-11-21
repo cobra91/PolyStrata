@@ -1756,8 +1756,7 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
     }
 
     // a card after another, each with the next run of layers; the last one has the output and the draft block
-    std::unique_ptr<Engine> first;
-    Engine* prev = nullptr;
+    std::vector<std::unique_ptr<Engine>> parts;
     for (size_t k = 0; k < starts.size(); ++k) {
         std::unique_ptr<Engine> e = make();
         const bool last = k + 1 == starts.size();
@@ -1766,23 +1765,42 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
             so.draft = false;
             so.draft_model.clear();
         }
-        if (first) {
-            so.window = first->opt_.window;   // every card's windows are the first one's
-            e->workers_ = first->workers_;
-        }
+        if (k > 0) so.window = parts[0]->opt_.window;   // every card's windows are the first one's
         e->lo_ = starts[k];
         e->end_ = last ? -1 : starts[k + 1];
         e->split_ = true;
         ck(cudaSetDevice((int) k % devices), "cudaSetDevice");
         try {
-            e->load(so);
+            e->load_layers(so);
+        } catch (const std::runtime_error& err) {
+            // on a card with several parts every part's layers, staging buffer and caches come before any expert
+            const std::string shared = k < (size_t) devices ? "" :
+                " (it shares a card with part " + std::to_string(k - (size_t) devices) + ", and the layers, "
+                "staging buffers and attention caches of both are in VRAM before any expert: give the card fewer "
+                "layers, a smaller --stage-mib or a shorter context)";
+            throw std::runtime_error("card " + std::to_string(k) + ": " + err.what() + shared);
+        }
+        parts.push_back(std::move(e));
+    }
+    // Then the expert caches, each of what its card has left.  A card with several parts leaves the later ones
+    // what they need beside their layers (mates_need()).
+    for (size_t k = 0; k < parts.size(); ++k) {
+        Engine& e = *parts[k];
+        for (size_t j = 0; j < parts.size(); ++j)
+            if (j != k && (int) j % devices == (int) k % devices) e.mates_.push_back(parts[j].get());
+        if (k > 0) e.workers_ = parts[0]->workers_;
+        ck(cudaSetDevice((int) k % devices), "cudaSetDevice");
+        try {
+            e.load_experts();
         } catch (const std::runtime_error& err) {
             throw std::runtime_error("card " + std::to_string(k) + ": " + err.what());
         }
-        Engine* at = e.get();
-        if (prev) prev->next_ = std::move(e);
-        else first = std::move(e);
-        prev = at;
+    }
+    std::unique_ptr<Engine> first = std::move(parts[0]);
+    Engine* prev = first.get();
+    for (size_t k = 1; k < parts.size(); ++k) {
+        prev->next_ = std::move(parts[k]);
+        prev = prev->next_.get();
     }
     ck(cudaSetDevice(0), "cudaSetDevice");
     int k = 0;
@@ -1908,6 +1926,38 @@ int64_t Engine::vram_free_mib() const {
     return next_ ? std::min(mib, next_->vram_free_mib()) : mib;
 }
 
+bool Engine::ram_is_tight() const {
+    const size_t ram = ram_available(), files = gg_->bytes() + (dg_ ? dg_->bytes() : 0);
+    return ram > 0 && files + (5ULL << 30) > ram;
+}
+
+int Engine::reserve_for(size_t total_b, bool ram_tight) const {
+    // 256 MiB at least, whatever was asked: the launches recorded later take theirs out of the reserve (mind_vram())
+    return opt_.vram_reserve_mib >= 0 ? std::max(opt_.vram_reserve_mib, 256) :
+#if defined(STRATA_GPU_METAL)
+           opt_.metal_balanced ? 256 :
+#endif
+           default_reserve_mib(total_b, ram_tight);
+}
+
+// Several engines of a split on one card (STRATA_POLY_CARDS) share its VRAM.  Each keeps its reserve free for the
+// launches it records, and one without an expert cache maps its attention caches' later rows from what is free
+// (cover() takes them out of a cache where there is one).  Their layers, staging buffers and caches are in VRAM
+// before any expert cache is filled (open()).
+size_t Engine::mates_need() const {
+    size_t need = 0, free_b = 0, total_b = 0;
+    if (!mates_.empty()) ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+    for (const Engine* m : mates_) {
+        const int mib = m->reserve_mib_ > 0 ? m->reserve_mib_ : m->reserve_for(total_b, m->ram_is_tight());
+        need += size_t(mib) << 20;
+        if (m->exp_) continue;
+        for (const Kv& k : m->kv_) need += k.reserved - k.mapped;
+        for (const Seq& q : m->seqs_)
+            for (const Kv& k : q.kv) need += k.reserved - k.mapped;
+    }
+    return need;
+}
+
 // Experts go to VRAM by use per byte when there are counts, the profile's and this run's, and otherwise the same
 // number from every layer.
 //
@@ -1924,15 +1974,11 @@ void Engine::fill_expert_cache() {
     if (!opt_.gpu_experts || n_moe_ == 0) return;
     size_t free_b = 0, total_b = 0;
     ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
-    const size_t ram = ram_available(), files = gg_->bytes() + (dg_ ? dg_->bytes() : 0);
-    ram_tight_ = ram > 0 && files + (5ULL << 30) > ram;
-    // 256 MiB at least, whatever was asked: the launches recorded later take theirs out of the reserve (mind_vram())
-    reserve_mib_ = opt_.vram_reserve_mib >= 0 ? std::max(opt_.vram_reserve_mib, 256) :
-#if defined(STRATA_GPU_METAL)
-                   opt_.metal_balanced ? 256 :
-#endif
-                   default_reserve_mib(total_b, ram_tight_);
-    size_t reserve = size_t(reserve_mib_) << 20;
+    ram_tight_ = ram_is_tight();
+    reserve_mib_ = reserve_for(total_b, ram_tight_);
+    // the other engines of a split on this card have their layers here already, and what they need beside them is
+    // left with the reserve
+    size_t reserve = (size_t(reserve_mib_) << 20) + mates_need();
     // The first time the pool claims what the card has but the margin (the reserve), for the whole run, and no more
     // than the model can use (below, where the experts' bytes are known): from then on the cache and the rows share it.
     // A later call (resize_cache()) divides what the pool holds again.
@@ -2240,7 +2286,8 @@ bool Engine::mind_card_vram() {
         return true;
     }
     if (minds_++ == 0) return false;   // nothing is recorded before the first request
-    const int64_t keep = opt_.vram_reserve_mib >= 0 || ram_tight_ ? reserve_mib_ : std::max(reserve_mib_ / 2, 128);
+    const int64_t keep = (opt_.vram_reserve_mib >= 0 || ram_tight_ ? reserve_mib_ : std::max(reserve_mib_ / 2, 128)) +
+                         (int64_t) (mates_need() >> 20);
     if (free < keep / 2) {
         shrink_cache(size_t(keep - free) << 20);
         held_is_budget();
@@ -2737,6 +2784,12 @@ void Engine::follow(int written) {
 }
 
 void Engine::load(const Options& o) {
+    load_layers(o);
+    load_experts();
+}
+
+// load() up to the expert cache: the weights in VRAM, and the caches, the scratch and the staging buffer.
+void Engine::load_layers(const Options& o) {
 #if defined(STRATA_GPU_METAL)
     gpu::metal::set_optimize(o.metal_optimize);
     gpu::metal::set_scoped_residency(o.metal_balanced);
@@ -2914,6 +2967,11 @@ void Engine::load(const Options& o) {
                    !split_;
     if (block_guess_) std::fprintf(stderr, "strata-poly: STRATA_BLOCK_GUESS: the model guesses its own blocks\n");
     alloc();
+}
+
+// The rest of load(), from the expert cache on: it takes what the card has free once the layers, the staging
+// buffer and the caches of every engine on the card are in VRAM (open()).
+void Engine::load_experts() {
     if (!opt_.profile.empty()) read_profile(opt_.profile, (int) layers_.size(), n_expert_, prior_);
     fill_expert_cache();
     ensure_stage();
@@ -2946,7 +3004,7 @@ void Engine::load(const Options& o) {
         for (const Kv& k : kv_) more += k.reserved - k.mapped;
         for (const Seq& q : seqs_)
             for (const Kv& k : q.kv) more += k.reserved - k.mapped;
-        if ((int64_t) ((more + kArenaPiece) >> 20) + reserve_mib_ <= vram_free_mib()) {
+        if ((int64_t) ((more + kArenaPiece + mates_need()) >> 20) + reserve_mib_ <= vram_free_mib()) {
             for (int s = sequences() - 1; s >= 0; --s) {   // ends with the first one bound
                 if (s != bound_) {
                     park_bound();

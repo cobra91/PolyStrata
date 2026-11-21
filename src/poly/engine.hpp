@@ -591,7 +591,17 @@ protected:
     void lin_jobs(const LinJob* jobs, int count, int n);
     /// The layer's ExpertScales for rows of the experts ids[r] (on the card), or none.
     ExpertScales expert_scales(const Layer& L, const int32_t* ids = nullptr) const;
+    /// load() in two: the layers, caches, scratch and staging buffer; then the expert cache and what follows it.
+    void load_layers(const Options& o);
+    void load_experts();
     void fill_expert_cache();
+    /// The reserve fill_expert_cache() keeps free on a card of total_b bytes, and whether the machine's RAM is within
+    /// 5 GiB of the model's files.
+    int reserve_for(size_t total_b, bool ram_tight) const;
+    bool ram_is_tight() const;
+    /// What the other engines on this card (mates_) need free beside what they hold, which this one's expert cache
+    /// leaves them.
+    size_t mates_need() const;
     void ensure_stage();
     void start_swaps();
     void plan_ahead(Layer& L, int il);
@@ -706,6 +716,8 @@ protected:
     int end_ = -1;                        ///< what open() asked for hi_; -1: the model's end
     bool split_ = false;                  ///< one of several engines: a call sets its card first
     std::unique_ptr<Engine> next_;
+    /// The engines of the split on the same card as this one (STRATA_POLY_CARDS above the cards there are)
+    std::vector<const Engine*> mates_;
     int64_t read_draft_calls_ = 0;               ///< read_draft_calls_for_test()
     const float* pass_ = nullptr;
     int64_t pass_at_ = 0;
