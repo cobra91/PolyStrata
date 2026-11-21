@@ -21,6 +21,7 @@
 #pragma once
 
 #include "engine.hpp"
+#include "strata/poly/inkling_kernels.hpp"
 
 #include <algorithm>
 
@@ -59,6 +60,9 @@ protected:
     bool route_card(int il, int n, int32_t* ids, float* w) override;
     void router_scores(const Layer& L, int n) override;
     void moe_shared(const Layer& L, int il, int n) override;
+    /// A token's (fused()), outside a window of guesses: the same for every call of one token, so that a recording
+    /// of moe_card() serves run() and step() alike.
+    bool card_sum_in_tail(int n) const override { return n == 1 && !opt_.dump && opt_.window == 1; }
     void finish_logits(float* logits, int rows) override;
     void shift_rows(ptrdiff_t by) override;
     size_t extra_bytes() const override;
@@ -115,7 +119,13 @@ private:
     void gather(int k, float* dst, int n, int first = 0);
     void scatter(int k, const float* src, int n);
     void copy_stream(int from, int to, int n);
-    void attn(Block& B, int il, const float* xq, const float* xk, const float* xv, const void* const* q8, int n);
+    void attn(Block& B, int il, const float* xq, const float* xk, const float* xv, const void* const* q8, int n,
+              bool fuse);
+    /// A token alone (not step()'s rows, no --dump-layers) goes in fewer launches, the same bits: the visit before's
+    /// tail convolution with the first mix, K and V's store with the clips, the attention's gate with its output,
+    /// three input norms in one launch, the attention's convolution with the FFN's mix and, with the experts on the
+    /// card, their sum with the tail's convolution.
+    bool fused(int n) const { return n == 1 && !rows_of_ && !opt_.dump; }
     int64_t attn_room(const Block& B, int n) const;
     void post_conv(const float* x, float* state, const Dev& w, float* acc, int n, bool fresh, const Row* rows);
     void conv_snaps(const float* x, const float* state, int channels, int n);
@@ -141,6 +151,8 @@ private:
     // device scratch, rows_ tokens each
     float *res_ = nullptr;                 ///< the stream (kCur) from a layer's head to its tail
     const Row* tail_rows_ = nullptr;       ///< step()'s rows (rows_of_) from a layer's head to its tail
+    InklingConvIn tail_conv_;              ///< a token's tail convolution, left to the next visit's head (fused())
+    bool tail_wait_ = false;               ///< tail_conv_ is still to be done
     float *blk_[4] = {};                   ///< the blocks, gathered from r_
     float *bank_ = nullptr, *bank_out_ = nullptr;
     float *msg_[4] = {};                   ///< a core layer's messages: q, k, v, ffn

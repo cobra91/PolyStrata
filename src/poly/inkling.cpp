@@ -450,7 +450,8 @@ void Inkling::conv_snaps(const float* x, const float* state, int channels, int n
 }
 
 // The attention from its three normed inputs (and their Q8_1 copies) to ao_, through the output's convolution.
-void Inkling::attn(Block& B, int v, const float* xq, const float* xk, const float* xv, const void* const* xq8, int n) {
+void Inkling::attn(Block& B, int v, const float* xq, const float* xk, const float* xv, const void* const* xq8, int n,
+                   bool fuse) {
     const int hk = n_kv_ * head_dim_, hq = n_head_ * head_dim_;
     // the projections of the three inputs, those of one format in one launch
     const LinJob proj[8] = {{&B.wq, xq, q_, xq8[0]},     {&B.wgate, xq, gate_, xq8[0]},
@@ -498,20 +499,26 @@ void Inkling::attn(Block& B, int v, const float* xq, const float* xk, const floa
         const long long* at = recording_ ? at_ : nullptr;   // a recorded launch: the position from what at_ holds
         conv_snaps(kraw_, B.conv, hk, n);
         conv_snaps(vraw_, B.conv + v_at, hk, n);
-        inkling_kv_store(kraw_, vraw_, B.conv, B.conv + v_at, fp(B.k_conv), fp(B.v_conv), B.swa ? nullptr : ktap_,
-                         B.swa ? nullptr : vtap_, n_kv_, head_dim_, n, qk_clip_, rms_eps_, kv_dst(q8(), B.plane, ring),
-                         pos_, k_, v_, st_, at);
-        inkling_clip_many(jobs, 2, n, pos_, st_, at);
+        if (fuse) {
+            inkling_kv_store_clip(kraw_, vraw_, B.conv, B.conv + v_at, fp(B.k_conv), fp(B.v_conv),
+                                  B.swa ? nullptr : ktap_, B.swa ? nullptr : vtap_, n_kv_, head_dim_, n, qk_clip_,
+                                  rms_eps_, kv_dst(q8(), B.plane, ring), pos_, k_, v_, jobs, 2, st_, at);
+        } else {
+            inkling_kv_store(kraw_, vraw_, B.conv, B.conv + v_at, fp(B.k_conv), fp(B.v_conv),
+                             B.swa ? nullptr : ktap_, B.swa ? nullptr : vtap_, n_kv_, head_dim_, n, qk_clip_, rms_eps_,
+                             kv_dst(q8(), B.plane, ring), pos_, k_, v_, st_, at);
+            inkling_clip_many(jobs, 2, n, pos_, st_, at);
+        }
         dump("Qcur", v, q_, hq, n);
         dump("Kcur", v, k_, hk, n);
         dump("Vcur", v, v_, hk, n);
         dump("Rcur", v, rel_, n_head_ * n_rel_, n);
         const InklingAttnSeq c = attn_seq(q8(), B.plane, pos_, attn_room(B, n));
         inkling_attend(q_, c.kcache, c.vcache, c.kq8, c.vq8, rel, sink_, pos_, n, att_, head_dim_, n_head_, n_kv_,
-                       scale, window, ring, awork_, awork_n_, st_, c.room, int8_dot_, at);
+                       scale, window, ring, awork_, awork_n_, st_, c.room, int8_dot_, at, fuse ? gate_ : nullptr);
     }
     dump("kqv_out", v, att_, hq, n);
-    mul_sigmoid(att_, gate_, hq, n, hq, false, st_);
+    if (!fuse) mul_sigmoid(att_, gate_, hq, n, hq, false, st_);
     lin(B.wo, att_, o_, n);   // the post-convolution: layer_head(), with the residual
 }
 
@@ -526,6 +533,16 @@ void Inkling::layer_head(Layer& L, int v, int n) {
     const bool direct = n == 1;
     float* const cres = work_stream(n);
     tail_rows_ = rows_of_;   // step()'s rows, for the tail's convolution
+    // A token alone has its launches fused (fused()): the visit before's tail convolution goes in with the first
+    // mix here, the attention's with the FFN's mix.
+    const bool fuse = fused(n);
+    // the visit before's, still to do (none before the card's first: a call cut short leaves its own behind)
+    const InklingConvIn* last = tail_wait_ && v != lo_ ? &tail_conv_ : nullptr;
+    tail_wait_ = false;
+    const auto flush = [&] {
+        if (last) inkling_conv_in(*last, n_embd_, st_);
+        last = nullptr;
+    };
     if (v == 0) {   // the embedding, normed, is the first block's start
         gather(kCur, o_, n);
         rms_norm(o_, fp(tok_norm_), res_, n_embd_, n, rms_eps_, st_);
@@ -546,6 +563,7 @@ void Inkling::layer_head(Layer& L, int v, int n) {
         // a later pass of the core starts from layer 5's output, with what the pass before left for its messages:
         // the start of the block in the core's middle (its layer 11's output) and the stream (its layer 17's)
         if (B.pass > 0 && ip == core_start_) {
+            flush();
             const int core_in = kBlock0 + core_start_ / kBlockSize;
             copy_stream(core_in + 1, kBank, n);
             copy_stream(kCur, kBankOut, n);
@@ -568,31 +586,40 @@ void Inkling::layer_head(Layer& L, int v, int n) {
     // the attention's inputs: the stream, or its mix with the blocks (one for a window layer, Q, K and V apart
     // for a full one)
     const float* in[3] = {cres, cres, cres};
+    // the mixes: the attention's inputs, and a later pass's messages (the pass before's mix, gated into each input)
+    InklingMix mixes[2];
+    int n_mix = 0;
     if (B.attn_query.p) {
-        InklingMix m;
+        InklingMix& m = mixes[n_mix++];
         for (int k = 0; k < nb; ++k) m.state[k] = bp[k];
         m.state[nb] = cres;
         m.n_state = nb + 1;
         m.query = fp(B.attn_query);
         m.n_query = B.swa ? 1 : 3;
         for (int j = 0; j < m.n_query; ++j) m.out[j] = mix_[j];
-        inkling_mix(m, n_embd_, n, norm_eps_, st_);
         for (int j = 0; j < 3; ++j) in[j] = mix_[B.swa ? 0 : j];
     }
-    // a later pass's messages: the pass before's mix, gated into each input
     if (B.pass > 0) {
         if (!direct) {
             gather(kBank, bank_, n);
             gather(kBankOut, bank_out_, n);
         }
-        InklingMix m;
+        InklingMix& m = mixes[n_mix++];
         m.state[0] = direct ? stream(kBank) : bank_;
         m.state[1] = direct ? stream(kBankOut) : bank_out_;
         m.n_state = 2;
         m.query = fp(B.msg_query);
         m.n_query = 4;
         for (int j = 0; j < 4; ++j) m.out[j] = msg_[j];
-        inkling_mix(m, n_embd_, n, norm_eps_, st_);
+    }
+    if (fuse && n_mix > 0 && B.attn_query.p) {
+        inkling_mix_conv(mixes, n_mix, last, n_embd_, norm_eps_, st_);
+        last = nullptr;
+    } else {
+        flush();
+        for (int k = 0; k < n_mix; ++k) inkling_mix(mixes[k], n_embd_, n, norm_eps_, st_);
+    }
+    if (B.pass > 0) {
         if (n <= kFusedRows) {   // the three controllers in two launches; each out its own buffer
             InklingCtrl c[3];
             for (int j = 0; j < 3; ++j)
@@ -622,16 +649,33 @@ void Inkling::layer_head(Layer& L, int v, int n) {
     } else {
         const Dev* w[3] = {&L.attn_norm, &L.attn_norm, &L.attn_norm};
         if (!B.swa) w[0] = &B.q_norm, w[1] = &B.k_norm, w[2] = &B.v_norm;
+        kernels::NormRows rows{};
         for (int j = 0; j < 3; ++j) {
-            norm(j, in[j], *w[j]);
+            rows.x[j] = in[j], rows.w[j] = fp(*w[j]), rows.y[j] = in_[j], rows.y_q8_1[j] = inq_[j];
             x[j] = in_[j];
+            q8[j] = inq_[j];
         }
+        if (!fuse || !kernels::native_rms_norm_q8_1_rows(rows, 3, n_embd_, rms_eps_, threads, st_))
+            for (int j = 0; j < 3; ++j) norm(j, in[j], *w[j]);
     }
-    attn(B, v, x[0], x[1], x[2], q8, n);
+    attn(B, v, x[0], x[1], x[2], q8, n, fuse);
 
     // the first layer of a block starts the stream afresh, and what it started from is the block's
     float* const post = B.conv + (size_t) 2 * (n_conv_ - 1) * n_kv_ * head_dim_;   // the attention-out's state
-    if (ip % kBlockSize == 0) {
+    InklingConvIn conv;   // a token alone's, done by the FFN's mix
+    if (fuse) {
+        conv_snaps(o_, post, n_embd_, n);
+        conv.x = o_;
+        conv.state = post;
+        conv.w = fp(B.post_conv);
+        conv.acc = cres;
+        conv.fresh = ip % kBlockSize == 0;
+        if (conv.fresh) {
+            const int k = ip / kBlockSize;
+            conv.save = stream(kBlock0 + k);
+            bp[k] = conv.save;
+        }
+    } else if (ip % kBlockSize == 0) {
         const int k = ip / kBlockSize;
         if (direct) {
             ck(cudaMemcpyAsync(stream(kBlock0 + k), cres, e * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
@@ -657,7 +701,8 @@ void Inkling::layer_head(Layer& L, int v, int n) {
     m.query = fp(B.ffn_query);
     m.n_query = 1;
     m.out[0] = mix_[0];
-    inkling_mix(m, n_embd_, n, norm_eps_, st_);
+    if (fuse) inkling_mix_conv(&m, 1, &conv, n_embd_, norm_eps_, st_);
+    else inkling_mix(m, n_embd_, n, norm_eps_, st_);
     float* f = mix_[0];
     if (B.pass > 0) {
         if (n <= kFusedRows) {
@@ -678,10 +723,29 @@ void Inkling::layer_head(Layer& L, int v, int n) {
 void Inkling::layer_tail(Layer&, int v, int n) {
     Block& B = blocks_[(size_t) v];
     const size_t hk = (size_t) n_kv_ * head_dim_;
+    const bool parts = card_parts_;   // moe_card() left the experts' sum to this
+    card_parts_ = false;
     dump("ffn_moe_out", v, fo_, n_embd_, n);
     float* const state = B.conv + (size_t) (n_conv_ - 1) * (2 * hk + n_embd_);
     // the stream at this half's rows: a window's halves (shift_rows()) run the other half's head in between
     float* const cres = work_stream(n);
+    if (fused(n) && !tail_rows_) {   // a token alone: the next visit's first mix does the convolution
+        InklingConvIn& c = tail_conv_;
+        c = InklingConvIn{};
+        if (parts) {
+            c.parts = d_, c.weights = d_wts_, c.n_parts = n_used_;
+        } else {
+            conv_snaps(fo_, state, n_embd_, n);
+            c.x = fo_;
+        }
+        c.state = state;
+        c.w = fp(B.ffn_post_conv);
+        c.acc = cres;
+        if (layers_in_order_ && v + 1 < hi_) tail_wait_ = true;
+        else inkling_conv_in(c, n_embd_, st_);
+        return;
+    }
+    if (parts) moe_sum(d_, d_wts_, fo_, n_embd_, n_used_, n, st_);   // step()'s row of one sequence
     post_conv(fo_, state, B.ffn_post_conv, cres, n, false, tail_rows_);
     tail_rows_ = nullptr;
     if (cres == res_) scatter(kCur, res_, n);   // several tokens' stream back to r_ (one token's is worked on there)
