@@ -48,8 +48,8 @@ with an 8 GB card as well.
   own, made to read pictures: a file of 16 to 29 GB.
 - **[Kolibri 1](docs/models/kolibri.md)** by Aleph Alpha, which writes German as well as English: a file of 29 to 48 GB,
   most of which stays in RAM beside a small card.
-- **[Inkling 2 Mini](docs/models/inkling.md)** by Thinking Machines, experimental: a file of 9 to 28 GB, on one NVIDIA
-  card under Linux.
+- **[Inkling 2 Mini](docs/models/inkling.md)** by Thinking Machines, experimental: a file of 9 to 28 GB, on one or
+  more NVIDIA cards under Linux.
 
 The server can change between installed models while it runs ([how](docs/BACKENDS.md#changing-the-model)).
 

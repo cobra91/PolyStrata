@@ -471,10 +471,10 @@ pipelines them through the cards: see [BATCHING.md](BATCHING.md).
 
 ## The strata-poly models
 
-Qwen3.6, Gemma 4, Ornith, Tiel Coder and GLM 5.3 Flash run on the strata-poly engine, which splits a model's layers
-across cards too. Each card runs a range of layers and keeps the routed experts of those layers in its VRAM, as many
-as fit. The last card also runs the output and the draft block, or Gemma 4's draft model. After its layers a card
-copies the rows of the tokens it read into pinned RAM, and the next card reads them from there: one row of the
+Qwen3.6, Gemma 4, Ornith, Tiel Coder, GLM 5.3 Flash and Inkling 2 Mini run on the strata-poly engine, which splits a
+model's layers across cards too. Each card runs a range of layers and keeps the routed experts of those layers in its
+VRAM, as many as fit. The last card also runs the output and the draft block, or Gemma 4's draft model. After its layers
+a card copies the rows of the tokens it read into pinned RAM, and the next card reads them from there: one row of the
 model's width a token, 8 KB for Qwen3.6. No NVLink or peer-to-peer access is needed.
 
 A prompt read in several calls keeps the cards busy together when every routed expert is in VRAM, or when the
@@ -545,6 +545,10 @@ disk again. With the cache empty at the start, the same test ran through at abou
 same container's cache; the engine now asks four times, a quarter of a second apart, before it gives up, and
 says at load when the container has less than the model's files and 8 GiB. This pod has less than setup asks
 for REAP50 beside 6.7 GiB of experts in VRAM, about 82 GB.
+
+Inkling 2 Mini runs its layers 6 to 17 three times, and those stay on one card, so its cards start at layer 1 to 6 or
+18 to 22, physical layers as the file numbers them; `"auto"` takes 6 or 18, whichever is nearer its share
+([docs/models/inkling.md](models/inkling.md#two-or-more-cards)).
 
 Not done yet:
 

@@ -92,8 +92,8 @@ About 4.6 GiB of experts fit on the 8 GB card. At most 7.5 GiB of VRAM was in us
 | **Disk** | 17.6, 9.1 or 27.8 GB for the model file. |
 | **System** | Linux and a current NVIDIA driver. Setup asks before it installs it on Windows: it was not built or run there. |
 
-It is not offered on AMD or Intel cards or on a Mac: the engine code for it was written for NVIDIA cards only. For now
-it also runs on one card (no layer split); setup leaves that option out for it. It can answer several requests at once
+It is not offered on AMD or Intel cards or on a Mac: the engine code for it was written for NVIDIA cards only. Two or
+more NVIDIA cards can split its layers ([Two or more cards](#two-or-more-cards)). It can answer several requests at once
 (`--parallel`, see [Several requests at once](#several-requests-at-once)). Its attention caches are fp16, or q8_0 with
 `--kv q8_0`, which halves them: a 128K context then takes about 2.3 GiB of VRAM when it is full, in fp16 4.3 GiB. On an
 8 GB card, use q8_0 for contexts past 32K. The file allows 1,048,576 tokens and the engine sets no limit of its own, but
@@ -242,6 +242,39 @@ How far it moves the answers, measured on the same card with the experts held fi
 - the checks against llama.cpp (below) are prompts of up to 1,500 tokens, where it does not apply; with it applied
   to every layer and room (a build that did, for the test), they stayed in range: 31 or 32 of 32 steps, prompt
   cosine 0.99938 to 0.99971.
+
+## Two or more cards
+
+Several NVIDIA cards split the model's layers as they do for the other models of strata-poly
+([MULTI_GPU.md](../MULTI_GPU.md#the-strata-poly-models)): `--gpus 0,1` at setup, or `"gpu": [0, 1]` and
+`"layer_split"` in the run config. Each card keeps the routed experts of its own layers in its VRAM, so two cards hold
+more of them than one. The twelve layers that run three times (6 to 17) stay on one card: a later pass runs the
+experts the first one has in VRAM. So a card starts at layer 1 to 6 or 18 to 22, which the engine says when it is
+given another (`"layer_split": "18"` puts layers 0 to 17 on the first card and 18 to 23 with the output on the second).
+`"auto"` shares the layers out by each card's free VRAM and then takes 6 or 18, whichever is nearer. What a card hands
+the next one is a token's residual streams, the four blocks' starts and the loop's messages among them: 64.5 KB a token.
+A card that holds every expert of its own layers runs a token's layers there as one CUDA graph, as a single card that
+holds them all does ([How fast is it?](#how-fast-is-it)); the others run theirs launch by launch.
+
+Two RTX 3070 8 GB split at 18 wrote faster than one of them, by how much depending on the model and the prompt.
+Split at 6, both models wrote slower than at 18.
+
+> **Measured on:** 2 x RTX 3070 8 GB (rented; no P2P, so the hand-off goes through host memory), 2 x Xeon E5-2699 v3
+> (36 cores, 34 CPU threads), q8_0 caches, the experts each card holds in VRAM, greedy answers of 256 tokens, two runs
+> each, with the split's code on inkling2 791be9e. The CPU is much faster than a desktop's, so the one-card numbers,
+> and with them what a second card adds, are not those of a PC with fewer cores. HIP and Metal were not built.
+
+| | One card | Split at 18 |
+| --- | ---: | ---: |
+| IQ4_NL, after 302 tokens | 46.8-47.0 tokens/s | 53.6-54.7 (+15%) |
+| IQ4_NL, after 1,500 tokens | 47.7 | 49.5-52.6 (+4% to +10%) |
+| UD-Q2_K_XL, after 302 tokens | 61.2-61.6 | 68.5-68.9 (+12%) |
+| UD-Q2_K_XL, after 1,500 tokens | 58.3-59.8 | 66.8-67.1 (+13% to +15%) |
+
+At 18 the IQ4_NL cards held 1,176 of layers 0 to 17's 2,304 experts and 694 of layers 18 to 23's 768; UD-Q2_K_XL's
+2,195 and all 768. The IQ4_NL prompts read faster too (264 and 499 tokens/s on one card, 305 and 651 split); the
+UD-Q2_K_XL prompt of 1,500 tokens read about as fast (804 and 793 tokens/s). With every expert on the CPU the split
+gave the same logits as one card to the byte, both sizes, split at 18, 6 and 3.
 
 ## Images
 
