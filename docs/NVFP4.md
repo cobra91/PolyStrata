@@ -130,7 +130,7 @@ FP16's range.
 
 | mode | kernel | activations | one product vs FP64 (`mmq_nvfp4_parity`) |
 |---|---|---|---|
-| `w4a8` (default) | llama.cpp MMQ, int8 tensor cores | q8_1, float block scales | 0.53% |
+| `w4a8` (CUDA's default; HIP's on request) | llama.cpp MMQ, int8 tensor cores | q8_1, float block scales | 0.53% |
 | `w4a4` | llama.cpp MMQ, Blackwell FP4 MMA (sm_120a only) | NVFP4 | 8.6% |
 | `fp16` | dequantize + cuBLAS FP16 GEMM | FP16 | reference |
 
@@ -229,8 +229,13 @@ too small for the blocks' E4M3 scales, and llama.cpp multiplies the product by t
   products before the activation (`ExpertScales`, in each path's SwiGLU), and its down scale on its weight in the
   token's sum. Down's scale on the hidden instead would leave it near 1e-5 before its 8-bit quantization (see "Where
   the global scales go"). Only an NVFP4 tensor's `.scale` is read: Gemma 4's `ffn_down_exps.scale` is its own.
-- Not built: Metal (no NVFP4 kernels); HIP (no NVFP4 prompt product, the batch goes through the decode kernels; not
-  run here).
+- HIP: the same W4A8 tiles, built for the HIP architectures (`src/poly/mmq_nvfp4.cu` is device-generic; the FP4
+  MMA is CUDA's alone), and opt-in: `STRATA_PREFILL_NVFP4=w4a8`, read by `nvfp4_w4a8_on()` in `src/poly/mmq.cu`. A
+  HIP run that does not ask keeps the decode kernels for its batch, and its previous bits. Measured on an RX 9060 XT
+  (gfx1200, ROCm 10.1): Inkling 2 Mini UD-Q2_K_XL, a 2,048-token prompt 177.3 -> 402.3 tok/s when the nine of its
+  eighteen MoE layers whose down matrix is NVFP4 stopped going through the decode kernels a token at a time; 286
+  tokens 174.7 -> 390.7. Greedy ids identical over 32 tokens at both sizes.
+- Not built: Metal (no NVFP4 kernels).
 
 Measured on lab-pro6000 (RTX PRO 6000 Blackwell Server Edition, sm_120, other users' jobs on the same card), with
 `WhiskyAKM/LFM2.5-24B-A2B-NVFP4-GGUF` (every matrix NVFP4, no global scales).

@@ -54,6 +54,22 @@ bool nvfp4_fp4(int cc) {
     return asked && cc == GGML_CUDA_CC_BLACKWELL;
 }
 
+// The int8 tiles, the ones mmq_nvfp4.cu builds for every architecture: CUDA takes them for NVFP4 whenever the FP4
+// MMA is not asked for (as it always has).  The HIP build has them too - the unit is device-generic, the FP4 MMA is
+// not - and there they are opt-in (STRATA_PREFILL_NVFP4=w4a8), so a HIP run that never asked for them keeps the
+// products, and the bits, it had before they were built.
+bool nvfp4_w4a8_on() {
+#if STRATA_POLY_NVFP4_W4A4
+    return true;
+#else
+    static const bool asked = [] {
+        const char* v = std::getenv("STRATA_PREFILL_NVFP4");
+        return v != nullptr && std::string(v) == "w4a8";
+    }();
+    return asked;
+#endif
+}
+
 // The float each row of NVFP4's FP4 rows carries (quantize_mmq_fp4_cuda's scale) goes behind the blocks and the
 // tiles' tail, in the room q8_bytes() leaves: FP4 blocks take half the bytes of Q8_1's.
 float* fp4_scales(void* xq, int64_t rows, int64_t cols) {
@@ -97,8 +113,9 @@ bool Mmq::fits(int type, int64_t w_rows, int64_t w_cols, bool q2_0) {
 #if STRATA_POLY_NVFP4
         case GGML_TYPE_NVFP4:
             if (w_cols % QK_NVFP4 != 0) return false;
-            if (!nvfp4_fp4(dev.cc)) return nvfp4_w4a8_fits(w_rows, dev.cc, dev.smpbo);
-            break;
+            if (nvfp4_fp4(dev.cc)) break;   // the FP4 MMA's tiles, the ones mmq-instance-nvfp4.cu builds
+            if (!nvfp4_w4a8_on()) return false;
+            return nvfp4_w4a8_fits(w_rows, dev.cc, dev.smpbo);
 #endif
         default: return false;
     }
@@ -193,10 +210,15 @@ void Mmq::mul(const void* w, int type, int64_t w_rows, int64_t w_cols, size_t st
 #undef X
 #if STRATA_POLY_NVFP4
         case GGML_TYPE_NVFP4:
+            // only on a build with the FP4 MMA instance (CUDA), and only where the card has it: a HIP build has no
+            // mul_mat_q_case<NVFP4> to call, and Mmq::fits() has already said which of the two runs
+#if STRATA_POLY_NVFP4_W4A4
             if (nvfp4_fp4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
                 a.y_scale = fp4_scales(const_cast<void*>(xq), total_rows, w_cols);
                 mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, a, s);
-            } else {
+            } else
+#endif
+            {
                 nvfp4_w4a8(ctx, a, s);
             }
             break;
