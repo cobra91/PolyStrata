@@ -3,6 +3,7 @@
 // but for the prompt batches' attention on the tensor cores (attn_mma_kernel), whose products take halves.
 #include "strata/poly/inkling_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -40,6 +41,106 @@ __device__ __forceinline__ float warp_max(float x) {
 }
 
 __device__ __forceinline__ float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
+
+// ---- native_mmvq.cu's arithmetic -------------------------------------------------------------------------------
+//
+// native_mmvq.cu is built with --use_fast_math: its float operations flush denormals to zero and its divisions are
+// approximate.  The launches here that do its Q8_1 quantization or its RMS norm write those operations out as the
+// instructions it compiles them to, so that their bits are its bits (this file is built without fast math).
+namespace fm {
+#define FM_BINARY(name, op)                                                  \
+    __device__ __forceinline__ float name(float a, float b) {                \
+        float r;                                                             \
+        asm(op " %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));                   \
+        return r;                                                            \
+    }
+FM_BINARY(add, "add.ftz.f32")         // a + b
+FM_BINARY(add_rn, "add.rn.ftz.f32")   // __fadd_rn
+FM_BINARY(mul_rn, "mul.rn.ftz.f32")   // __fmul_rn
+FM_BINARY(div_rn, "div.rn.ftz.f32")   // __fdiv_rn
+FM_BINARY(div, "div.approx.ftz.f32")  // a / b
+FM_BINARY(max, "max.ftz.f32")         // fmaxf
+#undef FM_BINARY
+__device__ __forceinline__ float fma_rn(float a, float b, float c) {   // __fmaf_rn
+    float r;
+    asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c));
+    return r;
+}
+__device__ __forceinline__ float sqrt_rn(float a) {   // __fsqrt_rn
+    float r;
+    asm("sqrt.rn.ftz.f32 %0, %1;" : "=f"(r) : "f"(a));
+    return r;
+}
+__device__ __forceinline__ float abs(float a) {   // fabsf
+    float r;
+    asm("abs.ftz.f32 %0, %1;" : "=f"(r) : "f"(a));
+    return r;
+}
+__device__ __forceinline__ float warp_sum(float x) {
+#pragma unroll
+    for (int o = WARP / 2; o > 0; o >>= 1) x = add(x, __shfl_xor_sync(0xffffffffu, x, o, WARP));
+    return x;
+}
+__device__ __forceinline__ float warp_max(float x) {
+#pragma unroll
+    for (int o = WARP / 2; o > 0; o >>= 1) x = max(x, __shfl_xor_sync(0xffffffffu, x, o, WARP));
+    return x;
+}
+constexpr float kHalfMax = 65504.0f;
+__device__ __forceinline__ float finite(float v) { return abs(v) > kHalfMax ? copysignf(kHalfMax, v) : v; }
+
+// A Q8_1 block: native_mmvq.cu's Q81Block.
+struct Q81 {
+    __half2 ds;
+    int8_t qs[32];
+};
+static_assert(sizeof(Q81) == 36, "a Q8_1 block");
+
+// A warp's 32 values, lane i value i of the block, as native_quantize_q8_1_kernel quantizes them (q8_1_finite.hpp's
+// scale, value and sums).
+__device__ __forceinline__ void q8_1(float xi, Q81* blk) {
+    const int lane = threadIdx.x % WARP;
+    const float amax = warp_max(abs(xi));
+    const float sum = warp_sum(xi);
+    const float d = finite(div(amax, 127.0f));
+    int8_t q = 0;
+    if (amax != 0.0f) {
+        const float r = roundf(div(xi, d));
+        q = (int8_t) (r > 127.0f ? 127.0f : r < -127.0f ? -127.0f : r);
+    }
+    blk->qs[lane] = q;
+    if (lane == 0) blk->ds = make_half2(__float2half(finite(d)), __float2half(finite(sum)));
+}
+
+// native_add_rms_norm_q8_1_kernel<SUM>'s row without add: y = x / rms(x) * w and its Q8_1 blocks.  The block's
+// threads (a multiple of 32, fewer than SUM or not) take the kernel's SUM threads' sums in turn, a warp one of its
+// warps; part: SUM / WARP floats of shared memory.
+template <int SUM>
+__device__ __forceinline__ void rms_norm_q8_1(const float* x, const float* w, float* y, Q81* yq, int n, float eps,
+                                              float* part) {
+    for (int t0 = 0; t0 < SUM; t0 += blockDim.x) {
+        const int t = t0 + threadIdx.x;
+        if (t >= SUM) break;
+        float ss = 0.0f;
+        for (int i = t; i < n; i += SUM) {
+            const float v = x[i];
+            ss = fma_rn(v, v, ss);
+        }
+        ss = warp_sum(ss);
+        if ((t & 31) == 0) part[t >> 5] = ss;
+    }
+    __syncthreads();
+    float sum = 0.0f;
+    for (int k = 0; k < SUM / WARP; ++k) sum = add_rn(sum, part[k]);
+    const float scale = div_rn(1.0f, sqrt_rn(add_rn(div_rn(sum, float(n)), eps)));
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float xi = mul_rn(mul_rn(x[i], scale), w[i]);
+        y[i] = xi;
+        q8_1(xi, yq + i / 32);
+    }
+    __syncthreads();   // part, for a row after this one
+}
+}  // namespace fm
 
 // upstream: cast(pos) -> scale_bias(1, 1) -> scale(1 / floor) -> clamp(1, inf) -> log -> scale_bias(alpha, 1)
 __device__ __forceinline__ float tau_of(float alpha, int floor_, long long p) {
@@ -154,6 +255,7 @@ struct AttnArgs {
     int i8_from;  // the split path's rows of splits of this many keys or more take attn_dec_i8_kernel (0: none)
     float* out;
     const float* gate;   // the split path's output gate: out = o * sigmoid(gate) (null: none)
+    void* out_q8_1;      // the split path's output's Q8_1 blocks too (null: none)
     float* work;
 };
 
@@ -359,8 +461,9 @@ __global__ void attn_join_kernel(AttnArgs a, Rows rows) {
         sum += ws[2 + d] * f;
     }
     const size_t i = size_t(th) * AT_DIM + d;
-    const float o = sum / denom;
-    a.out[i] = a.gate ? o * sigmoidf(a.gate[i]) : o;
+    const float o = sum / denom, y = a.gate ? o * sigmoidf(a.gate[i]) : o;
+    a.out[i] = y;
+    if (a.out_q8_1) fm::q8_1(y, static_cast<fm::Q81*>(a.out_q8_1) + i / 32);
 }
 
 // The split path's kernel: one token of one group, the keys of one split.  No tiles in shared memory and no
@@ -567,8 +670,10 @@ __global__ void __launch_bounds__(DEC_WARPS * WARP, 5) attn_dec_kernel(AttnArgs 
             const float mx = fmaxf(M, sink);
             const float f = M == -INFINITY ? 0.0f : expf(M - mx);
             const float denom = L * f + (sink == -INFINITY ? 0.0f : expf(sink - mx));
-            const float o = O * f / denom;
-            a.out[th * AT_DIM + d] = a.gate ? o * sigmoidf(a.gate[th * AT_DIM + d]) : o;
+            const size_t i = th * AT_DIM + d;
+            const float o = O * f / denom, y = a.gate ? o * sigmoidf(a.gate[i]) : o;
+            a.out[i] = y;
+            if (a.out_q8_1) fm::q8_1(y, static_cast<fm::Q81*>(a.out_q8_1) + i / 32);
         }
     }
 }
@@ -789,8 +894,10 @@ __global__ void __launch_bounds__(I8_WARPS * WARP) attn_dec_i8_kernel(AttnArgs a
             const float mx = fmaxf(M, sink);
             const float f = M == -INFINITY ? 0.0f : expf(M - mx);
             const float denom = L * f + (sink == -INFINITY ? 0.0f : expf(sink - mx));
-            const float o = O * f / denom;
-            a.out[th * AT_DIM + d] = a.gate ? o * sigmoidf(a.gate[th * AT_DIM + d]) : o;
+            const size_t i = th * AT_DIM + d;
+            const float o = O * f / denom, y = a.gate ? o * sigmoidf(a.gate[i]) : o;
+            a.out[i] = y;
+            if (a.out_q8_1) fm::q8_1(y, static_cast<fm::Q81*>(a.out_q8_1) + i / 32);
         }
     }
 }
@@ -1429,10 +1536,20 @@ struct MixPair {
     InklingMix m[2];
 };
 
+struct MixNorms {
+    const float* w[4];
+    float* y[4];
+    fm::Q81* yq[4];
+    float eps;
+};
+
 // One token's mixes, a block each, mix4_kernel's work; the first block's threads first do the convolution of
-// their float4 of c.acc, which its mix then reads from their registers.
-__global__ void __launch_bounds__(MIX4_MAX) mix_conv_kernel(MixPair mp, ConvIn c, int n, float eps) {
+// their float4 of c.acc, which its mix then reads from their registers.  With SUM, the first mix's outputs are then
+// normed as native_add_rms_norm_q8_1_kernel<SUM> norms them, each with its own weight.
+template <int SUM>
+__global__ void __launch_bounds__(MIX4_MAX) mix_conv_kernel(MixPair mp, ConvIn c, MixNorms nr, int n, float eps) {
     __shared__ Mix4Smem sm;
+    __shared__ float part[SUM > 0 ? SUM / WARP : 1];
     const InklingMix& m = mp.m[blockIdx.x];
     const int i = threadIdx.x;
     Given g;
@@ -1455,6 +1572,11 @@ __global__ void __launch_bounds__(MIX4_MAX) mix_conv_kernel(MixPair mp, ConvIn c
         case 3: mix4_body<3>(m, n, eps, 0, g, sm); break;
         case 4: mix4_body<4>(m, n, eps, 0, g, sm); break;
         default: mix4_body<5>(m, n, eps, 0, g, sm); break;
+    }
+    if constexpr (SUM > 0) {
+        if (blockIdx.x != 0) return;
+        __syncthreads();   // the mix's outputs
+        for (int q = 0; q < m.n_query; ++q) fm::rms_norm_q8_1<SUM>(m.out[q], nr.w[q], nr.y[q], nr.yq[q], n, nr.eps, part);
     }
 }
 static_assert(MIX_CONV_STATES == 5, "mix_conv_kernel's cases");
@@ -1488,6 +1610,17 @@ __global__ void situ_rows_kernel(const float* __restrict__ gate_up, float* __res
     const float* row = gate_up + size_t(blockIdx.y) * 2 * n;
     const float2 sc = row_scales(s, blockIdx.y);
     out[size_t(blockIdx.y) * n + i] = situ_one(row[i] * sc.x, row[n + i] * sc.y, beta, lb);
+}
+
+// situ_rows_kernel's values, not stored, into their Q8_1 blocks (n a multiple of 32: a warp is a block).
+__global__ void situ_q8_1_kernel(const float* __restrict__ gate_up, fm::Q81* __restrict__ q, int n, float beta,
+                                 float lb, ExpertScales s) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float* row = gate_up + size_t(blockIdx.y) * 2 * n;
+    const float2 sc = row_scales(s, blockIdx.y);
+    const size_t at = size_t(blockIdx.y) * n + i;
+    fm::q8_1(situ_one(row[i] * sc.x, row[n + i] * sc.y, beta, lb), q + at / 32);
 }
 
 // ---- fused decode steps ------------------------------------------------------------------------------------------
@@ -1770,7 +1903,7 @@ AttnArgs attn_args(const char* who, const float* q, const InklingRel& rel, const
 void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, Kvq8 kq8, Kvq8 vq8,
                     InklingRel rel, const float* sinks, int64_t pos, int rows, float* out, int dim, int n_head,
                     int kv_heads, float scale, int window, int ring, float* work, size_t work_floats, void* stream,
-                    int64_t room, bool int8_dot, const long long* at, const float* gate) {
+                    int64_t room, bool int8_dot, const long long* at, const float* gate, void* out_q8_1) {
     if (rows <= 0) return;
     if (at && room <= 0) throw std::invalid_argument("inkling_attend: the position on the card needs a room");
     AttnArgs a =
@@ -1790,6 +1923,7 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
         const size_t need = size_t(rows) * n_head * a.nslot * (AT_DIM + 2);
         if (need <= work_floats) {
             a.gate = gate;
+            a.out_q8_1 = out_q8_1;
             if (at) launch_dec(a, AttnAt{at}, rows, kq, vq, int8_dot, st);
             else launch_dec(a, AttnOne{}, rows, kq, vq, int8_dot, st);
             return;
@@ -1804,6 +1938,7 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
         else attn_mma_kernel<false, false><<<gm, MMA_WARPS * WARP, 0, st>>>(a);
         check_launch("inkling_attend");
         if (gate) mul_sigmoid(out, gate, n_head * dim, rows, n_head * dim, false, stream);
+        if (out_q8_1) kernels::native_quantize_q8_1(out, out_q8_1, n_head * dim * rows, 1, stream);
         return;
     }
     const int tq = rows >= 8 ? 8 : rows >= 4 ? 4 : rows >= 2 ? 2 : 1;
@@ -1816,6 +1951,7 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
     }
     check_launch("inkling_attend");
     if (gate) mul_sigmoid(out, gate, n_head * dim, rows, n_head * dim, false, stream);
+    if (out_q8_1) kernels::native_quantize_q8_1(out, out_q8_1, n_head * dim * rows, 1, stream);
 }
 
 void inkling_attend_seqs(const float* q, const InklingAttnSeq* seqs, int rows, InklingRel rel, const float* sinks,
@@ -1940,7 +2076,8 @@ void inkling_conv_in(const InklingConvIn& c, int n, void* stream) {
     check_launch("inkling_conv_in");
 }
 
-void inkling_mix_conv(const InklingMix* mixes, int count, const InklingConvIn* conv, int n, float eps, void* stream) {
+void inkling_mix_conv(const InklingMix* mixes, int count, const InklingConvIn* conv, int n, float eps, void* stream,
+                      const InklingMixNorm* norm) {
     if (count < 1 || count > 2) throw std::invalid_argument("inkling_mix_conv: 1 or 2 mixes");
     bool fits = n % 4 == 0 && n / 4 <= MIX4_MAX;
     MixPair mp{};
@@ -1954,14 +2091,32 @@ void inkling_mix_conv(const InklingMix* mixes, int count, const InklingConvIn* c
         mp.m[k] = m;
     }
     if (conv) fits = fits && aligned16(conv->acc) && aligned16(conv->save);
+    if (norm && n % WARP) throw std::invalid_argument("inkling_mix_conv: the norms take n a multiple of 32");
     if (!fits) {   // the calls one after the other
         if (conv) inkling_conv_in(*conv, n, stream);
         for (int k = 0; k < count; ++k) inkling_mix(mixes[k], n, 1, eps, stream);
+        for (int q = 0; norm && q < mixes[0].n_query; ++q)
+            kernels::native_add_rms_norm_q8_1(mixes[0].out[q], nullptr, norm->w[q], norm->y[q], norm->y_q8_1[q], n, 1,
+                                              norm->eps, norm->threads, stream);
         return;
     }
     const int threads = (n / 4 + WARP - 1) / WARP * WARP;   // launch_mix4()'s
     const ConvIn c = conv ? conv_in(*conv) : ConvIn{};
-    mix_conv_kernel<<<count, threads, 0, cs(stream)>>>(mp, c, n, eps);
+    MixNorms nr{};
+    if (norm) {
+        for (int q = 0; q < mixes[0].n_query; ++q)
+            nr.w[q] = norm->w[q], nr.y[q] = norm->y[q], nr.yq[q] = static_cast<fm::Q81*>(norm->y_q8_1[q]);
+        nr.eps = norm->eps;
+    }
+    const cudaStream_t st = cs(stream);
+    switch (norm ? norm->threads : 0) {
+        case 0: mix_conv_kernel<0><<<count, threads, 0, st>>>(mp, c, nr, n, eps); break;
+        case 128: mix_conv_kernel<128><<<count, threads, 0, st>>>(mp, c, nr, n, eps); break;
+        case 256: mix_conv_kernel<256><<<count, threads, 0, st>>>(mp, c, nr, n, eps); break;
+        case 512: mix_conv_kernel<512><<<count, threads, 0, st>>>(mp, c, nr, n, eps); break;
+        case 1024: mix_conv_kernel<1024><<<count, threads, 0, st>>>(mp, c, nr, n, eps); break;
+        default: throw std::invalid_argument("inkling_mix_conv: norms of 128, 256, 512 or 1024 threads");
+    }
     check_launch("inkling_mix_conv");
 }
 
@@ -1999,6 +2154,19 @@ void situ_rows(const float* gate_up, float* out, int n, int rows, float beta, fl
             gate_up + size_t(r) * 2 * n, out + size_t(r) * n, n, beta, lb, s);
     }
     check_launch("situ_rows");
+}
+
+void situ_rows_q8_1(const float* gate_up, void* q8_1, int n, int rows, float beta, float lb, void* stream,
+                    const ExpertScales* scales) {
+    if (n <= 0 || rows <= 0) return;
+    if (n % WARP) throw std::invalid_argument("situ_rows_q8_1: n must be a multiple of 32");
+    for (int r = 0; r < rows; r += 65535) {
+        ExpertScales s = scales ? *scales : ExpertScales{};
+        if (s.ids) s.ids += r;
+        situ_q8_1_kernel<<<dim3(grid(n, 256), std::min(65535, rows - r)), 256, 0, cs(stream)>>>(
+            gate_up + size_t(r) * 2 * n, static_cast<fm::Q81*>(q8_1) + size_t(r) * n / 32, n, beta, lb, s);
+    }
+    check_launch("situ_rows_q8_1");
 }
 
 void inkling_control_fused(const InklingCtrl* ctrl, int count, int n, int rank, int rows, float eps, float* work,

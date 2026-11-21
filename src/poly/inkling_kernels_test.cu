@@ -312,6 +312,41 @@ void test_situ() {
     cudaFree(dgu), cudaFree(dout);
 }
 
+size_t bytes_differ(const void* a, const void* b, size_t bytes);
+
+// situ_rows_q8_1() against situ_rows() and native_quantize_q8_1(), to the byte: with the experts' scales by their
+// picks, and blocks of zeros, of denormal values and of values past a half's range (the linear beta off).
+void test_situ_q8(int rows, float lb, bool scaled) {
+    const cudaStream_t st = test_stream();
+    namespace kk = strata::kernels;
+    const int n = 1152, n_exp = 16;
+    const float beta = 4.0f;
+    std::vector<float> gu = randv(size_t(rows) * 2 * n, 3.0f);
+    for (int i = 0; i < 32; ++i) gu[i] = 0.f;                                   // a block of zeros
+    for (int i = 32; i < 64; ++i) gu[i] = 1e-38f * (i - 47);                    // denormal products
+    for (int i = 64; i < 96; ++i) gu[i] = 30.f, gu[n + i] = 1e6f * (i - 70);   // past 65504 (no linear beta)
+    std::vector<int32_t> ids(rows);
+    for (int r = 0; r < rows; ++r) ids[r] = (r * 5) % n_exp;
+    float *dgu = up(gu), *dh, *gs = up(randv(n_exp, 0.2f, 1.f)), *us = up(randv(n_exp, 0.2f, 1.f));
+    int32_t* dids = up(ids);
+    ck(cudaMalloc(&dh, size_t(rows) * n * 4), "malloc");
+    const size_t qb = kk::native_q8_1_bytes(n) * rows;
+    void *q0, *q1;
+    ck(cudaMalloc(&q0, qb), "malloc"), ck(cudaMalloc(&q1, qb), "malloc");
+    ExpertScales es;
+    if (scaled) es.gate = gs, es.up = us, es.ids = dids;
+    situ_rows(dgu, dh, n, rows, beta, lb, st, &es);
+    kk::native_quantize_q8_1(dh, q0, n * rows, 1, st);
+    situ_rows_q8_1(dgu, q1, n, rows, beta, lb, st, &es);
+    const size_t diff = bytes_differ(q0, q1, qb);
+    char name[120];
+    std::snprintf(name, sizeof name, "situ_rows_q8_1 rows %d%s%s", rows, lb > 0 ? "" : " no linear beta",
+                  scaled ? " scaled" : "");
+    std::printf("%-58s %zu bytes differ  %s\n", name, diff, diff ? "FAIL" : "ok");
+    if (diff) ++failures;
+    for (void* p : {(void*) dgu, (void*) dh, (void*) gs, (void*) us, (void*) dids, q0, q1}) cudaFree(p);
+}
+
 // ---- attention --------------------------------------------------------------------------------------------------
 
 constexpr int kDim = 128, kHeads = 24, kKv = 8, kRel = 16, kExtent = 1024;
@@ -1309,11 +1344,14 @@ void test_fused_attn(bool q8, int window, bool taps, long long first, int tokens
     float *dkw = up(kw), *dvw = up(vw), *dqs = up(qs), *drs = up(rs);
     const size_t wn = inkling_attend_work_floats(kHeads, kDim);
     float *state[2], *ko[2], *vo[2], *yq[2], *yr[2], *out[2], *work[2];
+    void* oq[2];
+    const size_t oqb = strata::kernels::native_q8_1_bytes(hq);
     for (int i = 0; i < 2; ++i) {
         state[i] = up(st0);
         for (auto [p, n] : {std::pair{&ko[i], width}, {&vo[i], width}, {&yq[i], hq}, {&yr[i], hr}, {&out[i], hq}})
             ck(cudaMalloc(p, size_t(n) * 4), "malloc");
         ck(cudaMalloc(&work[i], wn * 4), "malloc");
+        ck(cudaMalloc(&oq[i], oqb), "malloc");
     }
     float *dk, *dv, *dkt, *dvt, *dq, *dr, *dsk, *dg;
     for (auto [p, n] : {std::pair{&dk, width}, {&dv, width}, {&dkt, kKv * 4}, {&dvt, kKv * 4}, {&dq, hq}, {&dr, hr},
@@ -1345,8 +1383,11 @@ void test_fused_attn(bool q8, int window, bool taps, long long first, int tokens
         const Kvq8 kq = q8 ? Kvq8{c[i].kc, c[i].ks} : Kvq8{}, vq = q8 ? Kvq8{c[i].vc, c[i].vs} : Kvq8{};
         inkling_attend(yq[i], c[i].k, c[i].v, kq, vq, {yr[i], dtable, kRel, window ? window : kExtent}, dsk, pos, 1,
                        out[i], kDim, kHeads, kKv, scale, window, ring, work[i], wn, st, room, int8_dot, at,
-                       i ? dg : nullptr);
-        if (!i) mul_sigmoid(out[i], dg, hq, 1, hq, false, st);
+                       i ? dg : nullptr, i ? oq[i] : nullptr);
+        if (!i) {
+            mul_sigmoid(out[i], dg, hq, 1, hq, false, st);
+            strata::kernels::native_quantize_q8_1(out[i], oq[i], hq, 1, st);
+        }
     };
     std::vector<std::pair<long long, cudaGraphExec_t>> graphs;   // by room
     size_t diff = 0;
@@ -1378,7 +1419,7 @@ void test_fused_attn(bool q8, int window, bool taps, long long first, int tokens
         diff += bytes_differ(ko[0], ko[1], size_t(width) * 4) + bytes_differ(vo[0], vo[1], size_t(width) * 4) +
                 bytes_differ(state[0], state[1], size_t(width) * 24) + bytes_differ(yq[0], yq[1], size_t(hq) * 4) +
                 bytes_differ(yr[0], yr[1], size_t(hr) * 4) + bytes_differ(out[0], out[1], size_t(hq) * 4) +
-                caches_differ(c[0], c[1]);
+                bytes_differ(oq[0], oq[1], oqb) + caches_differ(c[0], c[1]);
     }
     char name[160];
     std::snprintf(name, sizeof name, "fused vs calls, %s %s%s%s, %d tokens from %lld", q8 ? "q8_0" : "fp16",
@@ -1391,6 +1432,7 @@ void test_fused_attn(bool q8, int window, bool taps, long long first, int tokens
     for (float* p : {dkw, dvw, dqs, drs, dk, dv, dkt, dvt, dq, dr, dsk, dg, dtable}) cudaFree(p);
     for (int i = 0; i < 2; ++i)
         for (float* p : {state[i], ko[i], vo[i], yq[i], yr[i], out[i], work[i]}) cudaFree(p);
+    for (void* p : oq) cudaFree(p);
     cudaFree(dat);
 }
 
@@ -1411,9 +1453,18 @@ void test_gate_unsplit(int rows) {
     const float scale = 1.f / std::sqrt((float) kDim);
     inkling_attend(dq, c.k, c.v, {}, {}, rel, ds, 40, rows, o0, kDim, kHeads, kKv, scale, 0, 0, nullptr, 0, st);
     mul_sigmoid(o0, dg, hq, rows, hq, false, st);
+    const size_t qb = strata::kernels::native_q8_1_bytes(hq) * rows;
+    void *q0, *q1;
+    ck(cudaMalloc(&q0, qb), "malloc"), ck(cudaMalloc(&q1, qb), "malloc");
+    strata::kernels::native_quantize_q8_1(o0, q0, hq * rows, 1, st);
     inkling_attend(dq, c.k, c.v, {}, {}, rel, ds, 40, rows, o1, kDim, kHeads, kKv, scale, 0, 0, nullptr, 0, st, 0,
-                   false, nullptr, dg);
+                   false, nullptr, dg, q1);
     same_bits(("attend's gate unsplit, rows " + std::to_string(rows)).c_str(), o0, o1, size_t(rows) * hq);
+    const size_t qd = bytes_differ(q0, q1, qb);
+    std::printf("%-58s %zu bytes differ  %s\n", ("attend's Q8_1 unsplit, rows " + std::to_string(rows)).c_str(), qd,
+                qd ? "FAIL" : "ok");
+    if (qd) ++failures;
+    cudaFree(q0), cudaFree(q1);
     c.free_();
     for (float* p : {dk, dv, dq, dr, ds, dg, dtable, o0, o1}) cudaFree(p);
 }
@@ -1460,6 +1511,7 @@ struct MixConvCase {
     bool fresh;            // written, with the stream's old value saved into block save_k
     int save_k;
     bool alone;            // inkling_conv_in() only, no mix
+    bool norm = false;     // the first mix's outputs normed in the launch (native_add_rms_norm_q8_1())
 };
 void test_mix_conv(const MixConvCase& tc) {
     const cudaStream_t st = test_stream();
@@ -1471,15 +1523,26 @@ void test_mix_conv(const MixConvCase& tc) {
                hp = randv(size_t(parts) * n, 1.f), hw = randv(parts, 0.3f, 0.2f), hst = randv(size_t(n) * 3, 1.f),
                hcw = randv(size_t(n) * 4, 0.4f);
     float *dq1 = up(q1), *dq2 = up(q2), *dx = up(hx), *dp = up(hp), *dw = up(hw), *dcw = up(hcw);
+    namespace kk = strata::kernels;
+    const size_t qb = kk::native_q8_1_bytes(n);
+    const int threads = sum_threads(n);
+    std::vector<float*> nw;
+    for (int j = 0; j < tc.nq; ++j) {
+        auto h = randv(n, 0.2f, 1.f);
+        if (j == 1) std::fill(h.begin(), h.begin() + 64, 1e-39f);   // denormal products: a block flushed to zero
+        nw.push_back(up(h));
+    }
     struct Side {
         std::vector<float*> s;
-        float *state, *fo, *out[8];
+        float *state, *fo, *out[8], *ny[4];
+        void* nq[4];
     } side[2];
     for (Side& d : side) {
         for (const auto& h : hs) d.s.push_back(up(h));
         d.state = up(hst);
         ck(cudaMalloc(&d.fo, n * 4), "malloc");
         for (float*& o : d.out) ck(cudaMalloc(&o, n * 4), "malloc");
+        for (int j = 0; j < 4; ++j) ck(cudaMalloc(&d.ny[j], n * 4), "malloc"), ck(cudaMalloc(&d.nq[j], qb), "malloc");
     }
     const auto mixes = [&](Side& d, InklingMix* m) {
         m[0] = InklingMix{};
@@ -1520,6 +1583,8 @@ void test_mix_conv(const MixConvCase& tc) {
             InklingMix m[2];
             const int count = mixes(d, m);
             for (int k = 0; k < count; ++k) inkling_mix(m[k], n, 1, 1e-6f, st);
+            for (int j = 0; j < tc.nq && tc.norm; ++j)
+                kk::native_add_rms_norm_q8_1(d.out[j], nullptr, nw[j], d.ny[j], d.nq[j], n, 1, 1e-5f, threads, st);
         }
     }
     {   // fused
@@ -1530,7 +1595,10 @@ void test_mix_conv(const MixConvCase& tc) {
         } else {
             InklingMix m[2];
             const int count = mixes(d, m);
-            inkling_mix_conv(m, count, tc.conv ? &c : nullptr, n, 1e-6f, st);
+            InklingMixNorm nm;
+            for (int j = 0; j < tc.nq; ++j) nm.w[j] = nw[j], nm.y[j] = d.ny[j], nm.y_q8_1[j] = d.nq[j];
+            nm.eps = 1e-5f, nm.threads = threads;
+            inkling_mix_conv(m, count, tc.conv ? &c : nullptr, n, 1e-6f, st, tc.norm ? &nm : nullptr);
         }
     }
     size_t diff = bytes_differ(side[0].state, side[1].state, size_t(n) * 12);
@@ -1538,6 +1606,9 @@ void test_mix_conv(const MixConvCase& tc) {
     if (!tc.alone) {
         for (int j = 0; j < tc.nq; ++j) diff += bytes_differ(side[0].out[j], side[1].out[j], size_t(n) * 4);
         for (int j = 0; j < 4 && tc.msg; ++j) diff += bytes_differ(side[0].out[4 + j], side[1].out[4 + j], size_t(n) * 4);
+        for (int j = 0; j < tc.nq && tc.norm; ++j)
+            diff += bytes_differ(side[0].ny[j], side[1].ny[j], size_t(n) * 4) +
+                    bytes_differ(side[0].nq[j], side[1].nq[j], qb);
     }
     std::printf("%-58s %zu bytes differ  %s\n", (std::string("mix conv ") + tc.name).c_str(), diff,
                 diff ? "FAIL" : "ok");
@@ -1546,7 +1617,9 @@ void test_mix_conv(const MixConvCase& tc) {
         for (float* p : d.s) cudaFree(p);
         cudaFree(d.state), cudaFree(d.fo);
         for (float* o : d.out) cudaFree(o);
+        for (int j = 0; j < 4; ++j) cudaFree(d.ny[j]), cudaFree(d.nq[j]);
     }
+    for (float* p : nw) cudaFree(p);
     for (float* p : {dq1, dq2, dx, dp, dw, dcw}) cudaFree(p);
 }
 
@@ -2041,6 +2114,9 @@ int main(int argc, char** argv) {
     test_fused_attn(true, 0, false, 32765, 6, 65536, true);   // STRATA_KV_INT8's kernel from room 32768 on
     for (int rows : {1, 5, 40}) test_gate_unsplit(rows);
     for (int count : {1, 3}) test_norm_rows(count);
+    test_situ_q8(8, 25.f, true);
+    test_situ_q8(8, 0.f, false);
+    test_situ_q8(1, 25.f, false);
     for (const MixConvCase& tc : std::vector<MixConvCase>{
              {"window, tail sum, messages", 2, 1, true, 2, false, 0, false},
              {"full, tail x", 3, 3, false, 1, false, 0, false},
@@ -2050,7 +2126,10 @@ int main(int argc, char** argv) {
              {"ffn, block start, first block", 1, 1, false, 1, true, 0, false},
              {"no conv, messages", 1, 1, true, 0, false, 0, false},
              {"conv alone, sum", 1, 1, false, 2, false, 0, true},
-             {"conv alone, block start", 3, 1, false, 1, true, 1, true}})
+             {"conv alone, block start", 3, 1, false, 1, true, 1, true},
+             {"window, tail sum, norm", 2, 1, false, 2, false, 0, false, true},
+             {"full, tail x, 3 norms", 3, 3, false, 1, false, 0, false, true},
+             {"ffn, block start, norm", 2, 1, false, 1, true, 1, false, true}})
         test_mix_conv(tc);
     for (int rows : {1, 2, 4, 8}) {
         test_mmvq_jobs(8, "Q8_0", 2304, 8, rows);

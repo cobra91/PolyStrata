@@ -190,12 +190,14 @@ inline constexpr int kInklingMmaRows = kInklingSplitRows + 1;
 /// takes the split path, which is then sized by room alone: room > 0 and work enough (else std::invalid_argument).
 /// `gate` (null: none): the output gate, out *= sigmoid(gate) (n_head * dim a token), as mul_sigmoid() after the
 /// call gives it, the same bits; the split path applies it as it writes the output, the others with mul_sigmoid().
+/// `out_q8_1` (null: none): out's Q8_1 blocks too, as native_quantize_q8_1(out, out_q8_1, rows * n_head * dim, 1)
+/// gives them, the same bits (the split path writes them with the output).
 /// Throws std::runtime_error on a launch error.
 void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, Kvq8 kq8, Kvq8 vq8,
                     InklingRel rel, const float* sinks, int64_t pos, int rows, float* out, int dim, int n_head,
                     int kv_heads, float scale, int window, int ring, float* work, size_t work_floats, void* stream,
                     int64_t room = 0, bool int8_dot = false, const long long* at = nullptr,
-                    const float* gate = nullptr);
+                    const float* gate = nullptr, void* out_q8_1 = nullptr);
 
 // ---- short convolutions --------------------------------------------------------------------------------------
 
@@ -341,11 +343,22 @@ struct InklingConvIn {
 /// The convolution alone, a thread a channel: the same bits as inkling_conv() / inkling_conv_acc() of the input (after
 /// moe_sum() into a zeroed buffer, with parts) and the copy before it.
 void inkling_conv_in(const InklingConvIn& c, int n, void* stream);
+/// The norms of a mix's outputs, one for each of its queries: native_add_rms_norm_q8_1(out[q], no add, w[q], y[q],
+/// y_q8_1[q], n, 1 row, eps, threads).
+struct InklingMixNorm {
+    const float* w[4] = {};
+    float* y[4] = {};
+    void* y_q8_1[4] = {};
+    float eps = 0.f;
+    int threads = 0;   ///< sum_threads(n)
+};
 /// One token's inkling_mix() of each of `count` (1 or 2) mixes in one launch, a block each, and `conv` (null: none)
-/// done first by the first mix's block, whose threads keep their part of it for the mix: the same bits as
-/// inkling_conv_in(*conv) then inkling_mix() of each.  conv->acc and conv->save may be states of the first mix,
-/// not of the second.  Mixes of more than 5 states or unaligned buffers take those calls one after the other.
-void inkling_mix_conv(const InklingMix* mixes, int count, const InklingConvIn* conv, int n, float eps, void* stream);
+/// done first by the first mix's block, whose threads keep their part of it for the mix, and `norm` (null: none) of
+/// the first mix's outputs after it: the same bits as inkling_conv_in(*conv), inkling_mix() of each and the norms.
+/// conv->acc and conv->save may be states of the first mix, not of the second.  Mixes of more than 5 states or
+/// unaligned buffers take those calls one after the other.
+void inkling_mix_conv(const InklingMix* mixes, int count, const InklingConvIn* conv, int n, float eps, void* stream,
+                      const InklingMixNorm* norm = nullptr);
 
 // ---- a token of each of several sequences --------------------------------------------------------------------
 //
@@ -405,5 +418,9 @@ void inkling_conv_acc_seqs(const float* x, float* const* states, const float* w,
 /// `scales` as swiglu_clamp_rows()'s (null: none).
 void situ_rows(const float* gate_up, float* out, int n, int rows, float beta, float lb, void* stream,
                const ExpertScales* scales = nullptr);
+/// situ_rows() into the Q8_1 blocks native_quantize_q8_1(out, q8_1, n * rows, 1) makes of its output, the same bits,
+/// in one launch and without the floats.  n a multiple of 32.
+void situ_rows_q8_1(const float* gate_up, void* q8_1, int n, int rows, float beta, float lb, void* stream,
+                    const ExpertScales* scales = nullptr);
 
 }  // namespace strata::poly
