@@ -2609,4 +2609,196 @@ void inkling_kv_store_seqs(const float* kraw, const float* vraw, const InklingKv
     check_launch("inkling_kv_store_seqs");
 }
 
+// ---- the DSpark drafter --------------------------------------------------------------------------------------
+
+namespace {
+
+constexpr int FUSE_THREADS = 256;
+
+// A block a row and an output: the weighted sum to out, then its root mean square, then out scaled in place.
+__global__ void dspark_fuse_kernel(InklingFuse f, int n_embd, float eps) {
+    const int r = blockIdx.x, j = blockIdx.y;
+    float* out = f.out[j] + (size_t) r * n_embd;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < n_embd; i += FUSE_THREADS) {
+        float v = 0.f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) v += f.w[j][k] * f.x[k][(size_t) r * f.stride[k] + i];
+        out[i] = v;
+        ss += v * v;
+    }
+    __shared__ float part[FUSE_THREADS / WARP];
+    ss = warp_sum(ss);
+    if (threadIdx.x % WARP == 0) part[threadIdx.x / WARP] = ss;
+    __syncthreads();
+    if (threadIdx.x < WARP) {
+        float t = threadIdx.x < FUSE_THREADS / WARP ? part[threadIdx.x] : 0.f;
+        t = warp_sum(t);
+        if (threadIdx.x == 0) part[0] = t;
+    }
+    __syncthreads();
+    const float scale = rsqrtf(part[0] / (float) n_embd + eps);
+    const float* norm = f.norm[j];
+    for (int i = threadIdx.x; i < n_embd; i += FUSE_THREADS) out[i] = out[i] * scale * norm[i];
+}
+
+// Block attention: a block a key head and a piece of the keys, which it takes BA_KEYS at a time with a running
+// softmax.  Its queries are the rows' heads of that key head, row-major: qi = row * per + head % per.
+constexpr int BA_DIM = 128, BA_KEYS = 32, BA_THREADS = 256, BA_QUERIES = 32;
+constexpr int BA_KROW = BA_DIM + 2;   // halves a key row in shared memory: rows fall on different banks
+
+__global__ void block_attend_kernel(const float* __restrict__ q, const half* __restrict__ kc,
+                                    const half* __restrict__ vc, long long lo, long long n_keys, int ring, int rows,
+                                    int n_head, int kv_heads, float scale, int per_split, float* __restrict__ work) {
+    const int g = blockIdx.x, split = blockIdx.y, per = n_head / kv_heads, nq = rows * per;
+    const long long a = (long long) split * per_split, b = min(n_keys, a + per_split);
+    __shared__ float qs[BA_QUERIES][BA_DIM];
+    __shared__ half ks[BA_KEYS][BA_KROW];
+    __shared__ half vs[BA_KEYS][BA_DIM];
+    __shared__ float ps[BA_QUERIES][BA_KEYS];
+    __shared__ float m[BA_QUERIES], l[BA_QUERIES], corr[BA_QUERIES];
+    for (int i = threadIdx.x; i < nq * BA_DIM; i += BA_THREADS) {
+        const int qi = i / BA_DIM, d = i % BA_DIM, r = qi / per, h = g * per + qi % per;
+        qs[qi][d] = q[((size_t) r * n_head + h) * BA_DIM + d];
+    }
+    if (threadIdx.x < BA_QUERIES) m[threadIdx.x] = -INFINITY, l[threadIdx.x] = 0.f;
+    constexpr int ACC = BA_QUERIES * BA_DIM / BA_THREADS;
+    float acc[ACC];
+#pragma unroll
+    for (int i = 0; i < ACC; ++i) acc[i] = 0.f;
+    const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
+    for (long long k0 = a; k0 < b; k0 += BA_KEYS) {
+        const int nk = (int) min((long long) BA_KEYS, b - k0);
+        __syncthreads();   // the last tile's keys, values and weights are read
+        for (int i = threadIdx.x; i < BA_KEYS * BA_DIM / 2; i += BA_THREADS) {
+            const int kj = i / (BA_DIM / 2), d = 2 * (i % (BA_DIM / 2));
+            half2 kv = __floats2half2_rn(0.f, 0.f), vv = kv;
+            if (kj < nk) {
+                const long long p = lo + k0 + kj, row = ring > 0 ? p % ring : p;
+                const size_t at = ((size_t) row * kv_heads + g) * BA_DIM + d;
+                kv = *reinterpret_cast<const half2*>(kc + at);
+                vv = *reinterpret_cast<const half2*>(vc + at);
+            }
+            *reinterpret_cast<half2*>(&ks[kj][d]) = kv;
+            *reinterpret_cast<half2*>(&vs[kj][d]) = vv;
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < nq * BA_KEYS; i += BA_THREADS) {
+            const int qi = i / BA_KEYS, kj = i % BA_KEYS;
+            float s = -INFINITY;
+            if (kj < nk) {
+                s = 0.f;
+#pragma unroll 8
+                for (int d = 0; d < BA_DIM; d += 2) {
+                    const float2 k2 = __half22float2(*reinterpret_cast<const half2*>(&ks[kj][d]));
+                    s += qs[qi][d] * k2.x + qs[qi][d + 1] * k2.y;
+                }
+                s *= scale;
+            }
+            ps[qi][kj] = s;
+        }
+        __syncthreads();
+        for (int qi = warp; qi < nq; qi += BA_THREADS / WARP) {
+            const float s = ps[qi][lane];   // BA_KEYS == WARP
+            const float mt = warp_max(s), mo = m[qi], mn = fmaxf(mo, mt);
+            const float p = s == -INFINITY ? 0.f : expf(s - mn);
+            const float sum = warp_sum(p);
+            ps[qi][lane] = p;
+            if (lane == 0) {
+                const float c = mo == -INFINITY ? 0.f : expf(mo - mn);
+                corr[qi] = c;
+                l[qi] = l[qi] * c + sum;
+                m[qi] = mn;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < ACC; ++i) {
+            const int o = threadIdx.x + i * BA_THREADS, qi = o / BA_DIM, d = o % BA_DIM;
+            if (qi >= nq) continue;
+            float v = acc[i] * corr[qi];
+            for (int kj = 0; kj < nk; ++kj) v += ps[qi][kj] * __half2float(vs[kj][d]);
+            acc[i] = v;
+        }
+    }
+    __syncthreads();
+    // the piece's sums: per query its largest logit, its weights' sum and its weighted values
+    float* w = work + ((size_t) g * gridDim.y + split) * nq * (BA_DIM + 2);
+#pragma unroll
+    for (int i = 0; i < ACC; ++i) {
+        const int o = threadIdx.x + i * BA_THREADS, qi = o / BA_DIM, d = o % BA_DIM;
+        if (qi < nq) w[(size_t) qi * (BA_DIM + 2) + 2 + d] = acc[i];
+    }
+    if (threadIdx.x < nq) {
+        w[(size_t) threadIdx.x * (BA_DIM + 2)] = m[threadIdx.x];
+        w[(size_t) threadIdx.x * (BA_DIM + 2) + 1] = l[threadIdx.x];
+    }
+}
+
+// A block a row's head: the pieces' sums together.
+__global__ void block_join_kernel(const float* __restrict__ work, float* __restrict__ out, int splits, int rows,
+                                  int n_head, int kv_heads) {
+    const int r = blockIdx.x / n_head, h = blockIdx.x % n_head, d = threadIdx.x;
+    const int per = n_head / kv_heads, g = h / per, nq = rows * per, qi = r * per + h % per;
+    const float* w = work + (size_t) g * splits * nq * (BA_DIM + 2) + (size_t) qi * (BA_DIM + 2);
+    const size_t step = (size_t) nq * (BA_DIM + 2);
+    float mx = -INFINITY;
+    for (int s = 0; s < splits; ++s) mx = fmaxf(mx, w[s * step]);
+    float sum = 0.f, v = 0.f;
+    for (int s = 0; s < splits; ++s) {
+        const float ms = w[s * step];
+        if (ms == -INFINITY) continue;
+        const float c = expf(ms - mx);
+        sum += w[s * step + 1] * c;
+        v += w[s * step + 2 + d] * c;
+    }
+    out[((size_t) r * n_head + h) * BA_DIM + d] = v / sum;
+}
+
+__global__ void dspark_gru_kernel(const float* __restrict__ joint, float* __restrict__ state,
+                                  float* __restrict__ latent, int rank) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rank) return;
+    const float gate = sigmoidf(joint[i]), cand = tanhf(joint[rank + i]);
+    state[i] = cand + gate * (state[i] - cand);
+    latent[i] = tanhf(joint[2 * rank + i]);
+}
+
+int block_splits(long long n_keys) {
+    return (int) std::min<long long>(kInklingBlockSplits, std::max<long long>(1, (n_keys + 255) / 256));
+}
+
+}  // namespace
+
+void inkling_dspark_fuse(const InklingFuse& f, int n_embd, int rows, float eps, void* stream) {
+    if (rows <= 0) return;
+    dspark_fuse_kernel<<<dim3(rows, 4), FUSE_THREADS, 0, cs(stream)>>>(f, n_embd, eps);
+    check_launch("inkling_dspark_fuse");
+}
+
+size_t inkling_block_attend_work_floats(int rows, int n_head, int dim) {
+    return (size_t) kInklingBlockSplits * rows * n_head * (dim + 2);
+}
+
+void inkling_block_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, int64_t lo, int64_t hi,
+                          int ring, int rows, float* out, int dim, int n_head, int kv_heads, float scale, float* work,
+                          void* stream) {
+    if (dim != BA_DIM || kv_heads <= 0 || n_head % kv_heads || rows * (n_head / kv_heads) > BA_QUERIES || hi < lo)
+        throw std::invalid_argument("inkling_block_attend: heads of 128 values, at most 32 queries a key head");
+    const long long n_keys = hi - lo + 1;
+    const int splits = block_splits(n_keys);
+    const int per_split = (int) ((n_keys + splits - 1) / splits);
+    block_attend_kernel<<<dim3(kv_heads, splits), BA_THREADS, 0, cs(stream)>>>(
+        q, (const half*) kcache, (const half*) vcache, (long long) lo, n_keys, ring, rows, n_head, kv_heads, scale,
+        per_split, work);
+    check_launch("inkling_block_attend");
+    block_join_kernel<<<rows * n_head, BA_DIM, 0, cs(stream)>>>(work, out, splits, rows, n_head, kv_heads);
+    check_launch("inkling_block_attend");
+}
+
+void inkling_dspark_gru(const float* joint, float* state, float* latent, int rank, void* stream) {
+    dspark_gru_kernel<<<grid(rank, 256), 256, 0, cs(stream)>>>(joint, state, latent, rank);
+    check_launch("inkling_dspark_gru");
+}
+
 }  // namespace strata::poly

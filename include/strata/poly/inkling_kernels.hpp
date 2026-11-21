@@ -427,4 +427,41 @@ void situ_rows(const float* gate_up, float* out, int n, int rows, float beta, fl
 void situ_rows_q8_1(const float* gate_up, void* q8_1, int n, int rows, float beta, float lb, void* stream,
                     const ExpertScales* scales = nullptr);
 
+// ---- the DSpark drafter (--draft-model, a "dflash" file) ---------------------------------------------------------
+//
+// llama.cpp PR 32218 (88025eb), src/models/dspark.cpp graph_inkling2: three dense layers over a block of eight rows
+// that read the model's rows through their own caches.  The model's rows go in as inkling_dspark_fuse() makes them:
+// what the drafter's layers' caches take, and the context its recurrent head reads.
+
+/// For each of `rows` rows of the model: four inputs (the streams entering visits 5, 23 and 41, and the normed
+/// output), input k's row r at x[k] + r * stride[k], and four outputs of n_embd floats a row,
+///     out[j] = rms_norm(sum_k w[j][k] * x[k]) * norm[j]          (ggml: soft_max(dspark_fuse row j), mul, sum_rows,
+///                                                                  build_norm RMS)
+/// j = 0..2 the drafter's layers' contexts (dflare_norm), 3 the head's (dspark_norm).  w is softmax(dspark_fuse)'s.
+struct InklingFuse {
+    const float* x[4] = {};
+    int64_t stride[4] = {};
+    float w[4][4] = {};
+    const float* norm[4] = {};
+    float* out[4] = {};
+};
+void inkling_dspark_fuse(const InklingFuse& f, int n_embd, int rows, float eps, void* stream);
+
+/// Attention of `rows` tokens that all see the same cached rows, positions lo .. hi, each other's among them (the
+/// drafter's block: non-causal, every row with the first one's window).  q: n_head * dim a token; the caches fp16,
+/// kv_heads * dim a row, position p at row p % ring (ring 0: p); out: n_head * dim a token.  The keys go in up to
+/// kInklingBlockSplits pieces a key head, and work holds inkling_block_attend_work_floats() floats for their sums.
+/// Heads of 128 values, and rows * n_head / kv_heads <= 32; else std::invalid_argument.
+inline constexpr int kInklingBlockSplits = 32;
+size_t inkling_block_attend_work_floats(int rows, int n_head, int dim);
+void inkling_block_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, int64_t lo, int64_t hi,
+                          int ring, int rows, float* out, int dim, int n_head, int kv_heads, float scale, float* work,
+                          void* stream);
+
+/// The recurrent head's step (build_inkling2_head): from joint = joint_proj . [state, markov_w1[prev], hidden,
+/// context] + b (3 * rank floats),
+///     gate = sigmoid(joint[0, rank)), cand = tanh(joint[rank, 2 rank)),
+///     state = cand + gate * (state - cand),  latent = tanh(joint[2 rank, 3 rank)).
+void inkling_dspark_gru(const float* joint, float* state, float* latent, int rank, void* stream);
+
 }  // namespace strata::poly

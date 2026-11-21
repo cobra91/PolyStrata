@@ -9,7 +9,7 @@
 // a visit's projections in one launch (native_mmvq_jobs()) and the cached experts' launches a warp a row
 // (MmvqSlots::lanes) against each matrix alone, to the bit; and a token's fused launches (K and V's store with the
 // clips, the attention with its gate, the input norms in one launch, the mixes with a post-convolution before them)
-// against the calls they stand for, to the bit.
+// against the calls they stand for, to the bit; and the DSpark drafter's fuse, block attention and recurrent step.
 //
 // usage: poly_inkling_kernels_test [bench | decode]   (exit 0: every check within its tolerance; 77: no usable card;
 //        bench: also time the attention and the decode shapes; decode: only the decode-shape timings, with a
@@ -2087,6 +2087,115 @@ void bench_decode(const std::vector<float>& table, float* dtable) {
     bench_long_decode(dtable);
 }
 
+// ---- the DSpark drafter ------------------------------------------------------------------------------------------
+
+void test_dspark_fuse(int rows) {
+    const int n = 2304;
+    const int64_t stride[4] = {3 * n, 3 * n, 3 * n, n};
+    std::vector<float> x[4], norm[4];
+    for (int k = 0; k < 4; ++k) x[k] = randv((size_t) rows * stride[k], 1.f);
+    InklingFuse f;
+    std::vector<float> wts = randv(16, 1.f);
+    float* dx[4];
+    float* dn[4];
+    float* dout[4];
+    for (int k = 0; k < 4; ++k) {
+        norm[k] = randv(n, 0.2f, 1.f);
+        dx[k] = up(x[k]);
+        dn[k] = up(norm[k]);
+        ck(cudaMalloc(&dout[k], (size_t) rows * n * sizeof(float)), "malloc");
+        f.x[k] = dx[k] + k % 3;   // the streams of a row at their offsets
+        f.stride[k] = stride[k];
+        f.norm[k] = dn[k];
+        f.out[k] = dout[k];
+        for (int j = 0; j < 4; ++j) f.w[k][j] = wts[(size_t) k * 4 + j];
+    }
+    inkling_dspark_fuse(f, n, rows, 1e-6f, nullptr);
+    for (int j = 0; j < 4; ++j) {
+        std::vector<double> ref((size_t) rows * n);
+        for (int r = 0; r < rows; ++r) {
+            double ss = 0;
+            for (int i = 0; i < n; ++i) {
+                double v = 0;
+                for (int k = 0; k < 4; ++k) v += (double) f.w[j][k] * x[k][(size_t) r * stride[k] + k % 3 + i];
+                ref[(size_t) r * n + i] = v;
+                ss += v * v;
+            }
+            const double sc = 1.0 / std::sqrt(ss / n + 1e-6);
+            for (int i = 0; i < n; ++i) ref[(size_t) r * n + i] *= sc * norm[j][i];
+        }
+        const std::string what = "dspark fuse, output " + std::to_string(j) + ", " + std::to_string(rows) + " rows";
+        compare(what.c_str(), down(dout[j], ref.size()), ref, 2e-5);
+    }
+    for (int k = 0; k < 4; ++k) cudaFree(dx[k]), cudaFree(dn[k]), cudaFree(dout[k]);
+}
+
+// rows queries that all see positions lo..hi of an fp16 cache (a ring when ring > 0)
+void test_block_attend(int rows, long long lo, long long hi, int ring) {
+    const int dim = 128, nh = 24, kv = 8, per = nh / kv;
+    const long long slots = ring > 0 ? ring : hi + 1;
+    std::vector<float> q = randv((size_t) rows * nh * dim, 1.f);
+    std::vector<float> kf = randv((size_t) slots * kv * dim, 1.f), vf = randv((size_t) slots * kv * dim, 1.f);
+    std::vector<uint16_t> kh(kf.size()), vh(vf.size());
+    for (size_t i = 0; i < kf.size(); ++i) {
+        const __half a = __float2half(kf[i]), b = __float2half(vf[i]);
+        std::memcpy(&kh[i], &a, 2), std::memcpy(&vh[i], &b, 2);
+        kf[i] = __half2float(a), vf[i] = __half2float(b);
+    }
+    float *dq = up(q), *dout = nullptr, *dwork = nullptr;
+    uint16_t *dk = up(kh), *dv = up(vh);
+    ck(cudaMalloc(&dout, q.size() * sizeof(float)), "malloc");
+    ck(cudaMalloc(&dwork, inkling_block_attend_work_floats(rows, nh, dim) * sizeof(float)), "malloc");
+    const float scale = 1.f / std::sqrt((float) dim);
+    inkling_block_attend(dq, dk, dv, lo, hi, ring, rows, dout, dim, nh, kv, scale, dwork, nullptr);
+    std::vector<double> ref(q.size());
+    for (int r = 0; r < rows; ++r)
+        for (int h = 0; h < nh; ++h) {
+            const int g = h / per;
+            std::vector<double> s((size_t) (hi - lo + 1));
+            double mx = -1e300;
+            for (long long p = lo; p <= hi; ++p) {
+                const long long row = ring > 0 ? p % ring : p;
+                double d = 0;
+                for (int i = 0; i < dim; ++i)
+                    d += (double) q[((size_t) r * nh + h) * dim + i] * kf[((size_t) row * kv + g) * dim + i];
+                s[(size_t) (p - lo)] = d * scale;
+                mx = std::max(mx, d * scale);
+            }
+            double sum = 0;
+            for (double& e : s) sum += e = std::exp(e - mx);
+            for (int i = 0; i < dim; ++i) {
+                double v = 0;
+                for (long long p = lo; p <= hi; ++p) {
+                    const long long row = ring > 0 ? p % ring : p;
+                    v += s[(size_t) (p - lo)] * vf[((size_t) row * kv + g) * dim + i];
+                }
+                ref[((size_t) r * nh + h) * dim + i] = v / sum;
+            }
+        }
+    const std::string what = "block attend, " + std::to_string(rows) + " rows, keys " + std::to_string(lo) + ".." +
+                             std::to_string(hi) + (ring ? ", ring " + std::to_string(ring) : "");
+    compare(what.c_str(), down(dout, ref.size()), ref, 2e-5);
+    cudaFree(dq), cudaFree(dk), cudaFree(dv), cudaFree(dout), cudaFree(dwork);
+}
+
+void test_dspark_gru() {
+    const int rank = 256;
+    std::vector<float> j = randv(3 * rank, 2.f), st = randv(rank, 0.5f);
+    float *dj = up(j), *ds = up(st), *dl = nullptr;
+    ck(cudaMalloc(&dl, rank * sizeof(float)), "malloc");
+    inkling_dspark_gru(dj, ds, dl, rank, nullptr);
+    std::vector<double> rs(rank), rl(rank);
+    for (int i = 0; i < rank; ++i) {
+        const double gate = 1.0 / (1.0 + std::exp(-(double) j[i])), cand = std::tanh((double) j[rank + i]);
+        rs[i] = cand + gate * (st[i] - cand);
+        rl[i] = std::tanh((double) j[2 * rank + i]);
+    }
+    compare("dspark recurrent head state", down(ds, rank), rs, 1e-6);
+    compare("dspark recurrent head latent", down(dl, rank), rl, 1e-6);
+    cudaFree(dj), cudaFree(ds), cudaFree(dl);
+}
+
 }  // namespace
 
 // f(), a group of checks: an exception out of it is its failure, not the end of the run.
@@ -2340,6 +2449,13 @@ int main(int argc, char** argv) {
     guarded([&] { test_slots_lanes(13, "Q5_K", 1280, 512, 3); });
     guarded([&] { test_slots_lanes(14, "Q6_K", 2304, 1152, 3); });
     guarded([&] { test_slots_lanes(23, "IQ4_XS", 1536, 2301, 8); });
+    for (int rows : {1, 8, 300}) guarded([&] { test_dspark_fuse(rows); });
+    guarded([&] { test_block_attend(8, 0, 7, 0); });
+    guarded([&] { test_block_attend(8, 0, 1500, 0); });
+    guarded([&] { test_block_attend(8, 2000 - 1024, 2007, 1032); });   // the window wraps the ring
+    guarded([&] { test_block_attend(8, 0, 9000, 0); });                // the most pieces
+    guarded([&] { test_block_attend(1, 3, 40, 0); });
+    guarded([&] { test_dspark_gru(); });
     if (bench) bench_attend(table, dtable), bench_decode(table, dtable);
     cudaFree(dtable);
 
