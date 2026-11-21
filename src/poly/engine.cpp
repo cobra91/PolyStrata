@@ -3662,6 +3662,29 @@ void Engine::lin_jobs(const LinJob* jobs, int count, int n) {
     };
     // grouped: in a group already, launched or declined (then lin() takes it); done: launched
     bool grouped[kernels::kMmvqJobsMax] = {}, done[kernels::kMmvqJobsMax] = {};
+    const auto launched = [&](int j) {
+        const LinJob& g = jobs[j];
+        if (g.w->scale != 1.0f) axpy(g.y, g.w->scale, g.y, n * g.w->n_out, false, st_);
+        done[j] = grouped[j] = true;
+    };
+    // a token's matrices of several formats and one input width (a file of mixed quantizations): one launch
+    if (n == 1) {
+        kernels::MmvqJobs m{};
+        int types[kernels::kMmvqJobsMax], idx[kernels::kMmvqJobsMax], k = 0;
+        bool mixed = false;
+        for (int j = 0; j < count; ++j) {
+            const int t = (int) jobs[j].w->type;
+            if (alone(jobs[j]) || (t != 8 && t != 12 && t != 13 && t != 14) ||   // native_mmvq_jobs()'s formats
+                (k > 0 && jobs[j].w->n_in != jobs[idx[0]].w->n_in))
+                continue;
+            m.w[k] = jobs[j].w->p, m.x[k] = jobs[j].xq, m.y[k] = jobs[j].y, m.n_out[k] = jobs[j].w->n_out;
+            types[k] = t;
+            mixed = mixed || t != types[0];
+            idx[k++] = j;
+        }
+        if (mixed && kernels::native_mmvq_jobs_mixed(types, m, k, jobs[idx[0]].w->n_in, st_))
+            for (int j = 0; j < k; ++j) launched(idx[j]);
+    }
     for (int i = 0; i < count; ++i) {
         if (grouped[i] || alone(jobs[i])) continue;
         kernels::MmvqJobs m{};
@@ -3678,11 +3701,7 @@ void Engine::lin_jobs(const LinJob* jobs, int count, int n) {
             idx[k++] = j;
         }
         if (k < 2 || !kernels::native_mmvq_jobs((int) jobs[i].w->type, m, k, jobs[i].w->n_in, n, st_)) continue;
-        for (int j = 0; j < k; ++j) {
-            const LinJob& g = jobs[idx[j]];
-            if (g.w->scale != 1.0f) axpy(g.y, g.w->scale, g.y, n * g.w->n_out, false, st_);
-            done[idx[j]] = true;
-        }
+        for (int j = 0; j < k; ++j) launched(idx[j]);
     }
     for (int i = 0; i < count; ++i)
         if (!done[i]) lin(*jobs[i].w, jobs[i].x, jobs[i].y, n, jobs[i].xq);
