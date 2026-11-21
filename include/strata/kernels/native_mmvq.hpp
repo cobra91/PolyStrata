@@ -51,6 +51,18 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
 /// keeps the sum.  n is a multiple of 32.
 void native_add_rms_norm_q8_1(float* x, const float* add, const float* w, float* y, void* y_q8_1, int n, int rows,
                               float eps, int threads, void* stream);
+/// native_add_rms_norm_q8_1() without add of `count` rows that each have their own x, w, y and y_q8_1 (a layer's
+/// inputs of Q, K and V, each normed with its own weight), in one launch, a block a row: each row's bits are the
+/// call's for it alone.  False, with nothing launched, where there is no such kernel (Metal): the caller makes the
+/// calls.
+constexpr int kNormRowsMax = 4;
+struct NormRows {
+    const float* x[kNormRowsMax];
+    const float* w[kNormRowsMax];
+    float* y[kNormRowsMax];
+    void* y_q8_1[kNormRowsMax];
+};
+bool native_rms_norm_q8_1_rows(const NormRows& rows, int count, int n, float eps, int threads, void* stream);
 
 void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1,
                                  int n_in, int ncols, void* stream);

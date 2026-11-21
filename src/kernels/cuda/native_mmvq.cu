@@ -203,16 +203,12 @@ __global__ void native_swiglu_quantize_q8_1_kernel(const float* __restrict__ gat
 // with its block size (SUM threads of the block) and its IEEE operations written out (this file is built with
 // --use_fast_math).  Then every thread of the block takes values, a warp 32 of one Q8_1 block, and quantizes them as
 // native_quantize_q8_1_kernel does: more threads than the sum's make the row's quantization fewer steps.
+// The block's row: xr, ar (or null), yr and qr at the row's place.
 template<int SUM>
-__launch_bounds__(1024, 1)
-__global__ void native_add_rms_norm_q8_1_kernel(float* __restrict__ x, const float* __restrict__ add,
-                                                const float* __restrict__ w, float* __restrict__ y,
-                                                Q81Block* __restrict__ yq, int n, float eps) {
+__device__ __forceinline__ void add_rms_norm_q8_1_row(float* __restrict__ xr, const float* __restrict__ ar,
+                                                      const float* __restrict__ w, float* __restrict__ yr,
+                                                      Q81Block* __restrict__ qr, int n, float eps) {
     __shared__ float part[SUM / WARP];
-    float* xr = x + std::size_t(blockIdx.x) * n;
-    const float* ar = add ? add + std::size_t(blockIdx.x) * n : nullptr;
-    float* yr = y + std::size_t(blockIdx.x) * n;
-    Q81Block* qr = yq + std::size_t(blockIdx.x) * (n / Q8K);
     if (threadIdx.x < SUM) {
         float ss = 0.0f;
         for (int i = threadIdx.x; i < n; i += SUM) {
@@ -237,6 +233,24 @@ __global__ void native_add_rms_norm_q8_1_kernel(float* __restrict__ x, const flo
         qr[i / Q8K].qs[i % Q8K] = q;
         if (i % Q8K == 0) qr[i / Q8K].ds = q8_1_ds(d, bsum);
     }
+}
+
+template<int SUM>
+__launch_bounds__(1024, 1)
+__global__ void native_add_rms_norm_q8_1_kernel(float* __restrict__ x, const float* __restrict__ add,
+                                                const float* __restrict__ w, float* __restrict__ y,
+                                                Q81Block* __restrict__ yq, int n, float eps) {
+    add_rms_norm_q8_1_row<SUM>(x + std::size_t(blockIdx.x) * n, add ? add + std::size_t(blockIdx.x) * n : nullptr, w,
+                               y + std::size_t(blockIdx.x) * n, yq + std::size_t(blockIdx.x) * (n / Q8K), n, eps);
+}
+
+// native_add_rms_norm_q8_1_kernel's row of its own for each block, without add.
+template<int SUM>
+__launch_bounds__(1024, 1)
+__global__ void native_rms_norm_q8_1_rows_kernel(NormRows r, int n, float eps) {
+    const int k = blockIdx.x;
+    add_rms_norm_q8_1_row<SUM>(const_cast<float*>(r.x[k]), nullptr, r.w[k], r.y[k],
+                               static_cast<Q81Block*>(r.y_q8_1[k]), n, eps);
 }
 
 // Exact pinned vec_dot_q5_K_q8_1_impl_vmmq expression and integer dot order.
@@ -2736,6 +2750,29 @@ void native_add_rms_norm_q8_1(float* x, const float* add, const float* w, float*
     default: throw std::invalid_argument("native_add_rms_norm_q8_1: 128, 256, 512 or 1024 threads");
     }
     launch_check();
+}
+
+bool native_rms_norm_q8_1_rows(const NormRows& r, int count, int n, float eps, int threads, void* stream) {
+    validate_shape(n, 1);
+    validate_stream(stream);
+    if (count < 1 || count > kNormRowsMax) throw std::invalid_argument("native_rms_norm_q8_1_rows: 1 to 4 rows");
+    for (int k = 0; k < count; ++k) {
+        validate_pointer(r.x[k]);
+        validate_pointer(r.w[k]);
+        validate_pointer(r.y[k]);
+        validate_pointer(r.y_q8_1[k]);
+    }
+    const auto s = static_cast<cudaStream_t>(stream);
+    const int block = std::max(threads, std::min(1024, n));   // native_add_rms_norm_q8_1()'s
+    switch (threads) {
+    case 128: native_rms_norm_q8_1_rows_kernel<128><<<count, block, 0, s>>>(r, n, eps); break;
+    case 256: native_rms_norm_q8_1_rows_kernel<256><<<count, block, 0, s>>>(r, n, eps); break;
+    case 512: native_rms_norm_q8_1_rows_kernel<512><<<count, block, 0, s>>>(r, n, eps); break;
+    case 1024: native_rms_norm_q8_1_rows_kernel<1024><<<count, block, 0, s>>>(r, n, eps); break;
+    default: throw std::invalid_argument("native_rms_norm_q8_1_rows: 128, 256, 512 or 1024 threads");
+    }
+    launch_check();
+    return true;
 }
 
 void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
