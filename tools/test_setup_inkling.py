@@ -171,11 +171,14 @@ class Main(unittest.TestCase):
         self.assertIn("Inkling 2 Mini has not been built or run on Windows", out)
         self.assertNotIn("has been run on Linux only", out)
 
-    def test_one_card(self):
-        # its engine code has no --layer-split yet: setup writes none
-        code, out, _ = self.main(["--gpus", "0,1"], family="inkling", ram=64.0, n_gpus=2)
-        self.assertNotEqual(code, 0)
-        self.assertIn("runs on one card for now", out)
+    def test_cards(self):
+        # a layer split as for the other families (the engine keeps the loop's layers on one card)
+        code, out, cfg = self.main(["--gpus", "0,1"], family="inkling", ram=64.0, n_gpus=2)
+        self.assertEqual(code, 0, out)
+        self.assertEqual((cfg["gpu"], cfg["layer_split"]), ([0, 1], "auto"))
+        code, out, cfg = self.main(["--gpus", "0,1", "--layer-split", "18"], family="inkling", ram=64.0, n_gpus=2)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cfg["layer_split"], "18")
         code, out, cfg = self.main(["--gpu", "1"], family="inkling", ram=64.0, n_gpus=2)
         self.assertEqual(code, 0, out)
         self.assertEqual(cfg["gpu"], 1)

@@ -879,8 +879,8 @@ FAMILIES = {
     # download, less VRAM, faster (256 rows: 2.1 s against 3.3 s on 6 CPU threads, 63 against 131 ms on the GPU), and
     # the engine's prompt logits with either one's rows were as close to llama.cpp's (cosine 0.99989 or more, the same
     # greedy tokens, 2 pictures).
-    # NVIDIA cards only ("cuda_only": the AMD build was not made for it), not run on Windows.  Its engine code takes
-    # one card ("one_card": no --layer-split yet); "parallel" (--batch) as for the other families; its attention
+    # NVIDIA cards only ("cuda_only": the AMD build was not made for it), not run on Windows.  Several cards split its
+    # layers as the other families' (the loop's twelve on one card); "parallel" (--batch) as for them too; its attention
     # caches are fp16 or q8_0 (POLY_KV).  Measured on an RTX 2070 Super 8 GB with 62 GB of RAM (IQ4_NL): about 3.1 GiB
     # of VRAM beside the experts at 8K in fp16, so "vram_beside_gb" 4.0 at 32K (the rows of the 8 full-attention passes:
     # "row_bytes", 32 KiB a token in fp16, 17 KiB in q8_0; the 40 window passes' rings are fixed, ~0.3 GiB fp16, ~0.17
@@ -890,14 +890,14 @@ FAMILIES = {
     # general.sampling.* (temperature 1.0, top_k 50, top_p 1.0, min_p 0), written into a run config that has no sampling
     # block of its own.
     "inkling": {"title": "Inkling 2 Mini", "by": "Thinking Machines; GGUF by ggml-org",
-                "about": "on the strata-poly engine: one NVIDIA card, Linux; an 18 GB file, ~22 GB of RAM beside an "
+                "about": "on the strata-poly engine: NVIDIA, Linux; an 18 GB file, ~22 GB of RAM beside an "
                          "8 GB card (16.5 GiB measured for the engine); a 2-bit and an 8-bit size too, images optional",
                 "hf": hf("ggml-org/Inkling-2-Mini-GGUF"), "file": "Inkling-2-Mini-{q}.gguf", "shards": 1,
                 "tag": "inkling2-", "name": "inkling-2-mini", "engine": "poly", "vision": True,
                 "vision_llama": INKLING_VISION_LLAMA_CPP_COMMIT, "mmproj_hf": hf("ggml-org/Inkling-2-Mini-GGUF"),
                 "mmproj": "mmproj-Inkling-2-Mini-Q8_0.gguf", "vision_gb": 0.35, "vision_vram_gb": 0.6,
                 "experimental": True, "windows": False, "cuda_only": True, "ran_on_gb": 8, "row_bytes": 32768,
-                "laptop_tps": {32768: "28"}, "one_card": True,
+                "laptop_tps": {32768: "28"},
                 "windows_risk": "Inkling 2 Mini has not been built or run on Windows",
                 "sampling": {"temperature": 1.0, "top_k": 50, "top_p": 1.0},
                 "models": {"IQ4_NL": {"about": "4-bit experts in layers 0-19 (imatrix), 8-bit everywhere else",
@@ -7102,9 +7102,6 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     if unused:
         warn(f"not used with {title} (its engine has no such setting): " + ", ".join(unused))
 
-    if multi and fam.get("one_card"):
-        fail(f"{title} runs on one card for now: its engine code has no layer split yet",
-             f"choose one card with --gpu N (one of {', '.join(str(i) for i in multi)})")
     sizes = family_models(family)
     names = list(sizes)
     if a.model and a.model not in names:
