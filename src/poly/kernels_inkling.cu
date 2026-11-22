@@ -448,17 +448,38 @@ __global__ void __launch_bounds__(AT_THREADS) attn_kernel(AttnArgs a) {
     }
 }
 
-// ---- the same prompt attention on RDNA4's matrix cores (opt-in: STRATA_INKLING_WMMA=1, gfx12, halves' caches) ----
+// ---- the same prompt attention on RDNA4's matrix cores (gfx12, a prompt batch) ----------------------------------
 //
-// attn_kernel's block and softmax, with S = Q K^T and O += P V as v_wmma_f32_16x16x16_f16 (wave32) steps: a block is
-// WMMA_ROWS rows (21 tokens of the 3-head group blockIdx.y) and a warp owns 16 of them; its key tile of 32 is done as
-// two 16-key tiles.  gfx12's fragment layout (checked on gfx1201, src/kernels/cuda/qsa_prompt_attn.cu): a lane l holds
-// A[l % 16][(l / 16) * 8 + i] and B[(l / 16) * 8 + i][l % 16], and its C/D is D[(l / 16) * 8 + i][l % 16].
-#if defined(__HIPCC__) && (defined(__gfx1200__) || defined(__gfx1201__))
+// attn_mma_kernel's block (16 rows a warp, 21 tokens of a 3-head group, keys WM_KEYS at a time counted from position
+// 0) with v_wmma_f32_16x16x16_f16 (wave32) steps, done transposed: S^T = K Q^T and O^T = V^T P^T.  gfx12's fragment
+// layout (checked on gfx1201, src/kernels/cuda/qsa_prompt_attn.cu): a lane l holds A[l % 16][(l / 16) * 8 + i] and
+// B[(l / 16) * 8 + i][l % 16], and its C/D is D[(l / 16) * 8 + i][l % 16].  So lane l's scores are its own row l % 16
+// at 8 keys, which are what the same lane's B fragment of P^T holds: a row's softmax lives in the two lanes l and
+// l ^ 16 and the weights never leave the registers.  The queries (in log2 units), R, the bias table's rows and the
+// weights go into the products as a half plus the half of what it left (hi + lo, two or three steps a product), so
+// the sums are float-exact to about 2^-22 of each term; the keys and values are exact halves (fp16 caches) or Q8_0
+// codes, whose scales multiply the 32-dim blocks of the scores and the weights of each value block in floats.  The
+// bias is R times the table's rows of the distances a warp's rows reach in the tile, through a warp's own shared
+// memory, read back at each score's distance; only tiles with a distance below the extent compute it.
+#if defined(__HIPCC__)
+#if defined(__gfx1200__) || defined(__gfx1201__)
 #define INKLING_WMMA 1
 #else
 #define INKLING_WMMA 0
 #endif
+
+constexpr int WM_WARPS = 4, WM_KEYS = 32, WM_TOKENS = 16 * WM_WARPS / AT_PER;   // 21 tokens, the last row unused
+constexpr int WM_KR = AT_DIM + 8;             // a key row of shared memory, halves
+constexpr int WM_VS = WM_KEYS + 8;            // a dim's row of the values, halves
+constexpr int WM_SLICE = 64;                  // the block's distances a tile (rows of the table)
+constexpr int WM_DIST = 48;                   // a warp's distances a tile: 3 steps of 16
+constexpr int WM_BE = WM_DIST + 4;            // a row's bias of a tile, floats
+// The weights go into the products times 2^12 (and the output comes out divided by it, both exact): a weight, or a
+// Q8_0 block's scale times one, as small as 1e-6 is then a normal half and its lo half not lost below 6e-8
+constexpr float WM_PSCALE = 4096.0f;
+static_assert(16 * (WM_WARPS - 1) / AT_PER + WM_DIST <= WM_SLICE, "attn_wmma_kernel: the slice covers every warp");
+static_assert(16 / AT_PER + 1 + WM_KEYS <= WM_DIST, "attn_wmma_kernel: a warp's distances fit its steps");
+static_assert(WM_KEYS * AT_DIM % (16 * WM_WARPS * WARP) == 0, "attn_wmma_kernel: the tiles' copies fill the block");
 
 #if INKLING_WMMA
 typedef _Float16 wh8 __attribute__((ext_vector_type(8)));
@@ -469,209 +490,276 @@ __device__ __forceinline__ wf8 wmma16(wh8 a, wh8 b, wf8 c) {
 }
 
 __device__ __forceinline__ wf8 wf8_zero() { return wf8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f}; }
-#endif
 
-constexpr int WMMA_WARPS = AT_THREADS / WARP;    // 4
-constexpr int WMMA_ROWS = 16 * WMMA_WARPS;       // rows (token, head) pairs a block
-constexpr int WMMA_TOKENS = WMMA_ROWS / AT_PER;  // 21 tokens, the last row unused
-constexpr int WMMA_KR = AT_DIM + 8;              // a key or value row of shared memory, halves
-
-constexpr int WMMA_VS = AT_KEYS + 8;   // a dim's row of a value tile, halves (16-byte aligned, banks spread)
-constexpr std::size_t WMMA_DMAX = 64;  // distances a tile's rows can span, at most
-
-constexpr size_t attn_wmma_smem() {
-    return sizeof(half) * (size_t(WMMA_ROWS) * AT_DIM + size_t(AT_KEYS) * WMMA_KR + size_t(AT_DIM) * WMMA_VS) +
-           sizeof(float) * (size_t(WMMA_ROWS) * AT_KEYS + size_t(WMMA_ROWS) * AT_MAX_REL + WMMA_DMAX * AT_MAX_REL +
-                            3 * WMMA_ROWS);
-}
-
-__global__ void __launch_bounds__(AT_THREADS) attn_wmma_kernel(AttnArgs a) {
-#if INKLING_WMMA
-    extern __shared__ __align__(16) char wsm[];
-    half* Qh = reinterpret_cast<half*>(wsm);                       // [ROWS][DIM]
-    half* ks = Qh + size_t(WMMA_ROWS) * AT_DIM;                    // [KEYS][KR]
-    half* vs = ks + size_t(AT_KEYS) * WMMA_KR;                     // [DIM][VS]: a dim's 32 keys, for B fragments
-    float* Ps = reinterpret_cast<float*>(vs + size_t(AT_DIM) * WMMA_VS);   // [ROWS][KEYS]
-    float* Rh = Ps + size_t(WMMA_ROWS) * AT_KEYS;                  // [ROWS][MAX_REL]
-    float* bt = Rh + size_t(WMMA_ROWS) * AT_MAX_REL;               // [DIST][MAX_REL], this tile's table rows
-    float* Ms = bt + WMMA_DMAX * AT_MAX_REL;                       // [ROWS]
-    float* Ls = Ms + WMMA_ROWS;
-    float* As = Ls + WMMA_ROWS;
-
-    const int tid = threadIdx.x, lane = tid % WARP, warp = tid / WARP;
-    const int col = lane % 16, kh = lane / 16;   // a fragment's row (A) or column (B and C), and its k half
-    const int g = blockIdx.y, t0 = blockIdx.x * WMMA_TOKENS;
-    const int nt = min(WMMA_TOKENS, a.rows - t0);
-    const int n_rel = a.rel.n_rel;
-    const long long p0 = a.pos + t0, plast = p0 + nt - 1;
-    const long long kb = a.window > 0 && p0 >= a.window ? p0 - a.window + 1 : 0, ke = plast + 1;
-    const int r0 = 16 * warp + 8 * kh;           // this lane's C rows, r0 .. r0 + 7
-
-    for (int i = tid; i < WMMA_ROWS * AT_DIM; i += AT_THREADS) {
-        const int r = i / AT_DIM, d = i % AT_DIM, t = r / AT_PER, h = g * AT_PER + r % AT_PER;
-        Qh[i] = t < nt ? (half) a.q[((size_t(t0) + t) * a.n_head + h) * AT_DIM + d] : (half) 0.0f;
-    }
-    for (int i = tid; i < WMMA_ROWS * AT_MAX_REL; i += AT_THREADS) {
-        const int r = i / AT_MAX_REL, j = i % AT_MAX_REL, t = r / AT_PER, h = g * AT_PER + r % AT_PER;
-        Rh[i] = t < nt && j < n_rel ? a.rel.r[((size_t(t0) + t) * a.n_head + h) * n_rel + j] : 0.0f;
-    }
-    if (tid < WMMA_ROWS) {
-        Ms[tid] = -INFINITY;
-        Ls[tid] = 0.0f;
-    }
-    wf8 acc[AT_DIM / 16];
-#pragma unroll
-    for (int j = 0; j < AT_DIM / 16; ++j) acc[j] = wf8_zero();
-    __syncthreads();
-
-    for (long long kt = kb < ke ? kb / AT_KEYS * AT_KEYS : ke; kt < ke; kt += AT_KEYS) {
-        // the tile's keys and values, halves a row (a key outside [kb, ke) is zeros); the values go by dim, which
-        // is how a B fragment reads them
-        for (int j = 0; j < AT_KEYS; ++j) {
-            const long long kp = kt + j;
-            const bool live = kp >= kb && kp < ke;
-            const long long row = a.ring > 0 ? kp % a.ring : kp;
-            const size_t base = (size_t(row) * a.kv_heads + g) * AT_DIM + tid;
-            vs[size_t(tid) * WMMA_VS + j] = live ? a.vc[base] : (half) 0.0f;
-        }
-        // the keys, eight halves a thread a copy: a key row is contiguous, and a 16-byte copy is one instruction
-        constexpr int KCH = AT_DIM / 8;
-        for (int i = tid; i < AT_KEYS * KCH; i += AT_THREADS) {
-            const int j = i / KCH, c = i % KCH;
-            const long long kp = kt + j;
-            const bool live = kp >= kb && kp < ke;
-            const long long row = a.ring > 0 ? kp % a.ring : kp;
-            const size_t base = (size_t(row) * a.kv_heads + g) * AT_DIM + size_t(c) * 8;
-            uint4* dst = reinterpret_cast<uint4*>(ks + j * WMMA_KR + c * 8);
-            *dst = live ? *reinterpret_cast<const uint4*>(a.kc + base) : make_uint4(0, 0, 0, 0);
-        }
-        // the table rows the tile's rows and keys can reach: dist = position - key, so [p0 - kt - 31, plast - kt]
-        const long long dlo = std::max<long long>(0, p0 - kt - (AT_KEYS - 1));
-        const long long dhi = std::min<long long>(a.rel.extent - 1, plast - kt);
-        const int nd = dhi >= dlo ? int(dhi - dlo + 1) : 0;
-        for (int i = tid; i < nd * n_rel; i += AT_THREADS) bt[i] = a.rel.table[size_t(dlo + i / n_rel) * n_rel + i % n_rel];
-        __syncthreads();
-
-        // S = Q K^T, a 16-key tile a step: this lane's scores are rows r0..r0+7 at key col
-#pragma unroll
-        for (int t16 = 0; t16 < AT_KEYS / 16; ++t16) {
-            wf8 s = wf8_zero();
-#pragma unroll
-            for (int kk = 0; kk < AT_DIM / 16; ++kk) {
-                const int kd = kk * 16 + 8 * kh;
-                wh8 q, k;
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    q[i] = Qh[size_t(16 * warp + col) * AT_DIM + kd + i];
-                    k[i] = ks[(t16 * 16 + col) * WMMA_KR + kd + i];
-                }
-                s = wmma16(q, k, s);
-            }
-            const long long kp = kt + t16 * 16 + col;
-#pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const int r = r0 + i, t = r / AT_PER;
-                const long long p = p0 + t, dist = p - kp;
-                const bool seen = t < nt && kp >= kb && kp < ke && dist >= 0 && (a.window <= 0 || dist < a.window);
-                float v = -INFINITY;
-                if (seen) {
-                    float bias = 0.0f;
-                    if (dist < a.rel.extent && dist >= dlo && dist <= dhi) {
-                        const float* tb = bt + size_t(dist - dlo) * n_rel;
-                        const float* rr = Rh + size_t(r) * AT_MAX_REL;
-                        int j = 0;
-                        for (; j + 4 <= n_rel; j += 4) {
-                            const float4 t4 = *reinterpret_cast<const float4*>(tb + j);
-                            const float4 r4 = *reinterpret_cast<const float4*>(rr + j);
-                            bias += t4.x * r4.x;
-                            bias += t4.y * r4.y;
-                            bias += t4.z * r4.z;
-                            bias += t4.w * r4.w;
-                        }
-                        for (; j < n_rel; ++j) bias += tb[j] * rr[j];
-                    }
-                    v = s[i] * a.scale + bias;
-                }
-                Ps[size_t(r) * AT_KEYS + t16 * 16 + col] = v;
-            }
-        }
-        __syncthreads();
-
-        // the online softmax: a warp a row, a lane a key (attn_kernel's)
-        for (int r = warp; r < WMMA_ROWS; r += WMMA_WARPS) {
-            const float s = Ps[size_t(r) * AT_KEYS + lane];
-            const float m_old = Ms[r];
-            const float m_new = fmaxf(m_old, warp_max(s));
-            const float p = s == -INFINITY ? 0.0f : expf(s - m_new);
-            const float sum = warp_sum(p);
-            Ps[size_t(r) * AT_KEYS + lane] = p;
-            if (lane == 0) {
-                const float alpha = m_old == -INFINITY ? 0.0f : expf(m_old - m_new);
-                As[r] = alpha;
-                Ms[r] = m_new;
-                Ls[r] = Ls[r] * alpha + sum;
-            }
-        }
-        __syncthreads();
-
-        // O += P V: this lane's rows scaled by their alphas, then two 16-key groups of A fragments and the 16-dim
-        // slices of the values that go with them
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const float al = As[r0 + i];
-#pragma unroll
-            for (int j = 0; j < AT_DIM / 16; ++j) acc[j][i] *= al;
-        }
-#pragma unroll
-        for (int kg = 0; kg < AT_KEYS / 16; ++kg) {
-            wh8 ph;
-#pragma unroll
-            for (int i = 0; i < 8; ++i) ph[i] = (half) Ps[size_t(16 * warp + col) * AT_KEYS + kg * 16 + 8 * kh + i];
-#pragma unroll
-            for (int j = 0; j < AT_DIM / 16; ++j) {
-                wh8 v;
-#pragma unroll
-                for (int i = 0; i < 8; ++i) v[i] = vs[size_t(j * 16 + col) * WMMA_VS + kg * 16 + 8 * kh + i];
-                acc[j] = wmma16(ph, v, acc[j]);
-            }
-        }
-        __syncthreads();
-    }
-
+// x as a half and the half of what that leaves
+__device__ __forceinline__ void hilo(const float* x, wh8& hi, wh8& lo) {
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        const int r = r0 + i, t = r / AT_PER, h = g * AT_PER + r % AT_PER;
-        if (t >= nt) continue;
-        const size_t tok = size_t(t0) + t;
-        const float m = Ms[r], l = Ls[r];
-        const float sink = a.sinks ? a.sinks[tok * a.n_head + h] : -INFINITY;
-        const float mx = fmaxf(m, sink);
-        const float f = m == -INFINITY ? 0.0f : expf(m - mx);
-        const float denom = l * f + (sink == -INFINITY ? 0.0f : expf(sink - mx));
+        hi[i] = (_Float16) x[i];
+        lo[i] = (_Float16) (x[i] - (float) hi[i]);
+    }
+}
+
+__device__ __forceinline__ void load8(const float* p, float* x) {
+    const float4 a = *reinterpret_cast<const float4*>(p), b = *reinterpret_cast<const float4*>(p + 4);
+    x[0] = a.x, x[1] = a.y, x[2] = a.z, x[3] = a.w, x[4] = b.x, x[5] = b.y, x[6] = b.z, x[7] = b.w;
+}
+
+// The warp's shared-memory writes before its lanes read each other's
+__device__ __forceinline__ void wave_sync() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+}
+
+// 8 consecutive cache values from element `at` as halves: fp16 bits, or Q8_0 codes (exact as halves)
+template <bool Q8>
+__device__ __forceinline__ uint4 cache_halves(const half* f16, const Kvq8& q8, size_t at) {
+    if constexpr (!Q8) return *reinterpret_cast<const uint4*>(f16 + at);
+    const uint2 c = *reinterpret_cast<const uint2*>(q8.codes + at);
+    uint32_t h[4];
 #pragma unroll
-        for (int j = 0; j < AT_DIM / 16; ++j)
-            a.out[(tok * a.n_head + h) * AT_DIM + j * 16 + col] = acc[j][i] * f / denom;
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t word = j < 2 ? c.x : c.y, sh = 16 * (j % 2);
+        const _Float16 lo = (_Float16) (float) (signed char) (word >> sh);
+        const _Float16 hi = (_Float16) (float) (signed char) (word >> (sh + 8));
+        h[j] = uint32_t(__builtin_bit_cast(uint16_t, lo)) | uint32_t(__builtin_bit_cast(uint16_t, hi)) << 16;
+    }
+    return make_uint4(h[0], h[1], h[2], h[3]);
+}
+#endif
+
+template <bool KQ8, bool VQ8>
+__global__ void __launch_bounds__(WM_WARPS * WARP) attn_wmma_kernel(AttnArgs a) {
+#if INKLING_WMMA
+    __shared__ __align__(16) _Float16 ks[WM_KEYS * WM_KR];   // [KEYS][KR]
+    __shared__ __align__(16) _Float16 vt[AT_DIM * WM_VS];    // [DIM][VS]: a dim's keys, an A fragment's row
+    __shared__ __align__(16) float slice[WM_SLICE * 16];     // the table's rows of the block's distances
+    __shared__ __align__(16) float bias[WM_WARPS][16 * WM_BE];
+    __shared__ __align__(16) float ksc[KQ8 ? 4 * WM_KEYS : 4], vsc[VQ8 ? 4 * WM_KEYS : 4];   // [32-dim block][KEYS]
+    constexpr float LOG2E = 1.44269504f;
+    const int tid = threadIdx.x, lane = tid % WARP, w = tid / WARP, col = lane % 16, kh = lane / 16;
+    const int g = blockIdx.y, t0 = (gridDim.x - 1 - blockIdx.x) * WM_TOKENS;   // the longest blocks first
+    const int nt = min(WM_TOKENS, a.rows - t0), wt0 = 16 * w / AT_PER;
+    const int r = 16 * w + col, tok = r / AT_PER, head = g * AT_PER + r % AT_PER;   // the lane's row
+    const bool row_ok = tok < nt;
+    const long long p0 = a.pos + t0, own = p0 + tok, ext = a.rel.extent;
+    const long long kb = a.window > 0 && p0 >= a.window ? p0 - a.window + 1 : 0, ke = p0 + nt;
+    const size_t th = (size_t(t0) + (row_ok ? tok : 0)) * a.n_head + head;
+
+    // the row's query (B fragments of Q^T, 16 dims a step) and R, in log2 units
+    wh8 qh[AT_DIM / 16], ql[AT_DIM / 16], rh, rl;
+    {
+        const float c = a.scale * LOG2E;
+#pragma unroll
+        for (int kk = 0; kk < AT_DIM / 16; ++kk) {
+            float x[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            if (row_ok) load8(a.q + th * AT_DIM + kk * 16 + kh * 8, x);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) x[i] *= c;
+            hilo(x, qh[kk], ql[kk]);
+        }
+        float x[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        if (row_ok) load8(a.rel.r + th * 16 + kh * 8, x);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) x[i] *= LOG2E;
+        hilo(x, rh, rl);
+    }
+    wf8 acc[AT_DIM / 16];   // O^T: dims dt * 16 + kh * 8 + i of the row
+#pragma unroll
+    for (int dt = 0; dt < AT_DIM / 16; ++dt) acc[dt] = wf8_zero();
+    float m = -INFINITY, l = 0.0f;
+
+    for (long long kt = kb < ke ? kb / WM_KEYS * WM_KEYS : ke; kt < ke; kt += WM_KEYS) {
+        __syncthreads();   // the last tile's keys, values and table rows are read
+        // the keys, a 16-byte copy a thread; a key outside [kb, ke) is zeros (its cache row may be anything)
+#pragma unroll
+        for (int it = 0; it < WM_KEYS * (AT_DIM / 8) / (WM_WARPS * WARP); ++it) {
+            const int i = tid + it * WM_WARPS * WARP, j = i / (AT_DIM / 8), c = i % (AT_DIM / 8);
+            const long long kp = kt + j;
+            const bool live = kp >= kb && kp < ke;
+            const size_t at = (size_t(a.ring > 0 ? kp % a.ring : kp) * a.kv_heads + g) * AT_DIM + c * 8;
+            *reinterpret_cast<uint4*>(ks + j * WM_KR + c * 8) = live ? cache_halves<KQ8>(a.kc, a.kq, at)
+                                                                      : make_uint4(0, 0, 0, 0);
+            if constexpr (KQ8)
+                if (c % 4 == 0) ksc[(c / 4) * WM_KEYS + j] = live ? __half2float(__ushort_as_half(a.kq.scales[at / 32])) : 0.f;
+        }
+        // the values by dim, two keys a thread: lanes of a half-warp take 16 key pairs, so a write is 16 words
+#pragma unroll
+        for (int it = 0; it < WM_KEYS / 2 * (AT_DIM / 8) / (WM_WARPS * WARP); ++it) {
+            const int i = tid + it * WM_WARPS * WARP, j = 2 * (i % (WM_KEYS / 2)), c = i / (WM_KEYS / 2);
+            uint4 x[2];
+#pragma unroll
+            for (int u = 0; u < 2; ++u) {
+                const long long kp = kt + j + u;
+                const bool live = kp >= kb && kp < ke;
+                const size_t at = (size_t(a.ring > 0 ? kp % a.ring : kp) * a.kv_heads + g) * AT_DIM + c * 8;
+                x[u] = live ? cache_halves<VQ8>(a.vc, a.vq, at) : make_uint4(0, 0, 0, 0);
+                if constexpr (VQ8)
+                    if (c % 4 == 0) vsc[(c / 4) * WM_KEYS + j + u] = live ? __half2float(__ushort_as_half(a.vq.scales[at / 32])) : 0.f;
+            }
+            const uint32_t w0[4] = {x[0].x, x[0].y, x[0].z, x[0].w}, w1[4] = {x[1].x, x[1].y, x[1].z, x[1].w};
+#pragma unroll
+            for (int d = 0; d < 8; ++d) {
+                const uint32_t sh = 16 * (d % 2);
+                const uint32_t v = (w0[d / 2] >> sh & 0xffffu) | (w1[d / 2] >> sh & 0xffffu) << 16;
+                *reinterpret_cast<uint32_t*>(vt + (c * 8 + d) * WM_VS + j) = v;
+            }
+        }
+        // the table's rows of distances p0 - (kt + KEYS - 1) + e, zeros outside [0, extent)
+        const long long d0 = p0 - (kt + WM_KEYS - 1);
+        if (d0 < ext)
+            for (int i = tid; i < WM_SLICE * 4; i += WM_WARPS * WARP) {
+                const long long d = d0 + i / 4;
+                float4 x = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (d >= 0 && d < ext) x = *reinterpret_cast<const float4*>(a.rel.table + d * 16 + (i % 4) * 4);
+                *reinterpret_cast<float4*>(slice + i * 4) = x;
+            }
+        __syncthreads();
+
+        // S^T = K Q^T: s[t16][i] is the row's score at key kt + 16 t16 + 8 kh + i
+        wf8 s[WM_KEYS / 16];
+#pragma unroll
+        for (int t16 = 0; t16 < WM_KEYS / 16; ++t16) {
+            const _Float16* kr = ks + (t16 * 16 + col) * WM_KR + kh * 8;
+            s[t16] = wf8_zero();
+#pragma unroll
+            for (int b = 0; b < AT_DIM / 32; ++b) {
+                wf8 c = KQ8 ? wf8_zero() : s[t16];
+#pragma unroll
+                for (int kk = 2 * b; kk < 2 * b + 2; ++kk) {
+                    const wh8 kf = *reinterpret_cast<const wh8*>(kr + kk * 16);
+                    c = wmma16(kf, qh[kk], c);
+                    c = wmma16(kf, ql[kk], c);
+                }
+                if constexpr (KQ8) {
+                    float d[8];
+                    load8(ksc + b * WM_KEYS + t16 * 16 + kh * 8, d);
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) s[t16][i] = fmaf(d[i], c[i], s[t16][i]);
+                } else {
+                    s[t16] = c;
+                }
+            }
+        }
+
+        // the bias: the warp's distances dw + e, e = 16 T + 8 kh + i, times the rows' R, put by row and read back
+        const long long dw = d0 + wt0;
+        const bool near = dw < ext;
+        float* bw = bias[w];
+        if (near) {
+#pragma unroll
+            for (int T = 0; T < WM_DIST / 16; ++T) {
+                float x[8];
+                load8(slice + (wt0 + T * 16 + col) * 16 + kh * 8, x);
+                wh8 th_, tl_;
+                hilo(x, th_, tl_);
+                wf8 c = wmma16(th_, rh, wf8_zero());
+                c = wmma16(tl_, rh, c);
+                c = wmma16(th_, rl, c);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) bw[col * WM_BE + T * 16 + kh * 8 + i] = c[i];
+            }
+            wave_sync();
+        }
+
+        // the mask and the online softmax, in log2 units
+        const int e0 = tok - wt0 + WM_KEYS - 1;   // the row's distance to key kt, less dw
+        float mx = -INFINITY;
+#pragma unroll
+        for (int t16 = 0; t16 < WM_KEYS / 16; ++t16)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int k = t16 * 16 + kh * 8 + i;
+                const long long kp = kt + k, dist = own - kp;
+                const bool seen = row_ok && kp >= kb && kp < ke && dist >= 0 && (a.window <= 0 || dist < a.window);
+                float v = -INFINITY;
+                if (seen) v = near ? s[t16][i] + bw[col * WM_BE + e0 - k] : s[t16][i];
+                s[t16][i] = v;
+                mx = fmaxf(mx, v);
+            }
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 16));
+        const float now = fmaxf(m, mx), base = now == -INFINITY ? 0.0f : now;
+        const float f = exp2f(m - base);
+        m = now;
+        if (f != 1.0f) {
+            l *= f;
+#pragma unroll
+            for (int dt = 0; dt < AT_DIM / 16; ++dt)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) acc[dt][i] *= f;
+        }
+#pragma unroll
+        for (int t16 = 0; t16 < WM_KEYS / 16; ++t16)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float p = exp2f(s[t16][i] - base);
+                s[t16][i] = p;
+                l += p;
+            }
+
+        // O^T += V^T P^T: keys 16 kg.. of the dims 16 dt..; a Q8_0 value block's scales go on the weights
+#pragma unroll
+        for (int kg = 0; kg < WM_KEYS / 16; ++kg) {
+            const _Float16* vr = vt + col * WM_VS + kg * 16 + kh * 8;
+            if constexpr (!VQ8) {
+                float p[8];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) p[i] = s[kg][i] * WM_PSCALE;
+                wh8 ph, pl;
+                hilo(p, ph, pl);
+#pragma unroll
+                for (int dt = 0; dt < AT_DIM / 16; ++dt) {
+                    const wh8 vf = *reinterpret_cast<const wh8*>(vr + dt * 16 * WM_VS);
+                    acc[dt] = wmma16(vf, ph, acc[dt]);
+                    acc[dt] = wmma16(vf, pl, acc[dt]);
+                }
+            } else {
+#pragma unroll
+                for (int b = 0; b < AT_DIM / 32; ++b) {
+                    float p[8];
+                    load8(vsc + b * WM_KEYS + kg * 16 + kh * 8, p);
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) p[i] *= s[kg][i] * WM_PSCALE;
+                    wh8 ph, pl;
+                    hilo(p, ph, pl);
+#pragma unroll
+                    for (int dt = 2 * b; dt < 2 * b + 2; ++dt) {
+                        const wh8 vf = *reinterpret_cast<const wh8*>(vr + dt * 16 * WM_VS);
+                        acc[dt] = wmma16(vf, ph, acc[dt]);
+                        acc[dt] = wmma16(vf, pl, acc[dt]);
+                    }
+                }
+            }
+        }
+    }
+
+    l += __shfl_xor_sync(0xffffffffu, l, 16);
+    if (!row_ok) return;
+    float f = 1.0f;
+    if (a.sinks) {   // the sink, in log2 units like the scores
+        const float sink = a.sinks[th] * LOG2E, now = fmaxf(m, sink);
+        f = exp2f(m - now);
+        l = l * f + exp2f(sink - now);
+    }
+    float* y = a.out + th * AT_DIM + kh * 8;
+#pragma unroll
+    for (int dt = 0; dt < AT_DIM / 16; ++dt) {
+        float o[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) o[i] = acc[dt][i] * f / (l * WM_PSCALE);
+        *reinterpret_cast<float4*>(y + dt * 16) = make_float4(o[0], o[1], o[2], o[3]);
+        *reinterpret_cast<float4*>(y + dt * 16 + 4) = make_float4(o[4], o[5], o[6], o[7]);
     }
 #else
     (void) a;
-#if defined(__HIPCC__)
-    __builtin_trap();
-#else
-    __trap();
-#endif
+    __builtin_trap();   // never launched off gfx12 (wmma_attention())
 #endif
 }
 
-// Whether attn_wmma_kernel runs here: asked for (STRATA_INKLING_WMMA=1), on a card the kernel has its instructions
-// for (INKLING_WMMA's archs; the macros are the device pass's alone, so the host asks the card's name), elsewhere
-// the kernel being a trap.
+// Whether attn_wmma_kernel runs on the current card: gfx12, which its instructions are.  The arch macros are the
+// device pass's alone, so the host asks the card.
 bool wmma_attention() {
-#if defined(__HIPCC__)
-    static const bool asked = [] {
-        const char* v = std::getenv("STRATA_INKLING_WMMA");
-        return v != nullptr && *v != '\0' && std::string(v) != "0";
-    }();
-    if (!asked) return false;
     static std::atomic<int> cards[kDevices] = {};   // a device's: 1 gfx12, 2 not, 0 not yet asked
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kDevices) {
@@ -688,29 +776,17 @@ bool wmma_attention() {
         cards[dev].store(card, std::memory_order_relaxed);
     }
     return card == 1;
-#else
-    return false;
-#endif
 }
 
-void launch_attn_wmma(const AttnArgs& a, int kv_heads, int rows, cudaStream_t st) {
-    constexpr size_t smem = attn_wmma_smem();
-    if constexpr (smem > 48 * 1024) {
-        static std::atomic<bool> set[kDevices] = {};   // the device's own setting: once on each card the calls are for
-        int dev = 0;
-        const bool known = cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < kDevices;
-        if (!known || !set[dev].load(std::memory_order_relaxed)) {
-            const cudaError_t e =
-                cudaFuncSetAttribute(attn_wmma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
-            if (e != cudaSuccess)
-                throw std::runtime_error(std::string("inkling_attend: shared memory: ") + cudaGetErrorString(e));
-            if (known) set[dev].store(true, std::memory_order_relaxed);
-        }
-    }
-    const dim3 g(grid(rows, WMMA_TOKENS), kv_heads);
-    attn_wmma_kernel<<<g, AT_THREADS, smem, st>>>(a);
-    check_launch("inkling_attend");
+void launch_attn_wmma(const AttnArgs& a, int rows, bool kq, bool vq, cudaStream_t st) {
+    const dim3 g(grid(rows, WM_TOKENS), a.kv_heads);
+    constexpr int T = WM_WARPS * WARP;
+    if (kq && vq) attn_wmma_kernel<true, true><<<g, T, 0, st>>>(a);
+    else if (kq) attn_wmma_kernel<true, false><<<g, T, 0, st>>>(a);
+    else if (vq) attn_wmma_kernel<false, true><<<g, T, 0, st>>>(a);
+    else attn_wmma_kernel<false, false><<<g, T, 0, st>>>(a);
 }
+#endif
 
 // The split path's rows: a call's tokens one after the other in one sequence (inkling_attend()), or each row a
 // sequence's of its own with its own caches, position and splits (inkling_attend_seqs()).  AttnArgs::nslot is then
@@ -2882,14 +2958,15 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
         }
     }
     if (at) throw std::invalid_argument("inkling_attend: the position on the card takes the split path and a room");
-    // a block is WMMA_TOKENS tokens of a visit: below that the decode and split paths are the ones to use; its bias
-    // reads the table and R four values at a time
-    if (!kq && !vq && rows >= WMMA_TOKENS && rel.n_rel % 4 == 0 && wmma_attention()) {
-        launch_attn_wmma(a, kv_heads, rows, st);
+#if defined(__HIPCC__)
+    if (rows >= kInklingMmaRows && rel.n_rel == 16 && wmma_attention()) {
+        launch_attn_wmma(a, rows, kq, vq, st);
+        check_launch("inkling_attend");
         if (gate) mul_sigmoid(out, gate, n_head * dim, rows, n_head * dim, false, stream);
         if (out_q8_1) kernels::native_quantize_q8_1(out, out_q8_1, n_head * dim * rows, 1, stream);
         return;
     }
+#endif
     if (rows >= kInklingMmaRows && rel.n_rel == 16 && mma_attention()) {
         // attn_fa2_kernel for full layers whose call reaches past kFa2Keys positions only: in a window layer, and for
         // the first 2,048 keys of a full one, attn_mma_kernel was the faster (A100, q8_0, 1,024 tokens: 0.21 against

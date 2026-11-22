@@ -2331,7 +2331,11 @@ int main(int argc, char** argv) {
     cudaDeviceProp prop{};
     cudaGetDeviceProperties(&prop, 0);
     std::printf("device: %s (sm_%d%d)\n", prop.name, prop.major, prop.minor);
+#if defined(__HIPCC__)
+    mma_card = false;   // gfx12's matrix-core attention sums its hi + lo halves: held to the other paths' bound
+#else
     mma_card = prop.major * 10 + prop.minor >= 75;
+#endif
 
     if (only_bench) {   // decode: only the decode-shape timings
         std::vector<float> table = randv(size_t(kExtent) * kRel, 0.3f);
