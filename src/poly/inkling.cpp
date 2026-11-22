@@ -199,6 +199,9 @@ void Inkling::load_geometry() {
     // STRATA_POLY_EXPERT_TILES=1: a prompt batch's experts in tiles of their own widths (Engine::expert_tiles_).
     // Opt-in: no tile's sum is split over K where llama.cpp's stream-k splits some, so the sums differ in rounding.
     if (const char* e = std::getenv("STRATA_POLY_EXPERT_TILES"); e && std::atoi(e) != 0) expert_tiles_ = true;
+#if defined(STRATA_USE_HIP)
+    expert_tiles_ = true;   // RDNA's MMQ splits no tile over K, so there the tiles are the same sums in the same order
+#endif
     // STRATA_POLY_WIDE_READ=N: a read of several calls takes N tokens a call (Engine::wide_rows_).  Opt-in: larger
     // calls split some sums another way, so other bits.
     if (const char* e = std::getenv("STRATA_POLY_WIDE_READ")) wide_rows_ = std::max(std::atoi(e), 0);

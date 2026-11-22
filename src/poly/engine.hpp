@@ -844,7 +844,8 @@ protected:
     bool half_sum_guard_ = false;
     /// a prompt batch's routed experts through Mmq::mul_tiles(): one launch a product over every cached expert, and
     /// one over a staging round's, each expert's rows cut into tiles of their own width (moe_rows()).  No tile's sum
-    /// is split, where llama.cpp's stream-k splits some, so other bits: opt-in (Inkling 2's STRATA_POLY_EXPERT_TILES)
+    /// is split, where llama.cpp's stream-k splits some, so other bits: opt-in (Inkling 2's STRATA_POLY_EXPERT_TILES);
+    /// Inkling 2's default on HIP, whose RDNA cards' MMQ splits none
     bool expert_tiles_ = false;
     /// A read's calls of this many rows, with buffers the expert cache lends while the read is on (widen_rows());
     /// 0: never.  Larger calls split some sums another way, so other bits: opt-in (Inkling 2's
