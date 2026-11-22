@@ -188,6 +188,9 @@ void Inkling::load_geometry() {
     prestage_ = true;      // a read's next layer's experts come while a layer runs
     kernel_tables_ = true;    // and a call's tables do not wait behind the copies to the card
     lowbit_experts_ = true;   // Unsloth's files: IQ1_S gate_up and Q2_0 down experts
+    // STRATA_POLY_EXPERT_TILES=1: a prompt batch's experts in tiles of their own widths (Engine::expert_tiles_).
+    // Opt-in: no tile's sum is split over K where llama.cpp's stream-k splits some, so the sums differ in rounding.
+    if (const char* e = std::getenv("STRATA_POLY_EXPERT_TILES"); e && std::atoi(e) != 0) expert_tiles_ = true;
 #if !defined(STRATA_USE_HIP)
     lane_slots_ = true;       // the cached experts' launches through MmvqSlots::lanes' kernels (measured on CUDA)
 #endif

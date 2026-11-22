@@ -15,6 +15,7 @@
 #pragma once
 
 #include "cpu_experts.hpp"
+#include "mmq.hpp"
 #include "strata/poly/kernels.hpp"
 
 #include <atomic>
@@ -144,6 +145,7 @@ struct Dev {
 struct Layer {
     bool moe = false;
     bool mmq = false;     ///< the card has MMQ tiles for its routed experts' types (Engine::batched())
+    bool tiles_gu = false, tiles_d = false;   ///< gate|up's, down's products through Mmq::mul_tiles() (expert_tiles_)
     /// A layer that runs another layer's routed experts (Inkling's later visits of a looped layer): that layer's
     /// index, whose router, cache slots, staging, use counts and CPU pool it uses.  Its own moe is false, so the
     /// expert cache and every loop over the MoE layers leave it out.  -1 (every other model): none.
@@ -199,8 +201,6 @@ struct Stats {
 
 /// The most likely token of n logits: the first of the largest.
 int most_likely(const float* logits, int n);
-
-class Mmq;
 
 /// A picture in a sequence: n rows that stand where n tokens would, each the vision encoder's output for a patch,
 /// as wide as a token's embedding.  The patches come line after line, nx to a line.
@@ -797,6 +797,10 @@ protected:
     /// a prompt batch's products go through guard_half_sums(): the model's activations can sum past a half's range
     /// in a block.  Off for the models whose sums stay in range: it cost LFM2.5 4% of a 30K prompt's read on a 5090.
     bool half_sum_guard_ = false;
+    /// a prompt batch's routed experts through Mmq::mul_tiles(): one launch a product over every cached expert, and
+    /// one over a staging round's, each expert's rows cut into tiles of their own width (moe_rows()).  No tile's sum
+    /// is split, where llama.cpp's stream-k splits some, so other bits: opt-in (Inkling 2's STRATA_POLY_EXPERT_TILES)
+    bool expert_tiles_ = false;
 
     std::vector<Layer> layers_;   ///< the model's, and after them the draft block
     Dev out_norm_, output_;
@@ -967,6 +971,14 @@ protected:
     size_t stage_cut_ = 0;                        ///< what the cache gave up for it, which it takes back
     int stage_turn_ = 0;
     std::vector<int32_t> ids_, count_, first_, group_, round_, round_row_;
+    // expert_tiles_: a call's tiles (the cached experts', then each staging round's from tile_at_[r]) and the
+    // matrices' offsets (the cached experts' slots from the lowest, a round's gate|up and down from the buffer's),
+    // here and on the card
+    std::vector<Mmq::Tile> tiles_;
+    std::vector<int> tile_at_;
+    std::vector<int32_t> tile_first_, tile_rows_, tile_mat_;
+    int64_t *h_mat_at_ = nullptr, *mat_at_ = nullptr;
+    Mmq::Tile* d_tiles_ = nullptr;
     std::vector<int> staged_tiles_;   ///< STRATA_POLY_STAGED_TILES: the rows that end a size class of staged experts
     std::vector<float> route_tmp_;   ///< route()'s scratch, a share for each host thread
     std::vector<float> bias_rl_;     ///< one token's scores with Options::cache_bias added (moe())

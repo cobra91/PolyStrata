@@ -3334,7 +3334,8 @@ void Engine::alloc() {
     // A prompt batch runs a layer's routed experts through MMQ when the card has a tile for each of their types
     // (batched()).  The model's layers: the draft block's experts never run a batch at a time.
     const size_t n = (size_t) rows_;
-    bool tiles = false, mixed_tiles = false;
+    bool tiles = false, mixed_tiles = false, any_tiles = false;
+    int n_tiled = 0, n_products = 0;
     size_t one_expert = 0;
     for (int il = 0; il < n_layer_; ++il) {
         Layer& L = layers_[(size_t) il];
@@ -3345,11 +3346,19 @@ void Engine::alloc() {
                                              Mmq::fits((int) L.u_type, n_ff_exp_, n_embd_, lb)
                                        : Mmq::fits((int) L.gu_type, 2 * n_ff_exp_, n_embd_, lb);
         L.mmq = opt_.gpu_experts && rows_ >= kStageRows && gu_fits && Mmq::fits((int) L.d_type, n_embd_, n_ff_exp_, lb);
+        L.tiles_gu = expert_tiles_ && L.mmq && !L.mixed() && Mmq::tiles_fit((int) L.gu_type, 2 * n_ff_exp_, n_embd_, lb);
+        L.tiles_d = expert_tiles_ && L.mmq && Mmq::tiles_fit((int) L.d_type, n_embd_, n_ff_exp_, lb);
+        any_tiles = any_tiles || L.tiles_gu || L.tiles_d;
+        n_tiled += L.tiles_gu + L.tiles_d;
+        n_products += L.mmq ? 2 : 0;
         tiles = tiles || L.mmq;
         mixed_tiles = mixed_tiles || (L.mmq && L.mixed());
         one_expert = std::max(one_expert, L.gu_step + L.d_bytes);
     }
     if (tiles) mmq_ = std::make_unique<Mmq>();
+    if (expert_tiles_)
+        std::fprintf(stderr, "strata-poly: STRATA_POLY_EXPERT_TILES: %d of the layers' %d expert products in tiles of "
+                             "their own widths\n", n_tiled, n_products);
     if (mmq_ && reserve_mmq_) mmq_->reserve_fixup();
 
     shared_scratch();   // the first pass only counts
@@ -3392,6 +3401,14 @@ void Engine::alloc() {
         std::vector<int32_t> ramp(rr);
         std::iota(ramp.begin(), ramp.end(), 0);
         ck(cudaMemcpy(iota_, ramp.data(), rr * sizeof(int32_t), cudaMemcpyHostToDevice), "scratch");
+        if (any_tiles) {   // the cached experts' offsets, a round's gate|up and down ones; both products' tiles
+            const size_t mats = (3 * (size_t) n_expert_ + 1) / 2 * 2, n_tiles = 2 * ((size_t) n_expert_ + rr / 128 + 1);
+            const size_t bytes = mats * sizeof(int64_t) + n_tiles * sizeof(Mmq::Tile);
+            mat_at_ = (int64_t*) dmalloc(bytes, "scratch");
+            h_mat_at_ = (int64_t*) hmalloc(bytes, "pinned memory");
+            d_tiles_ = (Mmq::Tile*) (mat_at_ + mats);
+            tiles_.reserve(n_tiles);
+        }
 
         // One layer's experts pass through it at a time, so it never holds more than a layer has.  A model of
         // small experts has a few hundred MiB a layer, and the rest of the default would be VRAM that the
@@ -4812,7 +4829,8 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     if (n_ahead > 0) round_.push_back(n_cached + n_ahead);
     while (round_.back() < n_group) round_.push_back(std::min(round_.back() + per_round, n_group));
     const int n_round = (int) round_.size() - 1;
-    const int n_tile = (int) staged_tiles_.size() + 1;   // the size classes of a round's experts
+    // the size classes of a round's experts; none where the layer's products take tiles of their own widths
+    const int n_tile = L.tiles_gu || L.tiles_d ? 1 : (int) staged_tiles_.size() + 1;
     const size_t tile_row = (size_t) 2 * n_expert_ + 2;
     const auto tile_of = [&](int rows) {
         int t = 0;
@@ -4909,6 +4927,56 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     }
 
     const int rc = bounds[n_cached];   // the rows of the cached experts
+
+    // expert_tiles_: the tiles of each product - the cached experts', each round's - and where their matrices are.  The
+    // cached experts' slots count from the lowest one; a round's experts from the buffer.  The two products may take
+    // other widths, so each has tiles of its own: for part p (0 the cached experts, 1 + r round r), gate|up's from
+    // tile_at_[2p], down's from tile_at_[2p + 1].
+    const size_t n_mats = (3 * (size_t) n_expert_ + 1) / 2 * 2;
+    const uint8_t* slot0 = nullptr;
+    if (L.tiles_gu || L.tiles_d) {
+        int64_t* at = h_mat_at_;   // the cached experts' slots, a round's gate|up, a round's down
+        for (int g = 0; g < n_cached; ++g)
+            if (!slot0 || L.slot[(size_t) group_[(size_t) g]] < slot0) slot0 = L.slot[(size_t) group_[(size_t) g]];
+        for (int g = 0; g < n_cached; ++g) at[g] = L.slot[(size_t) group_[(size_t) g]] - slot0;
+        for (int j = 0; j < n_expert_; ++j) {
+            at[n_expert_ + j] = (int64_t) j * (int64_t) step;
+            at[2 * n_expert_ + j] = (int64_t) j * (int64_t) L.d_bytes;
+        }
+        tiles_.clear();
+        tile_at_.assign(1, 0);
+        const auto part = [&](int g0, int m) {
+            tile_first_.resize((size_t) m);
+            tile_rows_.resize((size_t) m);
+            tile_mat_.resize((size_t) m);
+            for (int j = 0; j < m; ++j) {
+                tile_first_[(size_t) j] = bounds[g0 + j];
+                tile_rows_[(size_t) j] = rows_of(g0 + j);
+                tile_mat_[(size_t) j] = j;
+            }
+            for (const int t : {(int) L.gu_type, (int) L.d_type}) {
+                Mmq::plan_tiles(t, tile_first_.data(), tile_rows_.data(), tile_mat_.data(), m, tiles_);
+                tile_at_.push_back((int) tiles_.size());
+            }
+        };
+        part(0, n_cached);
+        for (int r = 0; r < n_round; ++r) part(round_[(size_t) r], round_[(size_t) r + 1] - round_[(size_t) r]);
+        std::copy(tiles_.begin(), tiles_.end(), (Mmq::Tile*) (at + n_mats));
+        const size_t words = (n_mats * sizeof(int64_t) + tiles_.size() * sizeof(Mmq::Tile)) / sizeof(int32_t);
+        if (kernel_tables_)
+            copy2(h_mat_at_, mat_at_, (int) words, nullptr, nullptr, 0, st_);
+        else
+            ck(cudaMemcpyAsync(mat_at_, h_mat_at_, words * sizeof(int32_t), cudaMemcpyHostToDevice, cs(st_)),
+               "expert tiles");
+    }
+    // product t (0 gate|up, 1 down) of part p over its tiles: rows of xq from row0, matrices from w at `at`
+    const auto tile_mul = [&](int p, int t, const uint8_t* w, const int64_t* at, const void* xq, int64_t row0,
+                              int64_t xq_rows, const int32_t* ids, float* dst, int64_t ld) {
+        const int a = tile_at_[(size_t) (2 * p + t)], b = tile_at_[(size_t) (2 * p + t + 1)];
+        mmq_->mul_tiles(w, at, (int) (t == 0 ? L.gu_type : L.d_type), t == 0 ? 2 * n_ff_exp_ : n_embd_,
+                        t == 0 ? n_embd_ : n_ff_exp_, xq, row0, xq_rows, d_tiles_ + a, tiles_.data() + a, b - a, ids,
+                        dst, ld, st_);
+    };
     stats_.batch_cached += rc;
     stats_.batch_staged += rg - rc;
 
@@ -4961,19 +5029,27 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             }
             j += m;
         }
-        for (const Run& r : runs_) {
-            mmq_->mul(slot_of(r.j), gt, gu_rows, n_embd_, L.slot_bytes, r.m, mq_, d_cb + (size_t) r.c * cb_row + r.j,
-                      iota_, rg, r.most, gu_, ff2, st_);
-            up_mul(slot_of(r.j), L.slot_bytes, r.m, d_cb + (size_t) r.c * cb_row + r.j, r.most);
+        if (L.tiles_gu) {
+            if (rc > 0) tile_mul(0, 0, slot0, mat_at_, mq_, 0, rg, iota_, gu_, ff2);
+        } else {
+            for (const Run& r : runs_) {
+                mmq_->mul(slot_of(r.j), gt, gu_rows, n_embd_, L.slot_bytes, r.m, mq_,
+                          d_cb + (size_t) r.c * cb_row + r.j, iota_, rg, r.most, gu_, ff2, st_);
+                up_mul(slot_of(r.j), L.slot_bytes, r.m, d_cb + (size_t) r.c * cb_row + r.j, r.most);
+            }
         }
         if (rc > 0) {
             act_rows(gu_, hx_, rc, limit, &es);
             if (guard) guard_half_sums(hx_, ff, n_ff_exp_, rc, hf_, st_);
             Mmq::quantize(hx_, nullptr, mq2_, dt, ff, ff, rc, st_);
         }
-        for (const Run& r : runs_)
-            mmq_->mul(slot_of(r.j) + gu2, dt, n_embd_, ff, L.slot_bytes, r.m, mq2_, d_cb + (size_t) r.c * cb_row + r.j,
-                      d_place, rc, r.most, dx_, n_embd_, st_);
+        if (L.tiles_d) {
+            if (rc > 0) tile_mul(0, 1, slot0 + gu2, mat_at_, mq2_, 0, rc, d_place, dx_, n_embd_);
+        } else {
+            for (const Run& r : runs_)
+                mmq_->mul(slot_of(r.j) + gu2, dt, n_embd_, ff, L.slot_bytes, r.m, mq2_,
+                          d_cb + (size_t) r.c * cb_row + r.j, d_place, rc, r.most, dx_, n_embd_, st_);
+        }
         if (guard && rc > 0) scale_rows(dx_, n_embd_, n_embd_, rc, d_place, hf_, false, st_);
 
         // The round the buffer holds goes first and is not copied.  If it holds none of this call's, the experts
@@ -5013,22 +5089,32 @@ void Engine::moe_rows(Layer& L, int il, int n) {
                 }
             };
             uint8_t* const sb = stage_ + stage_at_;
-            each_class([&](int k, int top) {
-                const int32_t* b = n_tile == 1 ? d_bounds + g0 : d_tb + (size_t) k * tile_row + (size_t) (g0 - n_cached + r);
-                mmq_->mul(sb, gt, gu_rows, n_embd_, step, m, mq_, b, iota_, rg, top, gu_, ff2, st_);
-                up_mul(sb, step, m, b, top);
-            });
+            if (L.tiles_gu) {
+                tile_mul(1 + r, 0, sb, mat_at_ + n_expert_, mq_, 0, rg, iota_, gu_, ff2);
+            } else {
+                each_class([&](int k, int top) {
+                    const int32_t* b = n_tile == 1 ? d_bounds + g0
+                                                   : d_tb + (size_t) k * tile_row + (size_t) (g0 - n_cached + r);
+                    mmq_->mul(sb, gt, gu_rows, n_embd_, step, m, mq_, b, iota_, rg, top, gu_, ff2, st_);
+                    up_mul(sb, step, m, b, top);
+                });
+            }
             ExpertScales er = es;
             if (er.ids) er.ids += r0;
             act_rows(gu_ + (size_t) r0 * ff2, hx_ + (size_t) r0 * ff, rows, limit, &er);
             if (guard) guard_half_sums(hx_ + (size_t) r0 * ff, ff, n_ff_exp_, rows, hf_ + r0, st_);
             Mmq::quantize(hx_ + (size_t) r0 * ff, nullptr, mq2_, dt, ff, ff, rows, st_);
-            each_class([&](int k, int top) {
-                const int32_t* b = (n_tile == 1 ? d_rel + (g0 - n_cached + r)
-                                                : d_tb + (size_t) (n_tile + k) * tile_row + (size_t) (g0 - n_cached + r));
-                mmq_->mul(sb + down_at, dt, n_embd_, ff, L.d_bytes, m, mq2_, b, d_place + r0, rows, top, dx_, n_embd_,
-                          st_);
-            });
+            if (L.tiles_d) {
+                tile_mul(1 + r, 1, sb + down_at, mat_at_ + 2 * n_expert_, mq2_, r0, rows, d_place + r0, dx_, n_embd_);
+            } else {
+                each_class([&](int k, int top) {
+                    const int32_t* b = (n_tile == 1 ? d_rel + (g0 - n_cached + r)
+                                                    : d_tb + (size_t) (n_tile + k) * tile_row +
+                                                          (size_t) (g0 - n_cached + r));
+                    mmq_->mul(sb + down_at, dt, n_embd_, ff, L.d_bytes, m, mq2_, b, d_place + r0, rows, top, dx_,
+                              n_embd_, st_);
+                });
+            }
             if (guard) scale_rows(dx_, n_embd_, n_embd_, rows, d_place + r0, hf_ + r0, false, st_);
         }
         ck(cudaEventRecord((cudaEvent_t) ev_free_, cs(st_)), "expert staging");
