@@ -469,6 +469,10 @@ protected:
     /// moe_card() of n tokens leaves the experts' sum to the layer's tail: d_ holds each picked expert's output and
     /// d_wts_ its weight, and run() sets card_parts_ for the tail that follows.
     virtual bool card_sum_in_tail(int n) const { (void) n; return false; }
+    /// A window's tokens are routed on the card together, as a block of the model's own guesses is, when every expert
+    /// is in VRAM: card_rows() holds a whole window's rows.  false (the default): a window of more than kSumRows rows
+    /// is routed on the host.
+    virtual bool windows_on_card() const { return false; }
     /// The routed experts' activation of `rows` rows of gate_up straight into q8, the Q8_1 blocks of the down
     /// products' input: what act_rows() into h_ and native_quantize_q8_1() of the rows give, in fewer launches.
     /// true: done (h_ is not written); false (the default): those two run.
@@ -621,7 +625,8 @@ protected:
     /// a time (moe()).
     bool batched(const Layer& L, int n) const;
     /// The routed experts' rows a call routed on the card has room for (d_): a window of a model that guesses its
-    /// own block, or kSumRows.  The others keep kSumRows, whose windows past it are routed on the host as before.
+    /// own block or routes its windows on the card (windows_on_card()), or kSumRows.  The others keep kSumRows, whose
+    /// windows past it are routed on the host as before.
     int card_rows() const;
     void moe_add(int n);
     template <class F>
