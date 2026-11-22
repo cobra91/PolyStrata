@@ -282,9 +282,10 @@ void Mmq::plan_tiles(int type, const int32_t* first, const int32_t* rows, const 
         }
     }
     std::stable_sort(other.begin(), other.end(), [&](const Tile& a, const Tile& b) {
-        const auto anc = [&](const Tile& t) {
-            return anchor_of[std::find(mmq_tiles::kWidths, mmq_tiles::kWidths + mmq_tiles::kNWidths, t.width) -
-                             mmq_tiles::kWidths];
+        const auto anc = [&](const Tile& t) {   // t.width is one of kWidths: the loop above took it from there
+            const int* w = std::find(mmq_tiles::kWidths, mmq_tiles::kWidths + mmq_tiles::kNWidths, t.width);
+            if (w == mmq_tiles::kWidths + mmq_tiles::kNWidths) throw std::logic_error("mmq: a tile of no width");
+            return anchor_of[w - mmq_tiles::kWidths];
         };
         return anc(a) > anc(b);
     });

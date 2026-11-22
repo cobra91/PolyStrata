@@ -2302,8 +2302,9 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   target_include_directories(poly_fattn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/poly
                                                     ${_strata_gpu_include_directories})
   target_link_libraries(poly_fattn_test PRIVATE strata_poly_mmq ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
-  # STRATA_POLY_STAGED_TILES: the staged experts in size classes, each a launch of its own tile width, against one
-  # launch, bit for bit; needs a card
+  # STRATA_POLY_STAGED_TILES' size classes of the staged experts and Mmq::mul_tiles()'s tables of tiles
+  # (STRATA_POLY_EXPERT_TILES), each against one launch, bit for bit (within rounding where MMQ uses stream-k); needs a
+  # card
   add_executable(poly_mmq_tiles_test src/poly/mmq_tiles_test.cu)
   target_include_directories(poly_mmq_tiles_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/poly
                                                         ${_strata_gpu_include_directories})
