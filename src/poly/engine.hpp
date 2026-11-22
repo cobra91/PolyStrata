@@ -588,6 +588,10 @@ protected:
     void load_moe(int il, bool shared = true, int from = -1, bool any_type_scales = false);
     void alloc();
     void shared_scratch();
+    /// The buffers that hold a call's rows (rows_ of them): the scratch and the rest, as rows_mode_ asks.
+    void rows_buffers();
+    bool widen_rows();
+    void narrow_rows();
     float* draft_input(const int32_t* tokens, int64_t row, const float* h, int n);
     void draft_rows(const int32_t* tokens, int first, int n);
     void guess_block(int32_t token);
@@ -835,6 +839,23 @@ protected:
     /// one over a staging round's, each expert's rows cut into tiles of their own width (moe_rows()).  No tile's sum
     /// is split, where llama.cpp's stream-k splits some, so other bits: opt-in (Inkling 2's STRATA_POLY_EXPERT_TILES)
     bool expert_tiles_ = false;
+    /// A read's calls of this many rows, with buffers the expert cache lends while the read is on (widen_rows());
+    /// 0: never.  Larger calls split some sums another way, so other bits: opt-in (Inkling 2's
+    /// STRATA_POLY_WIDE_READ).  Not with windows, a drafter, batch slots or several cards.
+    int wide_rows_ = 0;
+    /// rows_buffers(): kOff allocates them as anything else; with wide reads on, kCarve places the device ones in
+    /// wide_map_ from its start (the pinned ones are allocated once for each width, host_set_, and given back after),
+    /// and kCount counts their bytes.
+    enum class RowsMode { kOff, kCarve, kCount };
+    RowsMode rows_mode_ = RowsMode::kOff;
+    std::vector<void*> narrow_host_, wide_host_;
+    std::vector<void*>* host_set_ = nullptr;
+    size_t rows_dev_at_ = 0, rows_host_at_ = 0;   ///< wide_map_'s bytes so far, and the next of host_set_
+    Mapped wide_map_;
+    size_t wide_bytes_ = 0, narrow_bytes_ = 0;    ///< the wide and the narrow buffers' VRAM
+    int32_t* h_iota_ = nullptr;                   ///< 0, 1, 2, ... for iota_ of either width
+    int narrow_rows_ = 0;      ///< rows_ outside a wide read
+    bool any_tiles_ = false, mixed_tiles_ = false;
 
     std::vector<Layer> layers_;   ///< the model's, and after them the draft block
     Dev out_norm_, output_;

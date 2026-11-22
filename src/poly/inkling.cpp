@@ -199,6 +199,9 @@ void Inkling::load_geometry() {
     // STRATA_POLY_EXPERT_TILES=1: a prompt batch's experts in tiles of their own widths (Engine::expert_tiles_).
     // Opt-in: no tile's sum is split over K where llama.cpp's stream-k splits some, so the sums differ in rounding.
     if (const char* e = std::getenv("STRATA_POLY_EXPERT_TILES"); e && std::atoi(e) != 0) expert_tiles_ = true;
+    // STRATA_POLY_WIDE_READ=N: a read of several calls takes N tokens a call (Engine::wide_rows_).  Opt-in: larger
+    // calls split some sums another way, so other bits.
+    if (const char* e = std::getenv("STRATA_POLY_WIDE_READ")) wide_rows_ = std::max(std::atoi(e), 0);
 #if !defined(STRATA_USE_HIP)
     lane_slots_ = true;       // the cached experts' launches through MmvqSlots::lanes' kernels (measured on CUDA)
 #endif
@@ -361,7 +364,7 @@ size_t Inkling::recurrent_floats() const { return (size_t) n_layer_ * conv_float
 // Each visit's convolution state in state_; a window visit's caches are a ring of the rows a call can read, a full
 // one's a row a position.
 void Inkling::alloc_caches() {
-    ring_ = std::min(opt_.max_context, window_ + rows_);
+    ring_ = std::min(opt_.max_context, window_ + std::max(rows_, wide_rows_));
     keep_ = std::min(window_, ring_);
     size_t one = 0;   // a position's bytes in a visit's planes together
     for (int i = 0; i < planes(); ++i) one += plane_row(i);

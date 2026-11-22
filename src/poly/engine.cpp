@@ -705,6 +705,7 @@ Engine::~Engine() {
     vmm_free(arena_);
     vmm_free(stage_map_);
     vmm_free(rows_map_);
+    vmm_free(wide_map_);
     for (unsigned long long h : vpool_) cuMemRelease(h);   // the pool goes back to the card with the engine
     vpool_.clear();
     for (void* p : host_allocs_) cudaFreeHost(p);
@@ -726,6 +727,13 @@ Engine::~Engine() {
 }
 
 void* Engine::dmalloc(size_t bytes, const char* what) {
+    if (rows_mode_ != RowsMode::kOff) {   // in wide_map_, 256-byte aligned as cudaMalloc()'s
+        void* at = (void*) (wide_map_.base + rows_dev_at_);
+        rows_dev_at_ += up_to(std::max<size_t>(bytes, 256), 256);
+        if (rows_mode_ == RowsMode::kCarve && rows_dev_at_ > wide_map_.mapped)
+            throw std::runtime_error("no VRAM for " + std::string(what) + " of a wide read");
+        return at;
+    }
     void* p = nullptr;
     const cudaError_t e = cudaMalloc(&p, std::max<size_t>(bytes, 256));
     if (e != cudaSuccess) {
@@ -738,6 +746,8 @@ void* Engine::dmalloc(size_t bytes, const char* what) {
 }
 
 void* Engine::hmalloc(size_t bytes, const char* what) {
+    if (rows_mode_ == RowsMode::kCount) return nullptr;
+    if (rows_mode_ == RowsMode::kCarve && rows_host_at_ < host_set_->size()) return (*host_set_)[rows_host_at_++];
     void* p = nullptr;
     const std::string why = std::string(what) + " (" + std::to_string(bytes) + " bytes)";
     // A container at its memory limit refused pinned memory with "invalid argument" five times in five minutes
@@ -752,6 +762,10 @@ void* Engine::hmalloc(size_t bytes, const char* what) {
     }
     ck(e, why.c_str());
     host_allocs_.push_back(p);
+    if (rows_mode_ == RowsMode::kCarve) {
+        host_set_->push_back(p);
+        ++rows_host_at_;
+    }
     return p;
 }
 
@@ -2435,6 +2449,59 @@ float* Engine::widen_stage(int calls, size_t call_bytes) {
     return rows_bytes > 0 && rows_map_.mapped >= rows_bytes ? (float*) rows_map_.base : nullptr;
 }
 
+// A read of wide_rows_ tokens a call: the buffers rows_buffers() sizes by a call's rows, for wide_rows_ rows, in
+// VRAM the expert cache lends as it does the staging buffer (narrow_stage() gives it back) and pinned memory kept
+// for the next wide read.  The narrow buffers stay as they are, for narrow_rows() to give back: what a call of
+// one token recorded (run()) keeps pointing at them.  False, and the narrow ones, where the card does not lend it.
+bool Engine::widen_rows() {
+    const size_t g = pool_on_ ? pg_ : grain_;
+    if (wide_map_.mapped < wide_bytes_) {
+        if (up_) ck(cudaStreamSynchronize(cs(up_)), "a wide read");
+        ck(cudaStreamSynchronize(cs(st_)), "a wide read");
+        const size_t want = up_to(wide_bytes_, g) - wide_map_.mapped;
+        size_t free_b = 0, total_b = 0;
+        ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+        if (pool_on_) free_b = vpool_bytes();
+        const size_t quarter = pool_on_ ? 0 : (size_t(std::max(reserve_mib_, 0)) << 20) / 4;
+        if (!stage_lent_) stage_cut_ = 0;
+        if (exp_ && free_b < want + quarter) {
+            const size_t had = arena_.mapped;
+            shrink_cache(want + quarter - free_b);
+            held_is_budget();
+            stage_cut_ += had - arena_.mapped;
+        }
+        stage_lent_ = true;   // narrow_stage() gives back what was cut, and the map
+        try {
+            vmm_map(wide_map_, wide_bytes_, SIZE_MAX, "a wide read's buffers");
+        } catch (const std::runtime_error&) {
+            vmm_unmap(wide_map_, narrow_bytes_);
+            return false;
+        }
+    }
+    rows_ = wide_rows_;
+    rows_mode_ = RowsMode::kCarve;
+    rows_dev_at_ = rows_host_at_ = 0;
+    host_set_ = &wide_host_;
+    try {
+        rows_buffers();
+    } catch (...) {
+        narrow_rows();
+        throw;
+    }
+    rows_mode_ = RowsMode::kOff;
+    return true;
+}
+
+// The narrow buffers again, as alloc() made them.
+void Engine::narrow_rows() {
+    rows_ = narrow_rows_;
+    rows_mode_ = RowsMode::kCarve;
+    rows_dev_at_ = rows_host_at_ = 0;
+    host_set_ = &narrow_host_;
+    rows_buffers();
+    rows_mode_ = RowsMode::kOff;
+}
+
 // The staging buffer of a read of more calls than r_ holds: where the engine prestages, room for what two turns in
 // a row leave out of the cache - the experts it lacks now, and their share of what it gives up for the read, its
 // least used of any layer - between one layer's experts and two layers'.
@@ -2465,6 +2532,7 @@ void Engine::narrow_stage() {
     ck(cudaStreamSynchronize(cs(st_)), "the expert staging buffer");
     vmm_unmap(stage_map_, stage_narrow_ + 256 + kTail);
     vmm_unmap(rows_map_, 0);
+    vmm_unmap(wide_map_, narrow_bytes_);
     stage_bytes_ = stage_narrow_;
     staged_il_ = -1;
     stage_lent_ = false;
@@ -3388,12 +3456,81 @@ void Engine::shared_scratch() {
     }
 }
 
+// The buffers sized by the rows of a call, in the order alloc() first asked for them.
+void Engine::rows_buffers() {
+    const size_t n = (size_t) rows_;
+    scratch_ = nullptr;
+    scratch_at_ = 0;
+    shared_scratch();   // the first pass only counts
+    assign_scratch();
+    scratch_ = (float*) dmalloc(scratch_at_ * sizeof(float), "scratch");
+    scratch_at_ = 0;
+    shared_scratch();
+    assign_scratch();
+
+    const int q_max = std::max({n_embd_, n_ff_, n_ff_exp_, n_ff_shexp_, widest(), 256});
+    xq_ = dmalloc(n * kernels::native_q8_1_bytes(n_embd_), "scratch");
+    q8_ = dmalloc(n * kernels::native_q8_1_bytes((q_max + 255) / 256 * 256), "scratch");
+    h_r_ = (float*) hmalloc(n * streams() * n_embd_ * sizeof(float), "pinned memory");
+    h_rl_ = (float*) hmalloc(n * n_expert_ * sizeof(float), "pinned memory");
+    h_x_ = (float*) hmalloc(n * n_embd_ * sizeof(float), "pinned memory");
+    h_cpu_ = (float*) hmalloc(n * n_embd_ * sizeof(float), "pinned memory");
+    if (!mmq_) return;
+    const size_t rr = n * n_used_,
+                 tab = (3 * rr + 3 * (size_t) n_expert_ + 3 + kClasses * ((size_t) n_expert_ + 1) +
+                        2 * kMaxStagedTiles * (2 * (size_t) n_expert_ + 2)) * sizeof(int32_t);
+    mq_ = dmalloc(Mmq::q8_bytes((int64_t) rr, n_embd_), "scratch");
+    mq2_ = dmalloc(Mmq::q8_bytes((int64_t) rr, n_ff_exp_), "scratch");
+    if (mixed_tiles_) mqu_ = dmalloc(Mmq::q8_bytes((int64_t) rr, n_embd_), "scratch");
+    mqx_ = dmalloc(Mmq::q8_bytes(rows_, q_max), "scratch");
+    d_ids_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
+    d_wts_ = (float*) dmalloc(rr * sizeof(float), "scratch");
+    h_ids_ = (int32_t*) hmalloc(rr * sizeof(int32_t), "pinned memory");
+    tab_ = (int32_t*) dmalloc(tab, "scratch");
+    h_tab_ = (int32_t*) hmalloc(tab, "pinned memory");
+    iota_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
+    d_ex_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
+    h_ex_ = (int32_t*) hmalloc(rr * sizeof(int32_t), "pinned memory");
+    if (rows_mode_ == RowsMode::kOff) {
+        std::vector<int32_t> ramp(rr);
+        std::iota(ramp.begin(), ramp.end(), 0);
+        ck(cudaMemcpy(iota_, ramp.data(), rr * sizeof(int32_t), cudaMemcpyHostToDevice), "scratch");
+    } else if (rows_mode_ == RowsMode::kCarve) {   // the other set's calls wrote here: behind them
+        ck(cudaMemcpyAsync(iota_, h_iota_, rr * sizeof(int32_t), cudaMemcpyHostToDevice, cs(st_)), "scratch");
+    }
+    if (any_tiles_) {   // the cached experts' offsets, a round's gate|up and down ones; both products' tiles
+        const size_t mats = (3 * (size_t) n_expert_ + 1) / 2 * 2, n_tiles = 2 * ((size_t) n_expert_ + rr / 128 + 1);
+        const size_t bytes = mats * sizeof(int64_t) + n_tiles * sizeof(Mmq::Tile);
+        mat_at_ = (int64_t*) dmalloc(bytes, "scratch");
+        h_mat_at_ = (int64_t*) hmalloc(bytes, "pinned memory");
+        d_tiles_ = (Mmq::Tile*) (mat_at_ + mats);
+        tiles_.reserve(n_tiles);
+    }
+    if (ids_.size() < rr) ids_.resize(rr);
+}
+
 // The sequence's state, the caches and every buffer, once the weights are known.
 void Engine::alloc() {
     // --dump-layers prints one token's stages
     rows_ = opt_.dump ? 1 : std::min(opt_.prompt_batch, opt_.max_context);
     const size_t most = std::min<size_t>(kReadBytes / ((size_t) streams() * n_embd_ * sizeof(float)), opt_.max_context);
     read_rows_ = rows_ < kStageRows ? rows_ : std::max(rows_, (int) most / rows_ * rows_);
+    if (wide_rows_ > 0) {   // a wide read (widen_rows()) lends its buffers on one card, and nothing records them
+#ifdef STRATA_VMM_RELEASE_WITH_ADDRESSES
+        const bool lends = false;
+#else
+        const bool lends = vmm_ && !split_;
+#endif
+        const int most_rows = std::min({read_rows_, 4096, opt_.max_context});
+        const bool can = lends && rows_ >= kStageRows && wide_rows_ > rows_ && opt_.window == 1 && opt_.batch == 0 &&
+                         !draft_ && !block_guess_ && !block_drafter_;
+        std::fprintf(stderr, can ? "strata-poly: wide reads: %d tokens a call where the expert cache lends the VRAM\n"
+                                 : "strata-poly: wide reads (%d tokens a call) need one card with VMM, a prompt "
+                                   "batch of at least 32 below it, and no windows, drafter or batch slots: off\n",
+                     std::min(wide_rows_, most_rows));
+        wide_rows_ = can ? std::min(wide_rows_, most_rows) : 0;
+        if (wide_rows_ <= rows_) wide_rows_ = 0;
+    }
     rec_n_ = recurrent_floats();
     state_n_ = rec_n_ + (draft_ ? (size_t) n_embd_ : 0);
     const size_t state_floats = state_n_ + (draft_ ? (size_t) rows_ * n_embd_ : 0);
@@ -3441,7 +3578,6 @@ void Engine::alloc() {
 
     // A prompt batch runs a layer's routed experts through MMQ when the card has a tile for each of their types
     // (batched()).  The model's layers: the draft block's experts never run a batch at a time.
-    const size_t n = (size_t) rows_;
     bool tiles = false, mixed_tiles = false, any_tiles = false;
     int n_tiled = 0, n_products = 0;
     size_t one_expert = 0;
@@ -3470,54 +3606,41 @@ void Engine::alloc() {
                              "their own widths\n", n_tiled, n_products);
     if (mmq_ && reserve_mmq_) mmq_->reserve_fixup();
 
-    shared_scratch();   // the first pass only counts
-    assign_scratch();
-    scratch_ = (float*) dmalloc(scratch_at_ * sizeof(float), "scratch");
-    scratch_at_ = 0;
-    shared_scratch();
-    assign_scratch();
+    any_tiles_ = any_tiles;
+    mixed_tiles_ = mixed_tiles;
+    narrow_rows_ = rows_;
+    if (wide_rows_ > 0) {
+        // The buffers in wide_map_: the narrow ones from its start, and a wide read's over them and past them in
+        // VRAM the expert cache lends (widen_rows()).  A read writes them all over, whatever it leaves there.
+        const auto count = [&](int rows) {
+            rows_ = rows;
+            rows_mode_ = RowsMode::kCount;
+            rows_dev_at_ = rows_host_at_ = 0;
+            rows_buffers();
+            return rows_dev_at_;
+        };
+        wide_bytes_ = count(wide_rows_);
+        narrow_bytes_ = count(narrow_rows_);
+        rows_mode_ = RowsMode::kOff;
+        vmm_reserve(wide_map_, wide_bytes_);
+        vmm_map(wide_map_, narrow_bytes_, SIZE_MAX, "scratch");
+        if (mmq_) {
+            const size_t rr = (size_t) wide_rows_ * n_used_;
+            h_iota_ = (int32_t*) hmalloc(rr * sizeof(int32_t), "pinned memory");
+            std::iota(h_iota_, h_iota_ + rr, 0);
+        }
+        narrow_rows();
+    } else {
+        rows_buffers();
+    }
 
-    const int q_max = std::max({n_embd_, n_ff_, n_ff_exp_, n_ff_shexp_, widest(), 256});
-    xq_ = dmalloc(n * kernels::native_q8_1_bytes(n_embd_), "scratch");
-    q8_ = dmalloc(n * kernels::native_q8_1_bytes((q_max + 255) / 256 * 256), "scratch");
-
-    h_r_ = (float*) hmalloc(n * streams() * n_embd_ * sizeof(float), "pinned memory");
     const size_t at_rows = (size_t) std::max(opt_.window, opt_.batch + 1);   // window()'s tokens, step()'s
     at_ = (long long*) dmalloc(at_rows * 2 * sizeof(long long), "scratch");
     h_at_ = (long long*) hmalloc(at_rows * 2 * sizeof(long long), "pinned memory");
-    h_rl_ = (float*) hmalloc(n * n_expert_ * sizeof(float), "pinned memory");
-    h_x_ = (float*) hmalloc(n * n_embd_ * sizeof(float), "pinned memory");
-    h_cpu_ = (float*) hmalloc(n * n_embd_ * sizeof(float), "pinned memory");
     h_logits_ = (float*) hmalloc((size_t) n_vocab_ * sizeof(float), "pinned memory");
 
     if (mmq_) {
-        const size_t rr = n * n_used_,
-                     tab = (3 * rr + 3 * (size_t) n_expert_ + 3 + kClasses * ((size_t) n_expert_ + 1) +
-                            2 * kMaxStagedTiles * (2 * (size_t) n_expert_ + 2)) * sizeof(int32_t);
-        mq_ = dmalloc(Mmq::q8_bytes((int64_t) rr, n_embd_), "scratch");
-        mq2_ = dmalloc(Mmq::q8_bytes((int64_t) rr, n_ff_exp_), "scratch");
-        if (mixed_tiles) mqu_ = dmalloc(Mmq::q8_bytes((int64_t) rr, n_embd_), "scratch");
-        mqx_ = dmalloc(Mmq::q8_bytes(rows_, q_max), "scratch");
-        d_ids_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
-        d_wts_ = (float*) dmalloc(rr * sizeof(float), "scratch");
-        h_ids_ = (int32_t*) hmalloc(rr * sizeof(int32_t), "pinned memory");
         d_slots_ = (void**) dmalloc((size_t) n_layer_ * n_expert_ * sizeof(void*), "scratch");
-        tab_ = (int32_t*) dmalloc(tab, "scratch");
-        h_tab_ = (int32_t*) hmalloc(tab, "pinned memory");
-        iota_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
-        d_ex_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
-        h_ex_ = (int32_t*) hmalloc(rr * sizeof(int32_t), "pinned memory");
-        std::vector<int32_t> ramp(rr);
-        std::iota(ramp.begin(), ramp.end(), 0);
-        ck(cudaMemcpy(iota_, ramp.data(), rr * sizeof(int32_t), cudaMemcpyHostToDevice), "scratch");
-        if (any_tiles) {   // the cached experts' offsets, a round's gate|up and down ones; both products' tiles
-            const size_t mats = (3 * (size_t) n_expert_ + 1) / 2 * 2, n_tiles = 2 * ((size_t) n_expert_ + rr / 128 + 1);
-            const size_t bytes = mats * sizeof(int64_t) + n_tiles * sizeof(Mmq::Tile);
-            mat_at_ = (int64_t*) dmalloc(bytes, "scratch");
-            h_mat_at_ = (int64_t*) hmalloc(bytes, "pinned memory");
-            d_tiles_ = (Mmq::Tile*) (mat_at_ + mats);
-            tiles_.reserve(n_tiles);
-        }
 
         // One layer's experts pass through it at a time, so it never holds more than a layer has.  A model of
         // small experts has a few hundred MiB a layer, and the rest of the default would be VRAM that the
@@ -3568,7 +3691,6 @@ void Engine::alloc() {
         cudaStream_t up = nullptr;
         ck(cudaStreamCreateWithFlags(&up, cudaStreamNonBlocking), "cudaStreamCreate");
         up_ = up;
-        ids_.resize(rr);
         first_.resize((size_t) n_expert_);
 
         for (void** e : {&ev_in_[0], &ev_in_[1], &ev_out_[0], &ev_out_[1]}) {   // read()
@@ -5975,6 +6097,18 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
     for (int k = 0; k < n_marks; ++k)
         if (marks[k].at <= (k ? marks[k - 1].at : 0) || marks[k].at >= n)
             throw std::logic_error("read: the marks rise, above 0 and below the tokens read");
+
+    // A read through the layers one at a time may take wider calls in buffers the expert cache lends it
+    // (widen_rows()); they are the narrow ones again when it returns.
+    OnCard on(device_, split_);
+    const bool wide = wide_rows_ > rows_ && n > 2 * rows_ && mmq_ && !all_cached() && n >= opt_.stage_ahead &&
+                      widen_rows();
+    struct Narrow {
+        Engine* e;
+        ~Narrow() {
+            if (e) e->narrow_rows();
+        }
+    } narrow{wide ? this : nullptr};
 
     // the calls: up to max_rows() tokens each, and none across a mark
     calls_.clear();
