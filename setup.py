@@ -906,10 +906,8 @@ FAMILIES = {
                 "tag": "inkling2-", "name": "inkling-2-mini", "engine": "poly", "vision": True,
                 "vision_llama": INKLING_VISION_LLAMA_CPP_COMMIT, "mmproj_hf": hf("ggml-org/Inkling-2-Mini-GGUF"),
                 "mmproj": "mmproj-Inkling-2-Mini-Q8_0.gguf", "vision_gb": 0.35, "vision_vram_gb": 0.6,
-                "experimental": True, "windows": False, "cuda_only": True, "ran_on_gb": 8, "row_bytes": 32768,
-                "cuda_only_why": "its prompt speed on AMD cards is not tuned yet",
+                "experimental": True, "windows": True, "cuda_only": False, "ran_on_gb": 8, "row_bytes": 32768,
                 "laptop_tps": {32768: "28"},
-                "windows_risk": "Inkling 2 Mini has not been built or run on Windows",
                 "sampling": {"temperature": 1.0, "top_k": 50, "top_p": 1.0},
                 "dspark": {"hf": hf("unsloth/Inkling-2-Mini-GGUF"), "file": "dspark-Inkling-2-Mini-Q8_0.gguf",
                            "gb": 0.4, "vram_gb": 0.4, "row_bytes": 4096},
@@ -3990,7 +3988,7 @@ def build_engine_hip_win(gpu, llama, portable=False) -> Path:
                  f"-DCMAKE_CXX_COMPILER={rocm}/lib/llvm/bin/clang++.exe",
                  f"-DCMAKE_HIP_COMPILER={rocm}/lib/llvm/bin/clang++.exe",
                  f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={rocm}", f"-DCMAKE_PREFIX_PATH={rocm}",
-                 f"-DCMAKE_HIP_FLAGS=--rocm-path={rocm} --rocm-device-lib-path={bitcode}",
+                 f"-DCMAKE_HIP_FLAGS=--rocm-path={rocm} --rocm-device-lib-path={bitcode} -D_ENABLE_EXTENDED_ALIGNED_STORAGE",
                  f"-DSTRATA_GGML_DIR={llama}"], vcvars, "build-strata-hip-win.bat")
     if stale_binary(bdir / EXE):                       # #2054: no stamp for a binary of another source
         fail(f"the engine build finished without a new engine ({EXE} is version "
@@ -6940,7 +6938,7 @@ def build_engine_poly_hip_win(gpu, llama, portable=False) -> Path:
                  f"-DCMAKE_CXX_COMPILER={rocm}/lib/llvm/bin/clang++.exe",
                  f"-DCMAKE_HIP_COMPILER={rocm}/lib/llvm/bin/clang++.exe",
                  f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={rocm}", f"-DCMAKE_PREFIX_PATH={rocm}",
-                 f"-DCMAKE_HIP_FLAGS=--rocm-path={rocm} --rocm-device-lib-path={bitcode}",
+                 f"-DCMAKE_HIP_FLAGS=--rocm-path={rocm} --rocm-device-lib-path={bitcode} -D_ENABLE_EXTENDED_ALIGNED_STORAGE",
                  f"-DSTRATA_GGML_DIR={llama}"], vcvars, "build-strata-poly-hip.bat")
     shutil.copy2(bdir / POLY_EXE, eng / POLY_EXE)
     # the DLLs, the GEMM kernels and the .kpack files rocBLAS finds beside its DLL come from the ready-made main
@@ -8089,7 +8087,7 @@ def main() -> int:
                          "Qwen3.6-35B-A3B on strata-poly, clover = Clover-35B-A3B-Preview, ornith = "
                          "Ornith 1.5, gemma4 = Gemma 4 26B-A4B, tiel = Tiel Coder 35B-A3B, minicpmv = MiniCPM-V 4.7 "
                          "35B-A3B, ornith122 = Ornith 1.5 122B (docs/BACKENDS.md), inkling = Inkling 2 Mini "
-                         "(experimental, NVIDIA only, docs/models/inkling.md), qwen36-strata = Qwen3.6-35B-A3B on the Strata project's "
+                         "(experimental, docs/models/inkling.md), qwen36-strata = Qwen3.6-35B-A3B on the Strata project's "
                          "own engine (UD-Q4_K_XL and up, 32 GB of RAM or more; pictures with --vision, several "
                          "requests at once with --parallel; docs/QWEN36.md)")
     ap.add_argument("--model", choices=list(dict.fromkeys(
