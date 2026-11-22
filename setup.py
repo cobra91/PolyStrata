@@ -906,13 +906,17 @@ FAMILIES = {
                 "tag": "inkling2-", "name": "inkling-2-mini", "engine": "poly", "vision": True,
                 "vision_llama": INKLING_VISION_LLAMA_CPP_COMMIT, "mmproj_hf": hf("ggml-org/Inkling-2-Mini-GGUF"),
                 "mmproj": "mmproj-Inkling-2-Mini-Q8_0.gguf", "vision_gb": 0.35, "vision_vram_gb": 0.6,
-                "experimental": True, "windows": True, "cuda_only": False, "ran_on_gb": 8, "row_bytes": 32768,
+                "experimental": True, "windows": True, "cuda_only": True, "ran_on_gb": 8, "row_bytes": 32768,
                 "laptop_tps": {32768: "28"},
                 "sampling": {"temperature": 1.0, "top_k": 50, "top_p": 1.0},
                 "dspark": {"hf": hf("unsloth/Inkling-2-Mini-GGUF"), "file": "dspark-Inkling-2-Mini-Q8_0.gguf",
                            "gb": 0.4, "vram_gb": 0.4, "row_bytes": 4096},
                 "models": {"IQ4_NL": {"about": "4-bit experts in layers 0-19 (imatrix), 8-bit everywhere else",
                                       "download_gb": 17.6, "ram_gb": 22, "arena_gb": 15.8, "vram_beside_gb": 4.0},
+                           "UD-IQ3_XXS": {"about": "Unsloth's 3-bit experts (UD-IQ3_XXS): ideal for 16 GB GPUs, 100% in VRAM",
+                                          "download_gb": 11.7, "ram_gb": 16, "arena_gb": 10.6, "vram_beside_gb": 4.0,
+                                          "hf": hf("unsloth/Inkling-2-Mini-GGUF"),
+                                          "mmproj_hf": hf("ggml-org/Inkling-2-Mini-GGUF")},
                            "UD-Q2_K_XL": {"about": "Unsloth's 2-bit experts, higher where it matters: the fastest and "
                                                    "the least RAM (9 GB measured), a little less accurate",
                                           "download_gb": 9.1, "ram_gb": 14, "arena_gb": 8.4, "vram_beside_gb": 4.0,
@@ -922,6 +926,8 @@ FAMILIES = {
                                     "download_gb": 27.8, "ram_gb": 32, "arena_gb": 26.0, "vram_beside_gb": 4.0}},
                 "sha256": {"Inkling-2-Mini-IQ4_NL.gguf":
                            (17627940768, "cbdf3fa9dc50a4124977980f37da4f1fa764b0cfe800d275cd43d26ce2a81af4"),
+                           "Inkling-2-Mini-UD-IQ3_XXS.gguf":
+                           (11663309504, "bd7ef0865adf119b5183e45e741c629bafa649769b33b5ebf689bb4bcc4690d6"),
                            "Inkling-2-Mini-UD-Q2_K_XL.gguf":
                            (9138715328, "20292e8142b69535ca88a5d04439d0fdeb4dc698d44c002dca706dcf92901441"),
                            "Inkling-2-Mini-Q8_0.gguf":

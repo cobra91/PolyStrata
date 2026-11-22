@@ -22,7 +22,7 @@ from tools import test_setup_glm as glm_tests  # noqa: E402
 
 FAM = setup.FAMILIES["inkling"]
 # setup's order: the size taken with the RAM for it, then Unsloth's 2-bit file (the least RAM), then 8-bit
-SIZES = [("IQ4_NL", 17627940768), ("UD-Q2_K_XL", 9138715328), ("Q8_0", 27820099264)]
+SIZES = [("IQ4_NL", 17627940768), ("UD-IQ3_XXS", 11663309504), ("UD-Q2_K_XL", 9138715328), ("Q8_0", 27820099264)]
 MMPROJ = "mmproj-Inkling-2-Mini-Q8_0.gguf"
 DSPARK = "dspark-Inkling-2-Mini-Q8_0.gguf"
 
@@ -48,7 +48,7 @@ class Pins(unittest.TestCase):
             self.assertAlmostEqual(n / 1e9, d["download_gb"], delta=0.05)
             self.assertLess(d["arena_gb"], d["download_gb"])
             self.assertEqual(d["ram_gb"], round(setup.poly_ram_need(d, 8.0)), size)
-            if size == "UD-Q2_K_XL":   # Unsloth's repository, in the architecture's native form (inkling2)
+            if size in ("UD-Q2_K_XL", "UD-IQ3_XXS"):   # Unsloth's repository, in the architecture's native form (inkling2)
                 self.assertEqual(d["hf"], "https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/"
                                           "ae9327c5fbc7333116ba32eee78bb5d2bbefae4f/")
                 self.assertEqual(d["mmproj_hf"], FAM["mmproj_hf"])   # ggml-org's image encoder for it too
@@ -63,7 +63,7 @@ class Pins(unittest.TestCase):
         self.assertIn(f"~{n:.0f} GB of RAM beside an 8 GB card (16.5 GiB measured for the engine)", FAM["about"])
         self.assertIs(FAM["experimental"], True)
         self.assertNotIn("unmeasured", FAM)          # measured on an RTX 2070 Super 8 GB (the comment above FAMILIES)
-        self.assertIs(FAM["windows"], False)
+        self.assertIs(FAM["windows"], True)
         self.assertIs(FAM["vision"], True)
         self.assertIn("images optional", FAM["about"])
         self.assertEqual(FAM["ran_on_gb"], 8)          # run on an RTX 2070 Super 8 GB
@@ -175,8 +175,7 @@ class Main(unittest.TestCase):
 
     def test_windows_is_asked(self):
         code, out, _ = self.main(win=True, family="inkling", ram=64.0, vram=31.84)
-        self.assertEqual(code, 0, out)                # --yes takes the risk
-        self.assertIn("Inkling 2 Mini has not been built or run on Windows", out)
+        self.assertEqual(code, 0, out)
         self.assertNotIn("has been run on Linux only", out)
 
     def test_cards(self):
