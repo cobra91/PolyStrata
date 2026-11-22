@@ -170,7 +170,7 @@ answer repeats the conversation: after an earlier repeat of the last three token
 takes what followed as up to three guesses, and puts the known token and the guesses through the model together. A
 guess counts when the model would have written that token itself, so the answer is the one it writes without
 guesses. It is off by default: without `--window` the engine writes one token at a time, identical to `--window 1`.
-The file has no draft block, so the conversation is the only source of guesses.
+The model's file has no draft block; its drafter (below) is a file of its own.
 
 It pays where the answer copies text from the prompt, such as code given back with a change. Elsewhere it guesses
 rarely and costs about nothing. On a card that holds few of the experts it gains less: most experts of the guessed
@@ -231,6 +231,56 @@ tokens with their probabilities): IQ4_NL and UD-Q2_K_XL, fp16 and q8_0 caches, c
 the CPU and with the cache holding the same experts. 15 of the 16 runs were identical. In the 16th (UD-Q2_K_XL, fp16,
 code, experts cached) the two caches never held the same experts (1,864 and 1,869 at load), and the answers first
 differ at a token the model rated about as likely as another (ln p1/p2 0.15).
+
+## Guesses from its DSpark drafter
+
+Unsloth publishes a small drafter for Inkling 2 Mini, [dspark-Inkling-2-Mini-Q8_0.gguf](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)
+(0.4 GB, three dense layers that read the model's own layers 5, 23, 41 and its output, as llama.cpp's PR 32218 runs
+it). With it the engine guesses three tokens a round and puts them through the model with the known one, in one
+window. A guess counts only when it is the token the model writes itself, so the greedy answer is the one written
+without the drafter.
+
+**Turning it on.** Setup asks where the card holds every expert of the size beside the drafter (an RTX 3090 24 GB
+with either size, a 16 GB card with UD-Q2_K_XL); the answer's default is no. `--dspark yes` sets it up on any card,
+`--dspark no` leaves it out. By hand: `"--draft-model", "/path/to/dspark-Inkling-2-Mini-Q8_0.gguf"` in the run
+config's `"args"`. A window is then 4 tokens (`--window N` sets it, `--window 1` turns the drafter off), and
+`--lookup` still adds the conversation's repeats. Not with `--parallel` (`--batch`) or several cards.
+
+**Where it pays.** On a card that holds every expert, and on text it guesses well: code, text that repeats the
+prompt. On prose it guesses about half the tokens right and gains little or nothing. On a card that holds few of the
+experts it is no faster or slower: the guessed tokens route to experts of their own, and those run on the CPU. A
+window of guesses is not recorded as one CUDA graph (see above), so with the drafter on, the tokens it does not guess
+right lose that gain.
+
+> **Measured on:** a rented RTX 3090 24 GB (every expert of both sizes in VRAM) and a rented RTX 2070 Super 8 GB
+> (31% of IQ4_NL's experts and 68% of UD-Q2_K_XL's in VRAM), 2026-11-21/22, strata-poly alone, greedy, q8_0 caches.
+> RTX 3090: 300 tokens written, two runs each; RTX 2070 Super: 200 tokens, one run. "Code": the 373-token prompt
+> above (a Python file given back with a function renamed); "prose": the 37-token question on hash tables. **These
+> rows are from the build before a token ran as one CUDA graph**: the `--window 1` column is that build's.
+
+| | without | with the drafter | guesses right |
+| --- | ---: | ---: | ---: |
+| RTX 3090, IQ4_NL, code | 59.7-60.4 tokens/s | 70.6-70.8 tokens/s (+18%) | 180 of 263 |
+| RTX 3090, IQ4_NL, prose | 60.3 | 58.8-59.1 (-2%) | 64 of 120 |
+| RTX 3090, UD-Q2_K_XL, code | 68.3-68.7 | 96.5-96.7 (+41%) | 192 of 253 |
+| RTX 3090, UD-Q2_K_XL, prose | 68.3-68.7 | 74.3-74.7 (+9%) | 114 of 199 |
+| RTX 2070 Super, IQ4_NL, code | 17.8 | 17.1 | 109 of 116 |
+| RTX 2070 Super, IQ4_NL, prose | 20.4 | 18.2 | 34 of 59 |
+| RTX 2070 Super, UD-Q2_K_XL, code | 28.4 | 31.6 | 97 of 112 |
+| RTX 2070 Super, UD-Q2_K_XL, prose | 33.8 | 30.3 | 37 of 44 |
+
+**VRAM.** The drafter's weights, scratch and window layers' caches took 0.4 GiB at load (the expert cache was that
+much smaller with it on the RTX 2070 Super, both sizes), and its full-attention layer keeps 4 KiB a context token in
+fp16 whatever `--kv` says (0.5 GiB at 128K). It comes out of the expert cache; setup counts it.
+
+**How it was checked.** Its guesses against llama.cpp's own drafter (PR 32218, 88025eb) on llama.cpp's inputs
+(`poly_dspark_parity`, a record of llama.cpp's run, IQ4_NL, seven guesses a round): 84 of 84, 178 of 179 and 137 of
+138 guesses the same on a code, a prose and a 1,523-token prompt (RTX 3090), the largest score difference 0.46. With
+every expert on the CPU (`--no-gpu-experts`), its answers were the same 200 tokens with the same five likeliest at
+every step as without it (both sizes, code and prose, RTX 2070 Super); with every expert on the card the same 200
+tokens (both sizes, code and prose, RTX 3090). Where a card holds only some experts, the drafter's 0.4 GiB means
+the cache holds other experts than without it, and answers can part where the model rates two tokens about equally
+(as with `--window` above).
 
 ## Long contexts
 
