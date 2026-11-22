@@ -73,7 +73,7 @@ struct Options {
                                   ///< layer's experts take; 0: 128 where a read can widen it (stage_read_mib) on
                                   ///< CUDA, else 2048, about what a layer of Q2_K experts leaves out of the cache
     int stage_read_mib = -1;      ///< a read of several calls: the staging buffer grows to this, at most what a
-                                  ///< layer's experts take, with VRAM the expert cache lends it until the read is
+                                  ///< layer's experts take (two layers' where the engine prestages), with VRAM the expert cache lends it until the read is
                                   ///< done (end_read()), so that each layer's experts are copied once a read, not
                                   ///< once a call; 0 (or no more than stage_mib): never; below 0: 2048 with the
                                   ///< 128 MiB default of stage_mib, else never
@@ -699,6 +699,7 @@ protected:
     int grow_cache(size_t bytes, bool later = false);
     void fill_now();
     float* widen_stage(int calls, size_t call_bytes);
+    size_t read_stage(size_t rows_bytes) const;
     void narrow_stage();
     void resize_card_cache(int mib);   ///< resize_cache() and mind_vram() for this engine's card
     bool mind_card_vram();
@@ -1000,7 +1001,8 @@ protected:
     bool shared_ahead_ = false;                   ///< read() runs several calls: each copies ahead, whatever its size
     size_t stage_bytes_ = 0, chunk_bytes_ = 0;
     Mapped stage_map_;                            ///< stage_'s VRAM when it can grow for a read (stage_read_mib)
-    size_t stage_narrow_ = 0, stage_wide_ = 0;    ///< stage_bytes_ outside a read and inside one
+    size_t stage_narrow_ = 0, stage_wide_ = 0;    ///< stage_bytes_ outside a read and inside one of several calls
+    size_t stage_layer_ = 0;                      ///< inside a read of two (stage_wide_ but for prestage_)
     bool stage_lent_ = false;                     ///< the expert cache has lent the read VRAM (widen_stage())
     Mapped rows_map_;                             ///< a read's rows when the cache lends it them (widen_stage())
     bool lend_rows_ = false;                      ///< whether it can

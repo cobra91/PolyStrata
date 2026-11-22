@@ -2381,7 +2381,7 @@ bool Engine::mind_card_vram() {
 
 // A read of several calls copies each layer's experts that are not cached through the staging buffer, a round
 // at a time, and again for each call: at 1 GiB, a layer of GLM 5.3 Flash Q2_K (about 2.4 GiB) went through in
-// three rounds a call.  For the read the buffer grows to stage_wide_, which holds the layer, with VRAM the
+// three rounds a call.  For the read the buffer grows to stage_layer_, which holds the layer, with VRAM the
 // expert cache gives up (its least used experts) when the card has not that much free; narrow_stage() gives it
 // back.  VRAM the card does not give leaves the buffer as it was.
 //
@@ -2391,7 +2391,8 @@ bool Engine::mind_card_vram() {
 // nullptr where the rows stay in pinned memory.
 float* Engine::widen_stage(int calls, size_t call_bytes) {
     const size_t rows_bytes = (size_t) calls * call_bytes;
-    const bool stage = !stage_lent_ && stage_wide_ > stage_narrow_;
+    const size_t wide = calls > 2 ? read_stage(rows_bytes) : stage_layer_;
+    const bool stage = wide > stage_bytes_;
     const size_t g = pool_on_ ? pg_ : grain_;
     const bool rows = lend_rows_ && rows_bytes > rows_map_.mapped &&
                       (!rows_map_.base || up_to(rows_bytes, g) <= rows_map_.reserved);
@@ -2400,7 +2401,7 @@ float* Engine::widen_stage(int calls, size_t call_bytes) {
         ck(cudaStreamSynchronize(cs(st_)), "the expert staging buffer");
         if (rows && !rows_map_.base)   // the largest read's, without its marks
             vmm_reserve(rows_map_, (size_t) std::max(calls, read_rows_ / rows_) * call_bytes);
-        size_t want = stage ? up_to(stage_wide_ + 256 + kTail, g) - stage_map_.mapped : 0;
+        size_t want = stage ? up_to(wide + 256 + kTail, g) - stage_map_.mapped : 0;
         if (rows) want += up_to(rows_bytes, g) - rows_map_.mapped;
         size_t free_b = 0, total_b = 0;
         ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
@@ -2416,11 +2417,11 @@ float* Engine::widen_stage(int calls, size_t call_bytes) {
         stage_lent_ = true;   // narrow_stage() gives back what was cut even if a map below fails
         if (stage) {
             try {
-                vmm_map(stage_map_, stage_wide_ + 256 + kTail, SIZE_MAX, "the expert staging buffer");
-                stage_bytes_ = stage_wide_;
+                vmm_map(stage_map_, wide + 256 + kTail, SIZE_MAX, "the expert staging buffer");
+                stage_bytes_ = wide;
                 staged_il_ = -1;
             } catch (const std::runtime_error&) {
-                vmm_unmap(stage_map_, stage_narrow_ + 256 + kTail);
+                vmm_unmap(stage_map_, stage_bytes_ + 256 + kTail);
             }
         }
         if (rows) {
@@ -2432,6 +2433,28 @@ float* Engine::widen_stage(int calls, size_t call_bytes) {
         }
     }
     return rows_bytes > 0 && rows_map_.mapped >= rows_bytes ? (float*) rows_map_.base : nullptr;
+}
+
+// The staging buffer of a read of more calls than r_ holds: where the engine prestages, room for what two turns in
+// a row leave out of the cache - the experts it lacks now, and their share of what it gives up for the read, its
+// least used of any layer - between one layer's experts and two layers'.
+size_t Engine::read_stage(size_t rows_bytes) const {
+    if (stage_wide_ <= stage_layer_) return stage_layer_;
+    const auto lacks = [&](int v) {
+        const Layer& L = layers_[(size_t) home_of(v)];
+        return (size_t) uncached(L) * (L.gu_step + L.d_bytes) + 2 * kTail + 512;
+    };
+    std::vector<uint8_t> home((size_t) n_layer_, 0);
+    size_t most = 0;
+    for (int v = lo_, last = -1; v < hi_ && v < n_layer_; ++v) {
+        if (!routed(layers_[(size_t) v])) continue;
+        home[(size_t) home_of(v)] = 1;
+        if (last >= 0) most = std::max(most, lacks(last) + lacks(v));
+        last = v;
+    }
+    const size_t homes = (size_t) std::count(home.begin(), home.end(), 1);
+    if (homes > 0) most += 2 * (most + rows_bytes) / homes;
+    return std::clamp(most, stage_layer_, stage_wide_);
 }
 
 // The read is done: the staging buffer goes back to stage_narrow_, the rows' VRAM goes, and the expert cache takes
@@ -2591,8 +2614,8 @@ int Engine::uncached(const Layer& L) const {
 }
 
 // In a read, the experts of the next turn's layer (next_home_) that are not cached go to the staging buffer while
-// the m of layer L are read there by the turn's calls: before the buffer's start if they fit there, else after
-// L's.  The part they take was the layer's before L, whose last call the copy waits for (ev_free_ has its mark
+// the m of layer L are read there by the turn's calls: from the buffer's start if they fit before L's, else at
+// its end.  The part they take was the layer's before L, whose last call the copy waits for (ev_free_ has its mark
 // until L's first call is done).  Where they do not fit, the next layer copies them when it starts, as without
 // this.  The experts and the launches are the same either way, so the results are too.
 //
@@ -2610,9 +2633,9 @@ void Engine::prestage(const Layer& L, int m, int n) {
     const size_t span2 = pad((size_t) m2 * N.gu_step) + (size_t) m2 * N.d_bytes + kTail;
     const size_t room = stage_bytes_ + 256 + kTail, after = pad(stage_at_ + span);
     size_t at = 0;
-    if (span2 > stage_at_) {
+    if (span2 > stage_at_) {   // at the buffer's end, so that the layer after it fits below what this one leaves
         if (after + span2 > room) return;
-        at = after;
+        at = (room - span2) / 256 * 256;
     }
     pre_.il = next_home_;
     pre_.at = at;
@@ -3518,9 +3541,21 @@ void Engine::alloc() {
         stage_bytes_ = std::max(std::min((size_t) stage_mib << 20, (size_t) n_expert_ * one_expert), one_expert);
         chunk_bytes_ = std::max(kChunkBytes, one_expert);
         // With stage_read_mib the buffer's addresses are reserved for the larger size, and a read maps the rest.
-        stage_narrow_ = stage_wide_ = stage_bytes_;
-        if (widens && read_mib > 0)
-            stage_wide_ = std::max(stage_bytes_, std::min((size_t) read_mib << 20, (size_t) n_expert_ * one_expert));
+        // Where the next layer's experts come while a layer runs (prestage_), a read of more calls than r_ holds
+        // widens it to two layers': with one, the next layer's seldom fitted beside this one's.  A read of two calls
+        // is over before the copies ahead pay for the experts the cache gives up.
+        stage_narrow_ = stage_layer_ = stage_wide_ = stage_bytes_;
+        if (widens && read_mib > 0) {
+            const size_t layer = (size_t) n_expert_ * one_expert;
+            stage_layer_ = std::max(stage_bytes_, std::min((size_t) read_mib << 20, layer));
+            // Two layers' with the room their spans' alignment takes (prestage()), past the default's 2 GiB: Inkling 2
+            // Mini IQ4_NL's last four layers have Q8_0 experts, 1.08 GB a layer and none of them cached, and each
+            // waited 0.1 s for its own copy.  read_stage() takes only what two layers in a row lack.
+            const size_t two = prestage_ ? 2 * layer + (size_t(1) << 20) : layer;
+            const size_t most = opt_.stage_read_mib < 0 && prestage_ ? std::max((size_t) read_mib << 20, two)
+                                                                      : (size_t) read_mib << 20;
+            stage_wide_ = std::max(stage_bytes_, std::min(most, two));
+        }
 #if defined(STRATA_GPU_METAL)
         if (!opt_.metal_balanced)
 #endif
