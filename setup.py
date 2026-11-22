@@ -879,7 +879,9 @@ FAMILIES = {
     # download, less VRAM, faster (256 rows: 2.1 s against 3.3 s on 6 CPU threads, 63 against 131 ms on the GPU), and
     # the engine's prompt logits with either one's rows were as close to llama.cpp's (cosine 0.99989 or more, the same
     # greedy tokens, 2 pictures).
-    # NVIDIA cards only ("cuda_only": the AMD build was not made for it), not run on Windows.  Several cards split its
+    # Offered on NVIDIA cards only ("cuda_only"): the engine builds and runs it on AMD cards with HIP too (an RX 9070 XT
+    # with ROCm 7.2.4, an RX 9060 XT), but its prompt speed there is not tuned yet, so setup does not offer it there.
+    # It was not built or run on Windows (docs/models/inkling.md, "What you need").  Several cards split its
     # layers as the other families' (the loop's twelve on one card); "parallel" (--batch) as for them too; its attention
     # caches are fp16 or q8_0 (POLY_KV).  Measured on an RTX 2070 Super 8 GB with 62 GB of RAM (IQ4_NL): about 3.1 GiB
     # of VRAM beside the experts at 8K in fp16, so "vram_beside_gb" 4.0 at 32K (the rows of the 8 full-attention passes:
@@ -8539,7 +8541,7 @@ def main() -> int:
         for f, fd in FAMILIES.items():                  # the families with sizes of their own
             for m, d in fd.get("models", {}).items():
                 if hip and fd.get("cuda_only"):
-                    say(f"  {fd['title']} {m}: NVIDIA only (not built or run for AMD cards)")
+                    say(f"  {fd['title']} {m}: NVIDIA only (setup does not offer it on AMD cards yet)")
                     continue
                 any_fits = any_fits or poly_fits(d, ram, gpu["vram_gb"], hip)
                 say(f"  {fd['title']} {m}: {poly_verdict(d, ram, gpu['vram_gb'], hip, bool(fd.get('windows')))}")
@@ -8576,7 +8578,7 @@ def main() -> int:
         return install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted)
     fam = FAMILIES[family]
     if fam.get("cuda_only") and hip:
-        fail(f"{fam['title']} runs on NVIDIA cards only for now: its engine code was not built or run for AMD cards",
+        fail(f"setup offers {fam['title']} on NVIDIA cards only for now: its AMD speed is not tuned yet",
              "use an NVIDIA card, or choose another model")
     if fam.get("ready") and hip:
         # not a risk the user could take: the HIP engine has no NVFP4 expert kernels at all, so it would not start

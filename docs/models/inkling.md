@@ -67,6 +67,15 @@ context with `--kv-whole` (so that a frozen 32K read has its rows), it gave the 
 (f5e5a7e) after an 8,192-token prompt with a checkpoint inside its read, after that prompt resumed with 1,985
 tokens more, and after a 32,765-token prompt read in four reads that followed a read stopped at 3 s.
 
+`STRATA_POLY_EXPERT_TILES=1` (opt-in) puts a prompt batch's expert products in one launch of tiles of their own
+widths. It read prompts 6-17% faster on the RTX 2070 Super 8 GB, a rented RTX 3090 24 GB and a rented A100 40 GB. With
+every expert on the card the results were the same to the bit as without it; with some experts in RAM the sums run in
+another order, and the chosen token changed only where the top two were nearly tied.
+
+On an A100 (compute capability 8.0 only) a full-attention layer whose prompt call reaches past 2,048 keys runs on a
+FlashAttention-2 kernel that gives the same bits as the tensor-core kernel above. On a rented A100 40 GB (every expert in
+VRAM) IQ4_NL read prompts of 8K to 128K tokens 4-6% faster with it.
+
 On a card that holds every expert, a token written on its own runs as one CUDA graph: its 48 layer runs and their
 experts are recorded once (again when the context outgrows the size they were recorded for) and replayed, so the CPU
 hands the card 4 launches a token instead of 1,059 (IQ4_NL) or 1,167 (UD-Q2_K_XL). A window of guesses (`--window`
