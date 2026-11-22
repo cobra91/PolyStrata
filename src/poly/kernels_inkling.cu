@@ -174,10 +174,10 @@ __device__ __forceinline__ float tau_of(float alpha, int floor_, long long p) {
 
 // ---- clip ------------------------------------------------------------------------------------------------------
 
-// A warp a head of a token.
-__device__ __forceinline__ void clip_group(const float* __restrict__ x, int x_stride, const float* __restrict__ scale,
-                                           float* y, int dim, int heads, int gi, float threshold, float alpha,
-                                           int floor_, long long pos) {
+// A warp a head of a token.  x may be y (a clip in place): it is not __restrict__.
+__device__ __forceinline__ void clip_group(const float* x, int x_stride, const float* __restrict__ scale, float* y,
+                                           int dim, int heads, int gi, float threshold, float alpha, int floor_,
+                                           long long pos) {
     const int lane = threadIdx.x % WARP;
     const int t = gi / heads, h = gi % heads;
     const float* xr = x + size_t(t) * x_stride + size_t(h) * dim;
@@ -206,9 +206,8 @@ __device__ __forceinline__ void clip_group(const float* __restrict__ x, int x_st
     }
 }
 
-__global__ void clip_kernel(const float* __restrict__ x, int x_stride, const float* __restrict__ scale,
-                            float* y, int dim, int heads, int groups, float threshold, float alpha, int floor_,
-                            long long pos) {
+__global__ void clip_kernel(const float* x, int x_stride, const float* __restrict__ scale, float* y, int dim,
+                            int heads, int groups, float threshold, float alpha, int floor_, long long pos) {
     const int gi = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP;
     if (gi >= groups) return;
     clip_group(x, x_stride, scale, y, dim, heads, gi, threshold, alpha, floor_, pos);
