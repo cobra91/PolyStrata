@@ -2993,9 +2993,10 @@ void Engine::load_layers(const Options& o) {
 #if defined(STRATA_USE_HIP) && defined(__linux__)
     // ROCm keeps a file descriptor open for each VMM handle (its dmabuf, librocdxg on WSL2): with --vram-pool's
     // 2 MiB handles the usual soft limit of 1,024 descriptors held an RX 9070 XT's pool to 2 GiB ("fail to import fd",
-    // and the map fails as a card without VRAM does).  The soft limit goes up to the hard one, as a process may.
+    // and the map fails as a card without VRAM does).  The soft limit goes up to the hard one (at most 2^20), as a
+    // process may, and never down.
     if (rlimit r{}; getrlimit(RLIMIT_NOFILE, &r) == 0 && r.rlim_cur < r.rlim_max) {
-        r.rlim_cur = std::min<rlim_t>(r.rlim_max, rlim_t(1) << 20);
+        r.rlim_cur = std::max(r.rlim_cur, std::min<rlim_t>(r.rlim_max, rlim_t(1) << 20));
         (void) setrlimit(RLIMIT_NOFILE, &r);
     }
 #endif
