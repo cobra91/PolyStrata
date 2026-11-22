@@ -14,58 +14,35 @@ the same at 29 to 32 of 32 steps with llama.cpp's own answer fed in.
 
 ## How fast is it?
 
-> **Measured on:** RTX 2070 Super 8 GB, Ryzen 5 3600XT, 62 GB DDR4, Ubuntu 22.04, one request, warm file cache, the
-> server's flags (128K context, q8_0 caches, the model's expert profile), 128 tokens written, two runs each, the
-> 302- and 1,500-token rows on the same day.
+> **Measured on:** RTX 2070 Super 8 GB, Ryzen 5 3600XT, 62 GB DDR4, Ubuntu 22.04, 2026-11-22. `strata-poly --serve`
+> with the server's flags (128K context, q8_0 caches), one engine a run, each from a fresh copy of the model's expert
+> profile, the prompt read in a fresh conversation (text from the parity prompts repeated). Reading at 2,048, 8,192 and
+> 32,768 tokens: prompt only, two runs, with the next layer's experts copied while a layer runs (below). The other
+> cells: the same flags, a build before that copy (it changes reading only); 302 and 1,500 tokens two runs each with
+> 256 tokens written, the longer prompts one run with 64. 1,042 of IQ4_NL's and 2,022 of UD-Q2_K_XL's 3,072 experts
+> were cached in the copy's runs.
 
-| | IQ4_NL prompt | IQ4_NL writing | UD-Q2_K_XL prompt | UD-Q2_K_XL writing |
+| prompt | IQ4_NL reading | IQ4_NL writing | UD-Q2_K_XL reading | UD-Q2_K_XL writing |
 | --- | ---: | ---: | ---: | ---: |
-| 302-token prompt | 273-275 tokens/s | 37.3-38.1 tokens/s | 503-511 tokens/s | 50.7-53.0 tokens/s |
-| 1,500-token prompt | 452-455 tokens/s | 36.1-36.5 tokens/s | 586-611 tokens/s | 46.7-48.1 tokens/s |
-| 34,800-token prompt (IQ4_NL, through the server, an earlier day) | 232 tokens/s | 28.1 tokens/s | | |
+| 302 tokens | 282-290 tokens/s | 38.8-40.0 tokens/s | 557-561 tokens/s | 51.1-52.3 tokens/s |
+| 1,500 tokens | 521-523 tokens/s | 38.5-38.7 tokens/s | 881-888 tokens/s | 49.0-49.5 tokens/s |
+| 2,048 tokens | 787-789 tokens/s | 34.0 tokens/s | 929-931 tokens/s | |
+| 8,192 tokens | 947-948 tokens/s | | 888-896 tokens/s | |
+| 32,768 tokens | 911-914 tokens/s | 28.7 tokens/s | 852-854 tokens/s | |
+| 131,008 tokens | 659 tokens/s (199 s) | 20.6 tokens/s | | |
 
-Since these rows the engine takes a visit's projections in one launch and its cached experts a warp a row. In
-back-to-back runs of strata-poly alone (the same flags, 2026-11-22, two runs each) writing after the 302-token prompt
-went from 38.2-38.7 to 39.0-39.5 tokens/s with IQ4_NL (+2%, with a copy of its expert profile) and from 51.2-51.9 to
-54.6-55.2 with UD-Q2_K_XL (+6%, without one).
+A prompt batch's attention runs on the tensor cores (cards of Turing or newer); writing does not (a token at a time
+takes the split path). Single runs differ by up to 4.5% both ways, the means of two runs by at most 1.5%. A prompt's
+read copies the next layer's experts that the card does not hold while a layer runs, and hands the card each call's
+row tables by a kernel, so that they wait for no copy.
 
-A prompt batch's attention runs on the tensor cores (cards of Turing or newer). Next to the build before it
-(2026-11-22, the same card; `strata-poly --serve`, a 128K context, q8_0 caches, one engine a run, each from a fresh
-copy of the model's expert profile, the prompt read in a fresh conversation; text from the parity prompts repeated;
-the 302- and 1,500-token rows two runs each, old and new taken in turn, 256 tokens written; the longer ones one run,
-64 tokens written):
-
-| run | prompt | before | writing | before |
-| --- | ---: | ---: | ---: | ---: |
-| 302 tokens, IQ4_NL | 282-290 tokens/s | 271-272 tokens/s | 38.8-40.0 tokens/s | 39.3-40.6 tokens/s |
-| 1,500 tokens, IQ4_NL | 521-523 tokens/s | 458-461 tokens/s | 38.5-38.7 tokens/s | 39.0-39.2 tokens/s |
-| 302 tokens, UD-Q2_K_XL | 557-561 tokens/s | 504-508 tokens/s | 51.1-52.3 tokens/s | 52.3-52.7 tokens/s |
-| 1,500 tokens, UD-Q2_K_XL | 881-888 tokens/s | 609-611 tokens/s | 49.0-49.5 tokens/s | 48.6-48.8 tokens/s |
-| 2,048 tokens, IQ4_NL | 658 tokens/s | 504 tokens/s | 34.0 tokens/s | 34.1 tokens/s |
-| 32,768 tokens, IQ4_NL | 820 tokens/s | 263 tokens/s | 28.7 tokens/s | 28.5 tokens/s |
-| 131,008 tokens, IQ4_NL | 659 tokens/s (199 s) | 92 tokens/s (1,421 s) | 20.6 tokens/s | 20.8 tokens/s |
-
-Writing does not run on the tensor cores (a token at a time takes the split path); single runs differ by up to
-4.5% both ways, the means of two runs by at most 1.5%.
-
-A prompt's read copies the next layer's experts that the card does not hold while a layer runs, and hands the card
-each call's row tables by a kernel, so that they wait for no copy. Next to the build before it, 249b2de (2026-11-22,
-the same card; `strata-poly --serve` with the server's flags, a fresh copy of each expert profile, one engine a
-run, 1,042 of IQ4_NL's and 2,022 of UD-Q2_K_XL's experts cached, prompt only, two runs each, old and new in turn):
-
-| prompt | IQ4_NL | before | UD-Q2_K_XL | before |
-| --- | ---: | ---: | ---: | ---: |
-| 2,048 tokens | 787-789 tokens/s | 620-626 tokens/s | 929-931 tokens/s | 887-895 tokens/s |
-| 8,192 tokens | 947-948 tokens/s | 793-796 tokens/s | 888-896 tokens/s | 825 tokens/s |
-| 32,768 tokens | 911-914 tokens/s | 781-783 tokens/s | 852-854 tokens/s | 802-805 tokens/s |
-
-The results are the same. With `STRATA_FREEZE_EXPERTS=1`, the 20 most likely tokens and their probabilities at 4
-steps after prompts of 2,048 and 8,192 tokens (q8_0 caches) and of 2,048 tokens (fp16) matched 249b2de's for both
-models, in runs where both builds cached the same number of experts (that number depends on the VRAM free at load,
-and runs that differ in it differ in their results with either build). Through `--serve`, also frozen, at a 40K
-context with `--kv-whole` (so that a frozen 32K read has its rows), it gave the same tokens as the build before
-(f5e5a7e) after an 8,192-token prompt with a checkpoint inside its read, after that prompt resumed with 1,985
-tokens more, and after a 32,765-token prompt read in four reads that followed a read stopped at 3 s.
+The results are the same as without those changes. With `STRATA_FREEZE_EXPERTS=1`, the 20 most likely tokens and
+their probabilities at 4 steps after prompts of 2,048 and 8,192 tokens (q8_0 caches) and of 2,048 tokens (fp16)
+matched for both models, in runs where both builds cached the same number of experts (that number depends on the VRAM
+free at load, and runs that differ in it differ in their results with either build). Through `--serve`, also frozen,
+at a 40K context with `--kv-whole` (so that a frozen 32K read has its rows), it gave the same tokens after an
+8,192-token prompt with a checkpoint inside its read, after that prompt resumed with 1,985 tokens more, and after a
+32,765-token prompt read in four reads that followed a read stopped at 3 s.
 
 `STRATA_POLY_EXPERT_TILES=1` (opt-in) puts a prompt batch's expert products in one launch of tiles of their own
 widths. It read prompts 6-17% faster on the RTX 2070 Super 8 GB, a rented RTX 3090 24 GB and a rented A100 40 GB. With
@@ -81,13 +58,20 @@ experts are recorded once (again when the context outgrows the size they were re
 hands the card 4 launches a token instead of 1,059 (IQ4_NL) or 1,167 (UD-Q2_K_XL). A window of guesses (`--window`
 above 1) is recorded the same way, once for each number of tokens it puts through the model, and its guesses are
 checked between windows as before. Not recorded: several requests at once (`--parallel`), a picture's tokens and
-`--dump-layers`. `--no-graphs` turns it off; the output is the same to the bit either way. On a rented RTX 3090 24 GB (every expert in VRAM,
-strata-poly alone, a 16K context, q8_0 caches, 256 tokens written, the build before and this one in turn, two runs each)
-writing went from 62.5-62.8 to 69.8-70.2 tokens/s with IQ4_NL after a 302-token prompt (+11%), from 60.8-61.3 to
-67.4-67.8 after 8,192 tokens, and from 71.8-72.6 to 82.1-82.6 (+14%) and 69.6-70.2 to 78.7-79.4 with UD-Q2_K_XL. A card
-that holds only some of the experts, as the 8 GB one above, runs as before.
+`--dump-layers`. `--no-graphs` turns it off; the output is the same to the bit either way. A card that holds only
+some of the experts, as the 8 GB one above, runs a token launch by launch.
 
-A token's launches are fewer too, on every card: a visit's norms and Q8_1 copies, the cache store and its clip, the
+> **Measured on:** a rented RTX 3090 24 GB, every expert in VRAM, strata-poly alone, a 16K context, q8_0 caches, 256
+> tokens written, two runs each, a build that ran a token launch by launch and this one in turn.
+
+| writing | launch by launch | one CUDA graph |
+| --- | ---: | ---: |
+| IQ4_NL, after 302 tokens | 62.5-62.8 tokens/s | 69.8-70.2 tokens/s (+11%) |
+| IQ4_NL, after 8,192 tokens | 60.8-61.3 tokens/s | 67.4-67.8 tokens/s |
+| UD-Q2_K_XL, after 302 tokens | 71.8-72.6 tokens/s | 82.1-82.6 tokens/s (+14%) |
+| UD-Q2_K_XL, after 8,192 tokens | 69.6-70.2 tokens/s | 78.7-79.4 tokens/s |
+
+A token's launches are fewer on every card: a visit's norms and Q8_1 copies, the cache store and its clip, the
 attention's gate and the mixes around it go in fewer kernels that write the same bits as the separate ones (the
 kernel test compares them). With UD-Q2_K_XL on the RTX 3090 a token took 890 kernels on the card instead of 1,391
 (nsys, every expert in VRAM). On CUDA a token's mixes are spread over many blocks in a cooperative launch, which the
@@ -163,7 +147,7 @@ the others write, answers of 64 to 16 tokens, so that a step has 1 to 4 of them)
 
 > **Measured on:** RTX 2070 Super 8 GB, Ryzen 5 3600XT, 62 GB DDR4, Ubuntu 22.04: the server's config (128K context,
 > q8_0 caches, the expert profile), chats of 300 tokens started together (greedy, thinking off), two runs each; the
-> server was started again for each row. Measured before the change of 2026-11-22 above.
+> server was started again for each row, on an earlier build than the speeds at the top of this page.
 
 | Chats at once | `"parallel"` | IQ4_NL, all together | IQ4_NL, each chat | UD-Q2_K_XL, all together | UD-Q2_K_XL, each chat | Experts in VRAM (IQ4_NL / UD-Q2_K_XL) |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -214,28 +198,22 @@ above), so the guesses gain on top of the graph's gain. With `--window 4` on a r
 and a 160-token answer to the 302-token code prompt).
 
 > **Measured on:** a rented RTX 3090 24 GB, every expert of both sizes in VRAM, strata-poly alone, a 16K context,
-> q8_0 caches, 256 tokens written, two runs each, the build before (inkling2-final 6e61054, whose windows were not
-> recorded) and this one in turn. "Code": setup's 302- and 1,500-token code prompts; "prose": a 302-token prose
-> prompt. Guesses right: this build's `--window 4`.
+> q8_0 caches, 256 tokens written, two runs each. "Code": setup's 302- and 1,500-token code prompts; "prose": a
+> 302-token prose prompt. Guesses right: `--window 4`'s.
 
-| | `--window 1` | `--window 4`, the build before | `--window 4` | `--window 8` | Guesses right |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| IQ4_NL, code, 302 | 70.8-70.9 tokens/s | 67.2-67.9 | 72.8 (+8%) | 71.5-71.7 | 31 of 50 |
-| IQ4_NL, code, 1,500 | 69.8-69.9 | 68.7-69.3 | 73.3 (+6%) | 71.7-71.8 | 54 of 93 |
-| IQ4_NL, prose, 302 | 70.7-70.8 | 65.0-65.1 | 69.9-70.0 (+8%) | 69.9-70.0 | 4 of 9 |
-| UD-Q2_K_XL, code, 302 | 84.1 | 81.4-82.2 | 89.4-89.5 (+9%) | 88.3-88.7 | 50 of 95 |
-| UD-Q2_K_XL, code, 1,500 | 82.8 | 85.6-86.1 | 93.8-93.9 (+9%) | 91.8-92.5 | 70 of 114 |
-| UD-Q2_K_XL, prose, 302 | 83.8-84.0 | 111.9-112.3 | 120.8-121.3 (+8%) | 127.8-128.2 | 123 of 128 |
+| | `--window 1` | `--window 4` | `--window 8` | Guesses right |
+| --- | ---: | ---: | ---: | ---: |
+| IQ4_NL, code, 302 | 70.8-70.9 tokens/s | 72.8 | 71.5-71.7 | 31 of 50 |
+| IQ4_NL, code, 1,500 | 69.8-69.9 | 73.3 | 71.7-71.8 | 54 of 93 |
+| IQ4_NL, prose, 302 | 70.7-70.8 | 69.9-70.0 | 69.9-70.0 | 4 of 9 |
+| UD-Q2_K_XL, code, 302 | 84.1 | 89.4-89.5 | 88.3-88.7 | 50 of 95 |
+| UD-Q2_K_XL, code, 1,500 | 82.8 | 93.8-93.9 | 91.8-92.5 | 70 of 114 |
+| UD-Q2_K_XL, prose, 302 | 83.8-84.0 | 120.8-121.3 | 127.8-128.2 | 123 of 128 |
 
 There `--window 4` and `--window 8` wrote the same 256 tokens as `--window 1`, with the same five likeliest tokens at
-every step, and the same with `--no-graphs` (`STRATA_FREEZE_EXPERTS=1`, both sizes, the three prompts). A window of 5
-to 8 tokens has its experts routed on the card now, as a shorter one's are: the build before routed it on the host,
-whose weights differ in their last bits, and its `--window 8` answers to the code prompts parted from its own
-`--window 1` ones (from token 24 to 62), so its `--window 8` speeds there are of other text with other guesses
-(UD-Q2_K_XL, code, 1,500: 140 of 180 right, 108.2-108.3 tokens/s) and not in the table. On the prose prompt, where
-both builds wrote the same text, `--window 8` went from 65.0-65.3 to 69.9-70.0 tokens/s (IQ4_NL) and from
-111.8-111.9 to 127.8-128.2 (UD-Q2_K_XL, +14%). With the conversation's guesses alone `--window 8` gains no more than
-`--window 4` on code.
+every step, and the same with `--no-graphs` (`STRATA_FREEZE_EXPERTS=1`, both sizes, the three prompts). A window of up
+to 8 tokens has its experts routed on the card, as a token's are. With the conversation's guesses alone `--window 8`
+gains no more than `--window 4` on code.
 
 With every expert on the CPU (`--no-gpu-experts`), `--window 4` wrote the same 200 tokens as `--window 1`, with the
 same five likeliest tokens and their probabilities at every step: IQ4_NL and UD-Q2_K_XL, three prompts each, greedy
@@ -247,7 +225,7 @@ the card's expert cache holding the same experts (`STRATA_FREEZE_EXPERTS=1`, and
 and text. Where the two caches held one expert apart (IQ4_NL: 1,006 and 1,007 of 3,072), they parted at a token the
 model rated about as likely as another.
 
-Without `--window`, 200 greedy tokens were compared with inkling2 791be9e's (the same tokens and twenty likeliest
+Without `--window`, 200 greedy tokens were compared with an earlier build's (the same tokens and twenty likeliest
 tokens with their probabilities): IQ4_NL and UD-Q2_K_XL, fp16 and q8_0 caches, code and text prompts, every expert on
 the CPU and with the cache holding the same experts. 15 of the 16 runs were identical. In the 16th (UD-Q2_K_XL, fp16,
 code, experts cached) the two caches never held the same experts (1,864 and 1,869 at load), and the answers first
@@ -275,32 +253,27 @@ prompt. On prose it guesses about half the tokens right and gains little or noth
 experts it is no faster or slower: the guessed tokens route to experts of their own, and those run on the CPU. The
 model's window of guesses is recorded as one CUDA graph (see above); the drafter's own launches go one by one.
 
-> **Measured on:** a rented RTX 3090 24 GB (every expert of both sizes in VRAM) and a rented RTX 2070 Super 8 GB
-> (31% of IQ4_NL's experts and 68% of UD-Q2_K_XL's in VRAM), 2026-11-21/22, strata-poly alone, greedy, q8_0 caches.
-> RTX 3090: 300 tokens written, two runs each; RTX 2070 Super: 200 tokens, one run. "Code": the 373-token prompt
-> above (a Python file given back with a function renamed); "prose": the 37-token question on hash tables. **These
-> rows are from the build before a token ran as one CUDA graph**: the `--window 1` column is that build's.
+> **Measured on:** a rented RTX 3090 24 GB (every expert of both sizes in VRAM; 256 tokens written, two runs each,
+> setup's 302- and 1,500-token code prompts) and a rented RTX 2070 Super 8 GB (31% of IQ4_NL's experts and 68% of
+> UD-Q2_K_XL's in VRAM; 200 tokens, one run; "code": the 373-token prompt above, a Python file given back with a
+> function renamed; "prose": the 37-token question on hash tables), 2026-11-21/22, strata-poly alone, greedy, q8_0
+> caches, the drafter at its window of 4.
 
 | | without | with the drafter | guesses right |
 | --- | ---: | ---: | ---: |
-| RTX 3090, IQ4_NL, code | 59.7-60.4 tokens/s | 70.6-70.8 tokens/s (+18%) | 180 of 263 |
-| RTX 3090, IQ4_NL, prose | 60.3 | 58.8-59.1 (-2%) | 64 of 120 |
-| RTX 3090, UD-Q2_K_XL, code | 68.3-68.7 | 96.5-96.7 (+41%) | 192 of 253 |
-| RTX 3090, UD-Q2_K_XL, prose | 68.3-68.7 | 74.3-74.7 (+9%) | 114 of 199 |
+| RTX 3090, IQ4_NL, code, 302 | 70.8-70.9 tokens/s | 72.3-72.9 tokens/s | 61 of 83, 66 of 84 |
+| RTX 3090, IQ4_NL, code, 1,500 | 69.8-69.9 | 78.1-78.4 | 160 of 214 |
+| RTX 3090, UD-Q2_K_XL, code, 302 | 84.1 | 103.5-103.9 | 155 of 216 |
+| RTX 3090, UD-Q2_K_XL, code, 1,500 | 82.8 | 100.6-100.8 | 151 of 230 |
 | RTX 2070 Super, IQ4_NL, code | 17.8 | 17.1 | 109 of 116 |
 | RTX 2070 Super, IQ4_NL, prose | 20.4 | 18.2 | 34 of 59 |
 | RTX 2070 Super, UD-Q2_K_XL, code | 28.4 | 31.6 | 97 of 112 |
 | RTX 2070 Super, UD-Q2_K_XL, prose | 33.8 | 30.3 | 37 of 44 |
 
-With the model's windows recorded as one CUDA graph, the same RTX 3090 (every expert in VRAM, 256 tokens written, two
-runs each, setup's 302- and 1,500-token code prompts) wrote, without the drafter and with it at its window of 4:
-
-| | without | with the drafter | the drafter, windows not recorded | guesses right |
-| --- | ---: | ---: | ---: | ---: |
-| IQ4_NL, code, 302 | 70.8-70.9 tokens/s | 72.3-72.9 | 68.2 | 61 of 83, 66 of 84 |
-| IQ4_NL, code, 1,500 | 69.8-69.9 | 78.1-78.4 | 74.5-76.8 | 160 of 214 |
-| UD-Q2_K_XL, code, 302 | 84.1 | 103.5-103.9 | 93.2-93.6 | 155 of 216 |
-| UD-Q2_K_XL, code, 1,500 | 82.8 | 100.6-100.8 | 96.8-97.2 | 151 of 230 |
+The RTX 2070 Super runs a token launch by launch with or without the drafter (it holds only some of the experts). On
+the RTX 3090, prose was measured only while windows still ran launch by launch: there the drafter wrote 2% slower
+with IQ4_NL (58.8-59.1 against 60.3 tokens/s, 64 of 120 guesses right) and 9% faster with UD-Q2_K_XL (74.3-74.7
+against 68.3-68.7, 114 of 199).
 
 Greedy and frozen, the drafter at windows 4 and 8 wrote the same 256 tokens with the same five likeliest at every step
 as `--window 1` and as `--no-graphs` (both sizes, those two prompts and a 302-token prose one).
@@ -373,7 +346,7 @@ at 18 (an earlier build on another box).
 
 > **Measured on:** 2 x RTX 3070 8 GB (rented; PCIe 3.0 x16, no P2P, so the hand-off goes through host memory), a Xeon
 > E5-2650 v4 (24 threads), q8_0 caches, the experts each card holds in VRAM, greedy answers of 256 tokens, two runs
-> each, inkling2 6e61054. The CPU has more cores than a desktop's, so the one-card numbers, and with them what a
+> each. The CPU has more cores than a desktop's, so the one-card numbers, and with them what a
 > second card adds, are not those of a PC with fewer cores.
 
 | | One card | Split at 18 |
