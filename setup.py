@@ -7175,7 +7175,7 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
             say(f"  Speculative decoding: {title}'s own drafter ({fam['dspark']['gb']} GB download, "
                 f"~{poly_dspark_gb(fam['dspark']):.1f} GB of VRAM) guesses")
             say("  a few tokens ahead and the model checks them together: faster code and text that repeats, prose")
-            say("  about as fast. Answers stay the same.")
+            say("  about as fast. With every expert on the card a greedy answer is the one written without it.")
             want = "yes" if ask("Use the DSpark drafter?", ["y", "n"], "n", a.yes) == "y" else "no"
         if want == "yes" and (a.parallel or 0) > 1:
             fail("--dspark yes does not go with --parallel", "leave one of them out")
@@ -7188,6 +7188,8 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
             spark = fam["dspark"]
             room = max(0.0, room - poly_dspark_gb(spark))
         ok("DSpark drafter: " + ("on" if spark else "off"))
+    elif a.dspark == "yes":
+        warn(f"--dspark: {title} has no DSpark drafter (Inkling 2 Mini has); left out")
     beside = poly_beside_gb(d)
     held, need_ram = poly_held_gb(d, room), poly_ram_need(d, room)
     say()
