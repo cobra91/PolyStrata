@@ -395,6 +395,12 @@ token was the same at 29 to 32 of the 32 steps. Where it differed, llama.cpp's t
 other in logit, except at one step (UD-Q2_K_XL, the 1,500-token prompt, in every run), where they were 1.0 apart. Two
 runs of the same input do not give identical logits here (cosine 0.9992 between two runs of the 302-token prompt).
 
+To compare two builds byte for byte with the experts on the card, give both the same `STRATA_GPU_EXPERTS=N` and the
+same copy of the expert profile: each build's cache holds the same N experts for the whole run, frozen, whatever VRAM
+the build leaves free. Without it the two builds' caches often differ by a few experts (a build that records more
+launches leaves less VRAM), and so do their logits. Pick an N a little below what the smaller build caches on its own
+(`poly_logits_dump`'s `N of 3072 experts cached` line, `strata-poly`'s `N of 3072 routed experts in VRAM`); one that does not fit stops the load with an error.
+
 ## Known differences
 
 - llama.cpp 29b52d398b does not set `ignore_merges` for `inkling2`, so a word that is one token but that no chain of

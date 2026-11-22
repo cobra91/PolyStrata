@@ -1989,7 +1989,16 @@ void Engine::fill_expert_cache() {
         free_b = vpool_bytes();
         reserve = stage_map_.base ? 0 : stage_slack;
     }
-    if (!claim_later && free_b <= reserve) return;
+    // STRATA_GPU_EXPERTS: an N the VRAM cannot hold is refused rather than cached in part
+    const auto short_of = [&](size_t room, size_t need) {
+        if (expert_cap_ <= 0) return;
+        throw std::runtime_error("STRATA_GPU_EXPERTS=" + std::to_string(expert_cap_) + ": the card has " +
+                                 std::to_string(room >> 20) + " MiB for the expert cache" +
+                                 (need ? ", the first " + std::to_string(expert_cap_) + " experts take " +
+                                             std::to_string(need >> 20) + " MiB" : std::string()) +
+                                 ": lower N or --vram-reserve-mib");
+    };
+    if (!claim_later && free_b <= reserve) return short_of(0, 0);
 
     struct Cand {
         int il, e;
@@ -2025,6 +2034,14 @@ void Engine::fill_expert_cache() {
     }
     std::stable_sort(cands.begin(), cands.end(),
                      [](const Cand& a, const Cand& b) { return a.value != b.value ? a.value > b.value : a.e < b.e; });
+    if (expert_cap_ >= 0) {   // the first N, each in turn, and nothing but them: the cache is sized to hold them
+        if ((size_t) expert_cap_ > cands.size())
+            throw std::runtime_error("STRATA_GPU_EXPERTS=" + std::to_string(expert_cap_) + ": the model has " +
+                                     std::to_string(cands.size()) + " experts the card can hold");
+        cands.resize((size_t) expert_cap_);
+        all = 0;
+        for (const Cand& c : cands) all += c.bytes;
+    }
 
     n_trade_ = (int) sizes.size();
     if (claim_later) {
@@ -2045,7 +2062,7 @@ void Engine::fill_expert_cache() {
                      budgeted ? "under the OS's budget for this process" : "of the card's free VRAM", limit >> 20);
         free_b = vpool_bytes();
         reserve = stage_map_.base ? 0 : stage_slack;
-        if (free_b <= reserve) return;
+        if (free_b <= reserve) return short_of(0, 0);
     }
     // sized again (resize_cache()), it is no larger than load() made it, or than its addresses with VMM
     const size_t most = vmm_ ? std::min(all, total_b) :
@@ -2076,6 +2093,7 @@ void Engine::fill_expert_cache() {
         }
     }
 #endif
+    if (arena < all) short_of(arena, all);
     if (arena == 0) return;
     if (vmm_) {   // in pieces, so that it can give some up to the attention caches (shrink_cache()) and grow
         if (!arena_.base) vmm_reserve(arena_, most + 256);   // addresses only: grow_cache() maps more of them
@@ -2083,6 +2101,7 @@ void Engine::fill_expert_cache() {
             vmm_map(arena_, arena + 256, kArenaPiece, "the expert cache");
         } catch (const std::runtime_error&) {   // the card may not have it all (grow_cache() is just as tolerant)
             arena = arena_.mapped > 256 ? arena_.mapped - 256 : 0;
+            if (arena < all) short_of(arena, all);
             if (arena == 0) return;
         }
         exp_ = (uint8_t*) arena_.base;
@@ -2206,8 +2225,8 @@ void Engine::resize_cache(int mib) {
 void Engine::resize_card_cache(int mib) {
     if (!opt_.gpu_experts || n_moe_ == 0) return;
     // As shrink_cache(): a frozen answer's cache does not change under it (the vram API resizes between
-    // requests; unfreeze_experts() ends the freeze before one begins).
-    if (freeze_experts_) return;
+    // requests; unfreeze_experts() ends the freeze before one begins).  STRATA_GPU_EXPERTS holds it for the run.
+    if (freeze_experts_ || expert_cap_ >= 0) return;
     OnCard here(device_, split_);
 #if defined(STRATA_GPU_METAL)
     // Every Metal graph retains its indirect resources, including in the legacy memory mode.
@@ -2876,7 +2895,26 @@ void Engine::load_layers(const Options& o) {
     // CPU instead (the cache holds it, but the split is the first token's).  What it buys: greedy answers that
     // repeat bit for bit, which is what a test, a benchmark of quality or a comparison with another engine needs.
     freeze_experts_ = freeze_experts_asked_ = std::getenv("STRATA_FREEZE_EXPERTS") != nullptr;
-    if (freeze_experts_)
+    // STRATA_GPU_EXPERTS=N, a test knob: the expert cache holds exactly the first N experts of the order it fills
+    // in (the profile's), held still for the whole run - frozen, no uploads, no resize.  Two builds that leave
+    // different VRAM free (one records more launches) would cache different numbers of experts, and their sums
+    // differ wherever the split does; with the same N and the same profile they hold the same set, so their
+    // logits can be compared byte for byte with the experts on the card.  An N the card cannot hold is an error.
+    if (const char* v = std::getenv("STRATA_GPU_EXPERTS"); v && *v) {
+        char* end = nullptr;
+        const long n = std::strtol(v, &end, 10);
+        if (*end || n < 0 || n > (1L << 24))
+            throw std::runtime_error(std::string("STRATA_GPU_EXPERTS=") + v + " is not a number of experts");
+        if (split_) throw std::runtime_error("STRATA_GPU_EXPERTS is for one card's engine, not a split");
+        expert_cap_ = (int) n;
+        freeze_experts_ = freeze_experts_asked_ = true;
+        opt_.expert_swaps = 0;
+        if (opt_.gpu_experts)
+            std::fprintf(stderr, "strata-poly: STRATA_GPU_EXPERTS=%d: the expert cache holds the first %d experts "
+                                 "in the profile's order, frozen, with no uploads and no resize, for the whole run\n",
+                         expert_cap_, expert_cap_);
+    }
+    if (freeze_experts_ && expert_cap_ < 0)
         std::fprintf(stderr, "strata-poly: the experts' split is frozen for the engine's whole run "
                              "(STRATA_FREEZE_EXPERTS): greedy answers are a function of the request alone, "
                              "and the only cache change after load is the serve VRAM resize\n");

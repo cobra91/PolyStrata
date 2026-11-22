@@ -738,6 +738,8 @@ protected:
                                              ///< for the engine's whole run (see Engine::load())
     bool freeze_experts_asked_ = false;      ///< the env was set: refreeze_experts() puts it back after the
                                              ///< serve VRAM resize lifted it (unfreeze_experts())
+    int expert_cap_ = -1;                    ///< STRATA_GPU_EXPERTS: the cache holds exactly this many experts,
+                                             ///< frozen for the run (see Engine::load_layers()); below 0: unset
     void* blas_ = nullptr; ///< cuBLAS on st_
     void* ev_ = nullptr;   ///< marks the router's copy to the host: ev_row_'s first, or a window's row's own
     void* ev_row_[8] = {}; ///< one for each token a window can have

@@ -1536,7 +1536,10 @@ void usage() {
                  "environment: STRATA_ROUTE_TAIL_SKIP=N  in place of --tail-skip (0 turns it off)\n"
                  "environment: STRATA_FREEZE_EXPERTS=1  hold the split of the routed experts between the card\n"
                  "                         and the CPU still, so the same request gives the same greedy answer\n"
-                 "                         bit for bit; with guesses on, add --window 1 for a repeat everywhere\n");
+                 "                         bit for bit; with guesses on, add --window 1 for a repeat everywhere\n"
+                 "environment: STRATA_GPU_EXPERTS=N  a test knob: the expert cache holds exactly the first N experts\n"
+                 "                         (the profile's order), frozen, for the whole run, so that two builds hold\n"
+                 "                         the same ones; an N the card cannot hold is an error\n");
 }
 
 }  // namespace
