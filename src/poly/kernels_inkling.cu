@@ -2418,6 +2418,8 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
     // a block is WMMA_TOKENS tokens of a visit: below that the decode and split paths are the ones to use
     if (wmma_attention() && !kq && !vq && rows >= WMMA_TOKENS) {
         launch_attn_wmma(a, kv_heads, rows, st);
+        if (gate) mul_sigmoid(out, gate, n_head * dim, rows, n_head * dim, false, stream);
+        if (out_q8_1) kernels::native_quantize_q8_1(out, out_q8_1, n_head * dim * rows, 1, stream);
         return;
     }
     if (rows >= kInklingMmaRows && rel.n_rel == 16 && mma_attention()) {
