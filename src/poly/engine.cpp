@@ -806,9 +806,30 @@ void Engine::mind_memory() {
 #endif
 }
 
+#ifdef STRATA_VMM_EQUAL_PIECES
+// Where a reservation's pieces must all be of one size (hip_compat/cuda.h): the unit they are made of, 2 MiB like
+// the pool's handles, of which vmm_reserve() reserves a whole number.
+static size_t vmm_unit(size_t grain) { return up_to(size_t(2) << 20, grain); }
+
+// The size of every piece of a reservation of `reserved` bytes: `first`, the size of the piece it has, or for its
+// first map the most units that divide the reservation and are no more than the piece asked for and the map's bytes.
+// A map then covers a whole number of pieces, and the last one is no shorter than the others.
+static size_t vmm_piece(size_t reserved, size_t first, size_t bytes, size_t piece, size_t unit) {
+    if (first) return first;
+    const size_t most = std::min(up_to(std::min(piece, reserved), unit), up_to(bytes, unit)) / unit;
+    size_t k = std::max<size_t>(most, 1);
+    while (k > 1 && (reserved / unit) % k != 0) --k;
+    return k * unit;
+}
+#endif
+
 void Engine::vmm_reserve(Mapped& m, size_t bytes) {
     CUdeviceptr p = 0;
+#ifdef STRATA_VMM_EQUAL_PIECES
+    m.reserved = up_to(std::max<size_t>(bytes, 1), pool_on_ ? pg_ : vmm_unit(grain_));
+#else
     m.reserved = up_to(std::max<size_t>(bytes, 1), pool_on_ ? pg_ : grain_);   // a whole number of pool handles
+#endif
     cu_ck(cuMemAddressReserve(&p, m.reserved, 0, 0, 0), "reserving addresses for VRAM");
     m.base = p;
 }
@@ -906,7 +927,13 @@ void Engine::vmm_map(Mapped& m, size_t bytes, size_t piece, const char* what) {
     // With the pool a piece is one of its handles and comes from it, never from the card; a map it cannot serve
     // throws as a card that has no more VRAM does
     if (pool_on_) piece = pg_;
+#ifdef STRATA_VMM_EQUAL_PIECES
+    if (!pool_on_)
+        piece = vmm_piece(m.reserved, m.pieces.empty() ? 0 : m.pieces.front().second, bytes, piece, vmm_unit(grain_));
+    bytes = std::min(up_to(bytes, piece), m.reserved);
+#else
     bytes = std::min(up_to(bytes, pool_on_ ? pg_ : grain_), m.reserved);
+#endif
     CUmemAllocationProp prop = {};
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
@@ -1361,7 +1388,15 @@ void Engine::cover(int64_t end) {
     const auto size = [rows](const Kv& k) { return (size_t) ((rows + k.per - 1) / k.per) * k.bytes; };
     size_t more = 0, held = arena_.mapped + other_rows();
     for (const Kv& k : kv_) {
+#ifdef STRATA_VMM_EQUAL_PIECES
+        // what vmm_map() below maps: whole pieces
+        const size_t piece = pool_on_ ? pg_
+                                      : vmm_piece(k.reserved, k.pieces.empty() ? 0 : k.pieces.front().second, size(k),
+                                                  (size_t) ((kKvGrow + k.per - 1) / k.per) * k.bytes, vmm_unit(grain_));
+        const size_t want = std::min(up_to(size(k), piece), k.reserved);
+#else
         const size_t want = std::min(up_to(size(k), pool_on_ ? pg_ : grain_), k.reserved);
+#endif
         if (want > k.mapped) more += want - k.mapped;   // trim_card_kv() leaves a piece it cuts through
         held += k.mapped;
     }
@@ -2099,7 +2134,12 @@ void Engine::fill_expert_cache() {
     if (arena < all) short_of(arena, all);
     if (arena == 0) return;
     if (vmm_) {   // in pieces, so that it can give some up to the attention caches (shrink_cache()) and grow
+#ifdef STRATA_VMM_EQUAL_PIECES
+        // a whole number of kArenaPiece, so that its pieces can all be of that size (vmm_map())
+        if (!arena_.base) vmm_reserve(arena_, up_to(most + 256, kArenaPiece));
+#else
         if (!arena_.base) vmm_reserve(arena_, most + 256);   // addresses only: grow_cache() maps more of them
+#endif
         try {
             vmm_map(arena_, arena + 256, kArenaPiece, "the expert cache");
         } catch (const std::runtime_error&) {   // the card may not have it all (grow_cache() is just as tolerant)
