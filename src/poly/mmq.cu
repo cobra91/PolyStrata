@@ -27,7 +27,7 @@ STRATA_POLY_MMQ_TILE_TYPES(X)
 #undef X
 #endif
 
-#if STRATA_POLY_NVFP4
+#if STRATA_POLY_NVFP4 || STRATA_POLY_NVFP4_INT8
 // mmq_nvfp4.cu
 void nvfp4_w4a8(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s);
 bool nvfp4_w4a8_fits(int64_t w_rows, int cc, size_t smpbo);
@@ -46,29 +46,26 @@ int64_t pad512(int64_t n) { return (n + 511) / 512 * 512; }
 // NVFP4's prompt products: on RTX 50, with STRATA_PREFILL_NVFP4=w4a4, FP4 x FP4 on its FP4 tensor cores (the
 // instance built for 12.0a, as MXFP4's); otherwise, as on every other card, the weights decoded to int8 times Q8_1
 // rows (mmq_nvfp4.cu).
-bool nvfp4_fp4(int cc) {
-    static const bool asked = [] {
+const std::string& nvfp4_mode() {
+    static const std::string mode = [] {
         const char* v = std::getenv("STRATA_PREFILL_NVFP4");
-        return v != nullptr && std::string(v) == "w4a4";
+        return std::string(v ? v : "");
     }();
-    return asked && cc == GGML_CUDA_CC_BLACKWELL;
+    return mode;
 }
 
-// The int8 tiles, the ones mmq_nvfp4.cu builds for every architecture: CUDA takes them for NVFP4 whenever the FP4
-// MMA is not asked for (as it always has).  The HIP build has them too - the unit is device-generic, the FP4 MMA is
-// not - and there they are opt-in (STRATA_PREFILL_NVFP4=w4a8), so a HIP run that never asked for them keeps the
-// products, and the bits, it had before they were built.
-bool nvfp4_w4a8_on() {
-#if STRATA_POLY_NVFP4_W4A4
-    return true;
-#else
-    static const bool asked = [] {
-        const char* v = std::getenv("STRATA_PREFILL_NVFP4");
-        return v != nullptr && std::string(v) == "w4a8";
-    }();
-    return asked;
-#endif
+bool nvfp4_fp4(int cc) { return nvfp4_mode() == "w4a4" && cc == GGML_CUDA_CC_BLACKWELL; }
+
+#if STRATA_POLY_NVFP4_INT8
+// HIP builds mmq_nvfp4.cu's int8 tiles and none of CUDA's FP4 ones.  An NVFP4 matrix takes them where the caller
+// allows them (Engine::nvfp4_int8_: Inkling 2) or STRATA_PREFILL_NVFP4=w4a8 asks for them; w4a4 and w4a4x2 ask for
+// products HIP does not have and leave the choice as it was, and any other value keeps them out.
+bool nvfp4_int8_on(Mmq::Allow allow) {
+    const std::string& m = nvfp4_mode();
+    if (m == "w4a8") return true;
+    return (m.empty() || m == "w4a4" || m == "w4a4x2") && (allow & Mmq::nvfp4_int8);
 }
+#endif
 
 // The float each row of NVFP4's FP4 rows carries (quantize_mmq_fp4_cuda's scale) goes behind the blocks and the
 // tiles' tail, in the room q8_bytes() leaves: FP4 blocks take half the bytes of Q8_1's.
@@ -101,10 +98,10 @@ void Mmq::reserve_fixup() {
 // step they read on into what lies behind it, and multiply that by the zeros quantize() pads the rows of x with.
 // So what lies behind a matrix must be readable and must not be read as an infinite block scale: the engine keeps
 // zero bytes there (kTail in runtime.hpp), as ggml-cuda does behind its tensors.
-bool Mmq::fits(int type, int64_t w_rows, int64_t w_cols, bool q2_0) {
+bool Mmq::fits(int type, int64_t w_rows, int64_t w_cols, Allow allow) {
     const ggml_type t = (ggml_type) type;
     const auto& dev = ggml_cuda_info().devices[ggml_cuda_get_device()];
-    if (t == GGML_TYPE_Q2_0 && !q2_0) return false;
+    if (t == GGML_TYPE_Q2_0 && !(allow & q2_0)) return false;
     switch (t) {
 #define X(T) case GGML_TYPE_##T:
         STRATA_POLY_MMQ_TYPES(X)
@@ -113,8 +110,11 @@ bool Mmq::fits(int type, int64_t w_rows, int64_t w_cols, bool q2_0) {
 #if STRATA_POLY_NVFP4
         case GGML_TYPE_NVFP4:
             if (w_cols % QK_NVFP4 != 0) return false;
-            if (nvfp4_fp4(dev.cc)) break;   // the FP4 MMA's tiles, the ones mmq-instance-nvfp4.cu builds
-            if (!nvfp4_w4a8_on()) return false;
+            if (!nvfp4_fp4(dev.cc)) return nvfp4_w4a8_fits(w_rows, dev.cc, dev.smpbo);
+            break;
+#elif STRATA_POLY_NVFP4_INT8
+        case GGML_TYPE_NVFP4:
+            if (w_cols % QK_NVFP4 != 0 || !nvfp4_int8_on(allow)) return false;
             return nvfp4_w4a8_fits(w_rows, dev.cc, dev.smpbo);
 #endif
         default: return false;
@@ -148,6 +148,8 @@ bool Mmq::split_exact(int type, int64_t w_rows) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 #if STRATA_POLY_NVFP4
     if (t == GGML_TYPE_NVFP4 && !nvfp4_fp4(cc)) return !nvfp4_w4a8_stream_k(w_rows, cc);
+#elif STRATA_POLY_NVFP4_INT8
+    if (t == GGML_TYPE_NVFP4) return !nvfp4_w4a8_stream_k(w_rows, cc);
 #endif
     for (int J = 8; J <= 128; J += 8) {
         const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config(t, J, fallback, cc);
@@ -210,18 +212,15 @@ void Mmq::mul(const void* w, int type, int64_t w_rows, int64_t w_cols, size_t st
 #undef X
 #if STRATA_POLY_NVFP4
         case GGML_TYPE_NVFP4:
-            // only on a build with the FP4 MMA instance (CUDA), and only where the card has it: a HIP build has no
-            // mul_mat_q_case<NVFP4> to call, and Mmq::fits() has already said which of the two runs
-#if STRATA_POLY_NVFP4_W4A4
             if (nvfp4_fp4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
                 a.y_scale = fp4_scales(const_cast<void*>(xq), total_rows, w_cols);
                 mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, a, s);
-            } else
-#endif
-            {
+            } else {
                 nvfp4_w4a8(ctx, a, s);
             }
             break;
+#elif STRATA_POLY_NVFP4_INT8
+        case GGML_TYPE_NVFP4: nvfp4_w4a8(ctx, a, s); break;
 #endif
         default: throw std::runtime_error("mmq: tensor type " + std::to_string(type) + " is not built");
     }

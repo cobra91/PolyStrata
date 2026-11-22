@@ -811,6 +811,21 @@ protected:
     /// the cached experts' launches through kernels::MmvqSlots::lanes' kernels (the same bits): Inkling 2's, measured
     /// there; off, the other families' launches as they were
     bool lane_slots_ = false;
+#if defined(STRATA_USE_HIP)
+    /// NVFP4 matrices' prompt products on HIP take the int8 tiles (Mmq::nvfp4_int8) unless STRATA_PREFILL_NVFP4 keeps
+    /// them out: Inkling 2's, as on CUDA, where every family takes them.  Off, a family's NVFP4 matrices go through
+    /// the decode kernels a token at a time unless STRATA_PREFILL_NVFP4=w4a8 asks for the tiles.
+    bool nvfp4_int8_ = false;
+#endif
+    /// What MMQ may take for the routed experts and for the dense matrices.
+    Mmq::Allow expert_mmq() const {
+#if defined(STRATA_USE_HIP)
+        return Mmq::Allow((lowbit_experts_ ? Mmq::q2_0 : Mmq::none) | (nvfp4_int8_ ? Mmq::nvfp4_int8 : Mmq::none));
+#else
+        return lowbit_experts_ ? Mmq::q2_0 : Mmq::none;
+#endif
+    }
+    Mmq::Allow dense_mmq() const { return expert_mmq(); }
     std::vector<float> clamp_exp_, clamp_shexp_;   ///< a layer's SwiGLU limits: the routed experts', the shared one's
     /// a prompt batch's products go through guard_half_sums(): the model's activations can sum past a half's range
     /// in a block.  Off for the models whose sums stay in range: it cost LFM2.5 4% of a 30K prompt's read on a 5090.

@@ -18,9 +18,14 @@ public:
     Mmq(const Mmq&) = delete;
     Mmq& operator=(const Mmq&) = delete;
 
-    /// This build multiplies ggml_type, and the card has a tile for a matrix of [w_rows, w_cols] of it.  Q2_0 only
-    /// when `q2_0` (Engine::lowbit_experts_).
-    static bool fits(int ggml_type, int64_t w_rows, int64_t w_cols, bool q2_0 = false);
+    /// The products a caller lets a matrix take besides the default ones.
+    ///   q2_0: Q2_0's tiles (Engine::lowbit_experts_).
+    ///   nvfp4_int8: on HIP, NVFP4's int8 tiles (mmq_nvfp4.cu) unless STRATA_PREFILL_NVFP4 keeps them out
+    ///     (Engine::nvfp4_int8_); CUDA takes them for NVFP4 always.
+    enum Allow : unsigned { none = 0, q2_0 = 1u << 0, nvfp4_int8 = 1u << 2 };
+
+    /// This build multiplies ggml_type, and the card has a tile for a matrix of [w_rows, w_cols] of it.
+    static bool fits(int ggml_type, int64_t w_rows, int64_t w_cols, Allow allow = none);
     /// Bytes of `rows` rows of `cols` values as quantize() writes them.
     static size_t q8_bytes(int64_t rows, int64_t cols);
     /// quantize() keeps the rows' block sums in halves for a matrix of ggml_type (guard_half_sums()).

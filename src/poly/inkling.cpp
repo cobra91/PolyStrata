@@ -189,6 +189,9 @@ void Inkling::load_geometry() {
     softcap_ = cap ? (float) cap->f : 0.f;
     const MetaValue* scale = find("expert_weights_scale");
     w_scale_ = scale ? (float) scale->num() : 0.f;
+#if defined(STRATA_USE_HIP)
+    nvfp4_int8_ = true;    // NVFP4 matrices' prompt products on the int8 tiles, as on CUDA
+#endif
     reserve_mmq_ = true;   // MMQ's scratch before the expert cache takes the VRAM
     prestage_ = true;      // a read's next layer's experts come while a layer runs
     kernel_tables_ = true;    // and a call's tables do not wait behind the copies to the card

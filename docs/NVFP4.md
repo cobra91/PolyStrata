@@ -130,7 +130,7 @@ FP16's range.
 
 | mode | kernel | activations | one product vs FP64 (`mmq_nvfp4_parity`) |
 |---|---|---|---|
-| `w4a8` (CUDA's default; HIP's on request) | llama.cpp MMQ, int8 tensor cores | q8_1, float block scales | 0.53% |
+| `w4a8` (CUDA's default; HIP's for Inkling 2, else on request) | llama.cpp MMQ, int8 tensor cores | q8_1, float block scales | 0.53% |
 | `w4a4` | llama.cpp MMQ, Blackwell FP4 MMA (sm_120a only) | NVFP4 | 8.6% |
 | `fp16` | dequantize + cuBLAS FP16 GEMM | FP16 | reference |
 
@@ -208,8 +208,9 @@ engine's own q8_1 kernels, which decode UE4M3/E2M1 in software. The engine was b
 on the RTX 5090 with the host answering as that generation. On those builds `mmq_nvfp4_parity` and
 `nvfp4_expert_gpu_parity` gave results identical to sm_120.
 
-HIP: the decode kernels use no CUDA-only intrinsics. The NVFP4 MMQ instance and the W4A8 unit are CUDA-only and
-guarded (`GGML_USE_HIP`). Neither was built for HIP here.
+HIP: the decode kernels use no CUDA-only intrinsics. The NVFP4 MMQ instance (the FP4 MMA) is CUDA-only and guarded
+(`GGML_USE_HIP`); the W4A8 unit (`src/poly/mmq_nvfp4.cu`) is device-generic and built for HIP as well
+(`STRATA_POLY_NVFP4_INT8`).
 
 ## strata-poly: NVFP4 GGUFs
 
@@ -230,11 +231,14 @@ too small for the blocks' E4M3 scales, and llama.cpp multiplies the product by t
   token's sum. Down's scale on the hidden instead would leave it near 1e-5 before its 8-bit quantization (see "Where
   the global scales go"). Only an NVFP4 tensor's `.scale` is read: Gemma 4's `ffn_down_exps.scale` is its own.
 - HIP: the same W4A8 tiles, built for the HIP architectures (`src/poly/mmq_nvfp4.cu` is device-generic; the FP4
-  MMA is CUDA's alone), and opt-in: `STRATA_PREFILL_NVFP4=w4a8`, read by `nvfp4_w4a8_on()` in `src/poly/mmq.cu`. A
-  HIP run that does not ask keeps the decode kernels for its batch, and its previous bits. Measured on an RX 9060 XT
-  (gfx1200, ROCm 10.1): Inkling 2 Mini UD-Q2_K_XL, a 2,048-token prompt 177.3 -> 402.3 tok/s when the nine of its
-  eighteen MoE layers whose down matrix is NVFP4 stopped going through the decode kernels a token at a time; 286
-  tokens 174.7 -> 390.7. Greedy ids identical over 32 tokens at both sizes.
+  MMA is CUDA's alone). Inkling 2 takes them by default, as on CUDA (`Engine::nvfp4_int8_`, `Mmq::nvfp4_int8`);
+  another family takes them with `STRATA_PREFILL_NVFP4=w4a8`, read by `nvfp4_int8_on()` in `src/poly/mmq.cu`, and
+  keeps the decode kernels for its batch, and its previous bits, without it. w4a4 and w4a4x2 leave that choice as it
+  is, and any other value of the switch keeps the tiles out (Inkling 2's too). Measured on an RX 9060 XT (gfx1200,
+  ROCm 10.1): Inkling 2 Mini UD-Q2_K_XL, a 2,048-token prompt 177.3 -> 402.3 tok/s when the nine of its eighteen MoE
+  layers whose down matrix is NVFP4 stopped going through the decode kernels a token at a time; 286 tokens 174.7 ->
+  390.7. Greedy ids identical over 32 tokens at both sizes. On an RX 9070 XT (gfx1201, ROCm 7.2.4), 3,072 of 3,072
+  experts in VRAM: 2,048 tokens 372.8 -> 997.7 tok/s, 8,192 tokens 343.9 -> 848.3, writing 85.9 -> 86.8.
 - Not built: Metal (no NVFP4 kernels).
 
 Measured on lab-pro6000 (RTX PRO 6000 Blackwell Server Edition, sm_120, other users' jobs on the same card), with

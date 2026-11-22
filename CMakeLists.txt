@@ -2089,9 +2089,9 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   # arch-specific target, so on CUDA their instances alone are built with 12x -> 12xa, as Strata's W4A4 unit is.  A
   # Blackwell other than 12.0 has no image of them, and Mmq::fits() leaves MXFP4 out there.  NVFP4 takes this
   # instance only on a 12.0 card with STRATA_PREFILL_NVFP4=w4a4.  Its other tiles, mmq_nvfp4.cu's, decode the
-  # weights to int8 and take Q8_1 rows: that unit is device-generic, so it is built here for HIP as well, but only
-  # the CUDA build defines STRATA_POLY_NVFP4_W4A4 (the FP4 MMA instance's) and only the HIP build makes the int8
-  # tiles opt-in (STRATA_PREFILL_NVFP4=w4a8, mmq.cu's nvfp4_w4a8_on()) so that a HIP run keeps its previous bits.
+  # weights to int8 and take Q8_1 rows: that unit is device-generic, so it is built here for HIP as well, under
+  # STRATA_POLY_NVFP4_INT8 (the int8 tiles alone; STRATA_POLY_NVFP4 is CUDA's, with its FP4 units), where a family
+  # allows them (Mmq::nvfp4_int8: Inkling 2) or STRATA_PREFILL_NVFP4=w4a8 asks for them.
   set(_strata_poly_mxfp4 ${_strata_mmq}/template-instances/mmq-instance-mxfp4.cu)
   if(STRATA_ENABLE_HIP)
     list(APPEND _strata_poly_mmq_instances ${_strata_poly_mxfp4} src/poly/mmq_nvfp4.cu)
@@ -2132,10 +2132,10 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
     target_compile_options(strata_poly_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
   endif()
   if(STRATA_ENABLE_HIP)
-    target_compile_definitions(strata_poly_mmq PRIVATE GGML_USE_HIP=1 STRATA_POLY_NVFP4=1)
+    target_compile_definitions(strata_poly_mmq PRIVATE GGML_USE_HIP=1 STRATA_POLY_NVFP4_INT8=1)
     target_link_libraries(strata_poly_mmq PUBLIC ggml-base hip::host)
   else()
-    target_compile_definitions(strata_poly_mmq PRIVATE STRATA_POLY_NVFP4=1 STRATA_POLY_NVFP4_W4A4=1 STRATA_POLY_MMQ_TILES=1)
+    target_compile_definitions(strata_poly_mmq PRIVATE STRATA_POLY_NVFP4=1 STRATA_POLY_MMQ_TILES=1)
     target_link_libraries(strata_poly_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target})
   endif()
 

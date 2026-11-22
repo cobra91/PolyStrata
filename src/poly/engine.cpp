@@ -3394,11 +3394,12 @@ void Engine::alloc() {
         Layer& L = layers_[(size_t) il];
         if (!L.moe) continue;
         // a mixed layer multiplies gate and up apart (moe_rows()), each a matrix of n_ff rows
+        const Mmq::Allow ea = expert_mmq();
         const bool lb = lowbit_experts_;
-        const bool gu_fits = L.mixed() ? Mmq::fits((int) L.gu_type, n_ff_exp_, n_embd_, lb) &&
-                                             Mmq::fits((int) L.u_type, n_ff_exp_, n_embd_, lb)
-                                       : Mmq::fits((int) L.gu_type, 2 * n_ff_exp_, n_embd_, lb);
-        L.mmq = opt_.gpu_experts && rows_ >= kStageRows && gu_fits && Mmq::fits((int) L.d_type, n_embd_, n_ff_exp_, lb);
+        const bool gu_fits = L.mixed() ? Mmq::fits((int) L.gu_type, n_ff_exp_, n_embd_, ea) &&
+                                             Mmq::fits((int) L.u_type, n_ff_exp_, n_embd_, ea)
+                                       : Mmq::fits((int) L.gu_type, 2 * n_ff_exp_, n_embd_, ea);
+        L.mmq = opt_.gpu_experts && rows_ >= kStageRows && gu_fits && Mmq::fits((int) L.d_type, n_embd_, n_ff_exp_, ea);
         L.tiles_gu = expert_tiles_ && L.mmq && !L.mixed() && Mmq::tiles_fit((int) L.gu_type, 2 * n_ff_exp_, n_embd_, lb);
         L.tiles_d = expert_tiles_ && L.mmq && Mmq::tiles_fit((int) L.d_type, n_embd_, n_ff_exp_, lb);
         any_tiles = any_tiles || L.tiles_gu || L.tiles_d;
@@ -3939,7 +3940,7 @@ void Engine::lin_raw(const Dev& w, const float* x, float* y, int n, const void* 
         return gemv_bf16((const uint16_t*) w.p, x, y, w.n_in, w.n_out, per, n, st_);
     }
     // a prompt batch: llama.cpp's matrix-matrix kernels read the weights once for all the tokens
-    if (mmq_ && n >= kStageRows && Mmq::fits((int) w.type, w.n_out, w.n_in, lowbit_experts_)) {
+    if (mmq_ && n >= kStageRows && Mmq::fits((int) w.type, w.n_out, w.n_in, dense_mmq())) {
         // A row too large for the halves its blocks keep their sums in goes in divided by a power of two, and x is
         // left as it was for whatever reads it next (both exact): its product comes out divided by the same.
         const bool guard = half_sum_guard_ && Mmq::half_sums((int) w.type);
