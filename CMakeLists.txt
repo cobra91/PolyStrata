@@ -2109,14 +2109,14 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
       target_compile_options(strata_poly_mmq_mxfp4 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
     endif()
     list(APPEND _strata_poly_mmq_instances $<TARGET_OBJECTS:strata_poly_mmq_mxfp4>)
-    # Mmq::mul_tiles() (src/poly/mmq_tiles.cuh, STRATA_POLY_EXPERT_TILES): a kernel for each type of Inkling 2 Mini's
-    # experts in its GGUFs, each in its own TU
-    foreach(_t q8_0 iq1_s iq2_xxs iq2_xs iq2_s iq4_nl q2_0)
-      string(TOUPPER ${_t} _strata_tiles_T)
-      configure_file(src/poly/mmq_tiles_instance.cu.in ${CMAKE_BINARY_DIR}/poly_mmq_tiles/mmq-tiles-${_t}.cu @ONLY)
-      list(APPEND _strata_poly_mmq_instances ${CMAKE_BINARY_DIR}/poly_mmq_tiles/mmq-tiles-${_t}.cu)
-    endforeach()
   endif()
+  # Mmq::mul_tiles() (src/poly/mmq_tiles.cuh, STRATA_POLY_EXPERT_TILES): a kernel for each type of Inkling 2 Mini's
+  # experts in its GGUFs, each in its own TU; llama.cpp's tiles, so HIP builds them too
+  foreach(_t q8_0 iq1_s iq2_xxs iq2_xs iq2_s iq4_nl q2_0)
+    string(TOUPPER ${_t} _strata_tiles_T)
+    configure_file(src/poly/mmq_tiles_instance.cu.in ${CMAKE_BINARY_DIR}/poly_mmq_tiles/mmq-tiles-${_t}.cu @ONLY)
+    list(APPEND _strata_poly_mmq_instances ${CMAKE_BINARY_DIR}/poly_mmq_tiles/mmq-tiles-${_t}.cu)
+  endforeach()
   if(STRATA_ENABLE_HIP)
     # CMake does not infer HIP from the .cu suffixes outside src/ (and drops a .cu source it has no language
     # for), and ggml's MMQ sources take its native HIP path (vendors/hip.h) instead of the hip_compat headers,
@@ -2132,7 +2132,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
     target_compile_options(strata_poly_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
   endif()
   if(STRATA_ENABLE_HIP)
-    target_compile_definitions(strata_poly_mmq PRIVATE GGML_USE_HIP=1 STRATA_POLY_NVFP4_INT8=1)
+    target_compile_definitions(strata_poly_mmq PRIVATE GGML_USE_HIP=1 STRATA_POLY_NVFP4_INT8=1 STRATA_POLY_MMQ_TILES=1)
     target_link_libraries(strata_poly_mmq PUBLIC ggml-base hip::host)
   else()
     target_compile_definitions(strata_poly_mmq PRIVATE STRATA_POLY_NVFP4=1 STRATA_POLY_MMQ_TILES=1)
