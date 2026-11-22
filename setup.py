@@ -7491,6 +7491,9 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     if a.parallel is not None:
         cfg["parallel"] = a.parallel if a.parallel >= 2 else 1
     elif spark:                                        # the drafter guesses for one request at a time
+        if config_has(cfg_path if cfg_path.is_file() else earlier, "parallel"):
+            say("  requests at once: 1 in place of the earlier config's \"parallel\" (the DSpark drafter guesses for "
+                "one request at a time; --dspark no keeps several)")
         cfg["parallel"] = 1
     for line in poly_parallel_note(a.parallel, d, vram):
         (ok if a.parallel is not None else say)(line if a.parallel is not None else "  " + line)
