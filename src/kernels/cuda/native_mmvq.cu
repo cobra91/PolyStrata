@@ -3501,7 +3501,8 @@ bool native_mmvq_jobs_mixed(const int* types, const MmvqJobs& jobs, int count, i
     (void) types, (void) jobs, (void) count, (void) n_in, (void) stream;
     return false;   // the wave layout's bits are other
 #else
-    if (count < 1 || count > kMmvqJobsMax) throw std::invalid_argument("native_mmvq_jobs_mixed requires 1 to 8 matrices");
+    if (count < 1 || count > kMmvqJobsMax || n_in <= 0)
+        throw std::invalid_argument("native_mmvq_jobs_mixed requires 1 to 8 matrices and n_in > 0");
     validate_stream(stream);
     MixedArgs m{};
     m.a.j = jobs;

@@ -1437,8 +1437,17 @@ bool mma_attention() {
 #if defined(__HIPCC__)
     return false;
 #else
+    static std::atomic<int> cards[kDevices] = {};   // a device's: 1 yes, 2 no, 0 not yet asked
+    int dev = 0;
+    const bool known = cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < kDevices;
+    if (known)
+        if (const int card = cards[dev].load(std::memory_order_relaxed)) return card == 1;
     cudaFuncAttributes fa{};
-    return cudaFuncGetAttributes(&fa, attn_mma_kernel<false, false>) == cudaSuccess && fa.ptxVersion >= 75;
+    const cudaError_t e = cudaFuncGetAttributes(&fa, attn_mma_kernel<false, false>);
+    if (e != cudaSuccess) cudaGetLastError();
+    const bool on = e == cudaSuccess && fa.ptxVersion >= 75;
+    if (known) cards[dev].store(on ? 1 : 2, std::memory_order_relaxed);
+    return on;
 #endif
 }
 
@@ -1811,7 +1820,6 @@ int fa2_card() {
 #if defined(__HIPCC__)
     return 1;
 #else
-    constexpr int kDevices = 64;
     static std::atomic<int> cards[kDevices] = {};
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kDevices) {
@@ -1850,7 +1858,6 @@ int fa2_warps(bool kq, bool vq) { return 4 * (fa2_card() >> (2 + 2 * (2 * kq + v
 template <int W, bool KQ8, bool VQ8, int S = 2>
 void launch_fa2(const AttnArgs& a, cudaStream_t st) {
     constexpr size_t smem = sizeof(FaSmem<W, S, KQ8, VQ8>);
-    constexpr int kDevices = 64;
     static std::atomic<bool> set[kDevices] = {};   // the device's own setting: once on each card the calls are for
     int dev = 0;
     const bool known = cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < kDevices;
@@ -3038,6 +3045,7 @@ bool aligned16(const void* p) { return (uintptr_t(p) & 15) == 0; }
 }  // namespace
 
 void inkling_conv_in(const InklingConvIn& c, int n, void* stream) {
+    if (n <= 0) return;
     conv_in_kernel<<<grid(n, 256), 256, 0, cs(stream)>>>(conv_in(c), n);
     check_launch("inkling_conv_in");
 }
@@ -3546,6 +3554,7 @@ size_t inkling_block_attend_work_floats(int rows, int n_head, int dim) {
 void inkling_block_attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, int64_t lo, int64_t hi,
                           int ring, int rows, float* out, int dim, int n_head, int kv_heads, float scale, float* work,
                           void* stream) {
+    if (rows <= 0) return;
     if (dim != BA_DIM || kv_heads <= 0 || n_head % kv_heads || rows * (n_head / kv_heads) > BA_QUERIES || hi < lo)
         throw std::invalid_argument("inkling_block_attend: heads of 128 values, at most 32 queries a key head");
     const long long n_keys = hi - lo + 1;
@@ -3560,6 +3569,7 @@ void inkling_block_attend(const float* q, const uint16_t* kcache, const uint16_t
 }
 
 void inkling_dspark_gru(const float* joint, float* state, float* latent, int rank, void* stream) {
+    if (rank <= 0) return;
     dspark_gru_kernel<<<grid(rank, 256), 256, 0, cs(stream)>>>(joint, state, latent, rank);
     check_launch("inkling_dspark_gru");
 }
