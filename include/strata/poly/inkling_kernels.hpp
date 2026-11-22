@@ -364,8 +364,8 @@ struct InklingMixNorm {
 /// conv->acc and conv->save may be states of the first mix, not of the second.  Mixes of more than 5 states or
 /// unaligned buffers take those calls one after the other.  With `work` (inkling_mix_conv_work_bytes() of device
 /// memory, zeroed once and then left to these calls, one at a time) a mix's work is spread over n / 128 blocks that
-/// meet in it, where the card holds all of them at once: each value the same operations in the same order as in the
-/// one block, the same bits.
+/// meet in it, where the card holds all of them at once (not on HIP, where one block a mix is faster): each value the
+/// same operations in the same order as in the one block, the same bits.
 void inkling_mix_conv(const InklingMix* mixes, int count, const InklingConvIn* conv, int n, float eps, void* stream,
                       const InklingMixNorm* norm = nullptr, void* work = nullptr);
 size_t inkling_mix_conv_work_bytes();

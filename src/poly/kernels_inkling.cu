@@ -3020,8 +3020,13 @@ size_t inkling_mix_conv_work_bytes() { return sizeof(MixSpreadWork); }
 namespace {
 // The blocks of mix_spread_kernel the current card holds at once (the least over its SUMs): a launch's blocks wait
 // for each other in grid_meet(), so a launch takes no more than these.  Other streams' kernels on the card can only
-// delay its blocks, as they run to their end without them.
+// delay its blocks, as they run to their end without them.  None on HIP: there the blocks' meetings cost more than
+// the one block a mix did (an RX 9070 XT wrote Inkling 2 Mini UD-Q2_K_XL at 74.1 tok/s spread, 80.1 in one block,
+// after a 286-token prompt; the same bits).
 int spread_room() {
+#if defined(__HIPCC__)
+    return -1;
+#endif
     static std::mutex mu;
     static std::vector<int> rooms;   // a device's, 0: not yet asked
     int dev = 0;
