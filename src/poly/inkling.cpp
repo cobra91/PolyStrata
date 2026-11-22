@@ -1174,6 +1174,10 @@ void Inkling::load_spark_shape() {
     // a block's queries of a key head go to inkling_block_attend() together
     need(s_block_ >= 2 && s_block_ * (s_head_ / s_kv_) <= 32,
          "a block of " + std::to_string(s_block_) + " rows");
+    // a block guesses s_block_ - 1 tokens: a window holds the token and at most those
+    if (opt_.window > s_block_)
+        throw std::runtime_error("Inkling 2: --window " + std::to_string(opt_.window) + " is more than the DSpark "
+                                 "drafter's block of " + std::to_string(s_block_) + " (the token and its guesses)");
     need(get("attention.causal").u == 0 && get("sample_from_anchor").u == 0,
          "a causal block, or one whose first row is a guess");
     need((int) get("vocab_size").u == n_vocab_ && (int) get("vocab_size_unpadded").u == n_vocab_real_,
