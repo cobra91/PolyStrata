@@ -63,6 +63,9 @@ protected:
     /// others: ranked by uses per byte, 4 of their 512 were in VRAM on an 8 GB card, and those layers ran 7 of their
     /// 8 experts a token on the CPU.
     bool experts_by_uses() const override { return true; }
+    /// What a prompt routes to tells of its answer: the cache that follows it from the answer's first token makes
+    /// fewer trades and leaves fewer experts to the CPU.
+    bool prompt_counts() const override { return true; }
     /// A window of guesses is routed on the card (Engine::moe_card()) with every expert in VRAM, so that it is
     /// recorded as one too: --window 5 to 8 have more rows than kSumRows.
     bool windows_on_card() const override { return true; }

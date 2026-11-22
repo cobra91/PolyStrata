@@ -2802,8 +2802,8 @@ void Engine::follow_loop() {
 // slots.  Then, for written tokens, the experts used lately that the cache lacks start on their way, each to the
 // slot of the cached expert of its size that was used least (among equals, the one the profile ranks last).
 //
-// A prompt batch neither counts nor moves anything.  What a prompt routes to says no more about the answer than
-// the profile does, and moving the cache while the prompt was read cost 3% of the reading speed (measured).
+// A prompt batch moves nothing: moving the cache while the prompt was read cost 3% of the reading speed (measured).
+// Nor does it count, unless the model says what its prompt routes to tells of the answer (prompt_counts()).
 void Engine::follow(int written) {
     {
         std::lock_guard<std::mutex> l(swap_m_);
@@ -2856,6 +2856,7 @@ void Engine::follow(int written) {
     if (written <= 0) return;
     const float keep = std::exp2(-(float) written / (float) kSwapHalf);
     for (float& r : recent_) r *= keep;
+    recent_at_ = pos_ + written - 1;
     const auto from_pool = [&](Swap& s) {   // the slot follow_loop() copies s from, held until s arrives
         s.from = -1;
         if (!pool_) return;
@@ -4915,6 +4916,25 @@ void Engine::stage(const Layer& L, const int32_t* experts, int m, void* stream, 
     ck(cudaMemsetAsync(to + down_at + (size_t) m * L.d_bytes, 0, kTail, cs(stream)), "expert staging");
 }
 
+// A prompt batch's experts into recent_, a row's uses halved for every kSwapHalf rows after it, as follow() does a
+// written token's: when the answer starts, the cache follows what its prompt used.  recent_ is reckoned at the
+// row recent_at_; a later batch moves it on, and the first layer's batch before it is another prompt's.  Nothing
+// moves while the prompt is read (follow()).
+void Engine::prompt_recent(int il, int n) {
+    const int64_t last = pos_ + n - 1;
+    if (il == first_moe_layer() && last < recent_at_) recent_at_ = last;
+    if (last > recent_at_) {
+        const float keep = std::exp2(-(float) (last - recent_at_) / (float) kSwapHalf);
+        for (float& r : recent_) r *= keep;
+        recent_at_ = last;
+    }
+    float* rec = recent_.data() + (size_t) il * n_expert_;
+    for (int t = 0; t < n; ++t) {
+        const float w = std::exp2(-(float) (recent_at_ - (pos_ + t)) / (float) kSwapHalf);
+        for (int k = 0; k < n_used_; ++k) rec[(size_t) ids_[(size_t) t * n_used_ + k]] += w;
+    }
+}
+
 // A MoE layer for a prompt batch: the experts on the GPU, by llama.cpp's MMQ.  A row is a token and one
 // of the experts it routes to.  The rows are sorted by expert, the experts of the VRAM cache first; the other
 // experts pass through the staging buffer, as many at a time as it holds.  A full batch starts the copy of
@@ -5027,6 +5047,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
         if (pool_) prompt_use_[(size_t) il * n_expert_ + (size_t) ids_[(size_t) i]] += 1.f;
     }
     if (pool_ && il == first_moe_layer()) prompt_rows_ += n;
+    if (n_swap_ > 0 && prompt_counts()) prompt_recent(il, n);
     // The CPU computes some of the routed experts outside VRAM while the others are copied: the ones the fewest
     // tokens chose, whose copy costs as much as any other's and which cost the CPU about as much as their tokens.
     int n_spare = 0, n_cpu = 0;

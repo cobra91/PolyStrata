@@ -517,6 +517,9 @@ protected:
     /// The expert cache takes the most used experts (fill_expert_cache(), grow_cache()).  false (the default): the
     /// most used for their size, uses per byte; true: the most used, whatever their size.
     virtual bool experts_by_uses() const { return false; }
+    /// A prompt batch's experts count toward their recent use as a written token's do (prompt_recent()), so the
+    /// cache follows the prompt from the answer's first token.  false (the default): only written tokens count.
+    virtual bool prompt_counts() const { return false; }
     /// run() records a fixed layer's head and tail apart when a call's layers are not one recording (its routed
     /// experts are not all on the card).  false: only the one recording of every layer.
     virtual bool layer_graphs() const { return true; }
@@ -652,6 +655,7 @@ protected:
     template <class F>
     void* record(F&& work);
     void moe_rows(Layer& L, int il, int n);
+    void prompt_recent(int il, int n);
     void stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone = false, uint8_t* to = nullptr);
     void prestage(const Layer& L, int m, int n);
     void settle_prestage();
@@ -1182,7 +1186,9 @@ protected:
     std::condition_variable swap_cv_;
     bool swap_quit_ = false;
     std::string swap_error_;         ///< why the thread stopped; follow() throws it
-    std::vector<float> recent_;      ///< per (layer, expert): its uses by written tokens, halved every kSwapHalf
+    std::vector<float> recent_;      ///< per (layer, expert): its uses by written tokens (and prompt_counts()' prompt
+                                     ///< rows), halved every kSwapHalf
+    int64_t recent_at_ = 0;          ///< the row recent_ is reckoned at (prompt_recent())
     std::vector<uint8_t> coming_;    ///< per (layer, expert): on its way into the cache
     std::vector<Pick> in_, out_;     ///< per trade number: the experts to bring in, and the ones to give up
     std::vector<size_t> trade_at_;   ///< per trade number: how many of its pairs follow() has taken
