@@ -405,7 +405,8 @@ __global__ void __launch_bounds__(AT_THREADS) attn_kernel(AttnArgs a) {
         }
         __syncthreads();
 
-        // the values: a thread a dimension, every row; the tile's weights are read four rows a time
+        // the values: a thread a dimension, every row; the tile's weights are read four rows a time when a key's R
+        // of them stay 16-byte aligned (TQ 4 and 8; TQ 2's 6 put every other key's 8 bytes off), else one at a time
 #pragma unroll
         for (int r = 0; r < R; ++r) acc[r] *= As[r];
         for (int j = 0; j < AT_KEYS; ++j) {
@@ -416,13 +417,14 @@ __global__ void __launch_bounds__(AT_THREADS) attn_kernel(AttnArgs a) {
             const float v = live ? cache_value<VQ8>(a.vc, a.vq, base) : 0.0f;
             const float* pr = Ps + j * R;
             int r = 0;
-            for (; r + 4 <= R; r += 4) {
-                const float4 w = *reinterpret_cast<const float4*>(pr + r);
-                acc[r] += w.x * v;
-                acc[r + 1] += w.y * v;
-                acc[r + 2] += w.z * v;
-                acc[r + 3] += w.w * v;
-            }
+            if constexpr (R % 4 == 0)
+                for (; r < R; r += 4) {
+                    const float4 w = *reinterpret_cast<const float4*>(pr + r);
+                    acc[r] += w.x * v;
+                    acc[r + 1] += w.y * v;
+                    acc[r + 2] += w.z * v;
+                    acc[r + 3] += w.w * v;
+                }
             for (; r < R; ++r) acc[r] += pr[r] * v;
         }
         __syncthreads();

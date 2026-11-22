@@ -2283,6 +2283,10 @@ int main(int argc, char** argv) {
         {"attend full fp16 split, room, 1 token at 0", 0, 0, true, {1, 16, 17}, true, true, true, 1},
         {"attend full fp16 unsplit", 0, 0, false, {7, 1}, false, false, true, 1},
         {"attend full fp16 unsplit, 1 token at 0", 0, 0, false, {1, 3, 2, 17}, false, false, true, 1},
+        // 2 and 3 tokens unsplit: attn_kernel's TQ 2, whose 6 rows of weights a key are not a whole float4
+        {"attend full q8_0 unsplit, 2 and 3 tokens", 0, 0, true, {40, 3, 2, 3}, false, false, true, 1},
+        {"attend swa fp16 ring unsplit, 2 and 3 tokens", 1024, 1024 + 1100, false, {1100, 3, 2}, false, false, true,
+         37},
         {"attend full fp16 prompt >1024", 0, 0, false, {1100, 7, 1}, true, false, true, 23},
         {"attend full fp16 prompt, room", 0, 0, false, {1300, 1, 7}, true, true, true, 41},
         {"attend full q8_0", 0, 0, true, {1050, 1, 7}, true, false, true, 37},
