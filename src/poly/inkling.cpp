@@ -205,9 +205,7 @@ void Inkling::load_geometry() {
     // STRATA_POLY_WIDE_READ=N: a read of several calls takes N tokens a call (Engine::wide_rows_).  Opt-in: larger
     // calls split some sums another way, so other bits.
     if (const char* e = std::getenv("STRATA_POLY_WIDE_READ")) wide_rows_ = std::max(std::atoi(e), 0);
-#if !defined(STRATA_USE_HIP)
-    lane_slots_ = true;       // the cached experts' launches through MmvqSlots::lanes' kernels (measured on CUDA)
-#endif
+    lane_slots_ = true;       // the cached experts' launches through MmvqSlots::lanes' kernels (measured on CUDA and HIP)
     situ_ = Situ{shape_f("activation.situ_beta"), shape_f("activation.situ_linear_beta")};
     need(situ_->beta > 0.f, "bad activation.situ_beta");
     const MetaValue* real = find("vocab_size_unpadded");
