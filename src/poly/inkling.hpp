@@ -57,6 +57,12 @@ protected:
     int head_key(int il, int n) const override;
     /// A call's visits are recorded only as one, when its routed experts are all on the card (Engine::run()).
     bool layer_graphs() const override { return false; }
+    /// An expert is worth its uses, whatever its size.  Outside VRAM a use reads all of its bytes from RAM, so the
+    /// CPU's time for it grows with its size: one twice the size and as often used saves about what two of half its
+    /// size save in the same room.  The IQ4_NL file's last 4 layers have Q8_0 experts, 1.9 times the size of the
+    /// others: ranked by uses per byte, 4 of their 512 were in VRAM on an 8 GB card, and those layers ran 7 of their
+    /// 8 experts a token on the CPU.
+    bool experts_by_uses() const override { return true; }
     /// A window of guesses is routed on the card (Engine::moe_card()) with every expert in VRAM, so that it is
     /// recorded as one too: --window 5 to 8 have more rows than kSumRows.
     bool windows_on_card() const override { return true; }

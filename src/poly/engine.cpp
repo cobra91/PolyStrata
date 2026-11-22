@@ -2087,7 +2087,7 @@ void Engine::fill_expert_cache() {
         for (int e = 0; e < n_expert_; ++e) {
             const size_t i = (size_t) il * n_expert_ + e;
             const double used = (double) ((prior_.empty() ? 0 : prior_[i]) + use_[i]);
-            cands.push_back({il, e, bytes, used / (double) bytes});
+            cands.push_back({il, e, bytes, experts_by_uses() ? used : used / (double) bytes});
             all += bytes;
         }
     }
@@ -2605,7 +2605,7 @@ int Engine::grow_cache(size_t bytes, bool later) {
             const size_t i = (size_t) il * n_expert_ + e;
             if (L.slot[(size_t) e] || (!coming_.empty() && coming_[i])) continue;
             const double used = (double) ((prior_.empty() ? 0 : prior_[i]) + use_[i]);
-            cands.push_back({il, e, used / (double) L.slot_bytes});
+            cands.push_back({il, e, experts_by_uses() ? used : used / (double) L.slot_bytes});
         }
     }
     if (cands.empty()) return 0;
