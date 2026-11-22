@@ -1267,8 +1267,9 @@ void Inkling::spark_store(const SparkLayer& D, const float* k, const float* v, i
 void Inkling::spark_rows(int64_t pos, int n, const float* const* x, const int64_t* stride) {
     const int E = n_embd_;
     const int64_t last = pos + n - 1, ring = s_block_ + 1;
-    for (int c0 = 0; c0 < n; c0 += kSparkRows) {
-        const int m = std::min(kSparkRows, n - c0);
+    const int chunk = std::min(rows_, kSparkRows);   // the rows s_ctx_ holds (alloc())
+    for (int c0 = 0; c0 < n; c0 += chunk) {
+        const int m = std::min(chunk, n - c0);
         InklingFuse f;
         for (int k = 0; k < 4; ++k) {
             f.x[k] = x[k] + (size_t) c0 * stride[k];
