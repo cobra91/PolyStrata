@@ -15,7 +15,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cmath>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -25,6 +24,7 @@ namespace strata::poly {
 namespace {
 
 constexpr int WARP = 32;
+constexpr int kDevices = 64;   // the devices a setting or answer of the card's is kept for
 
 inline cudaStream_t cs(void* stream) { return (cudaStream_t) stream; }
 inline int grid(size_t n, int block) { return int((n + block - 1) / block); }
@@ -3018,35 +3018,45 @@ void inkling_conv_in(const InklingConvIn& c, int n, void* stream) {
 size_t inkling_mix_conv_work_bytes() { return sizeof(MixSpreadWork); }
 
 namespace {
-// The blocks of mix_spread_kernel the current card holds at once (the least over its SUMs): a launch's blocks wait
-// for each other in grid_meet(), so a launch takes no more than these.  Other streams' kernels on the card can only
-// delay its blocks, as they run to their end without them.  None on HIP: there the blocks' meetings cost more than
-// the one block a mix did (an RX 9070 XT wrote Inkling 2 Mini UD-Q2_K_XL at 74.1 tok/s spread, 80.1 in one block,
-// after a 286-token prompt; the same bits).
+// The blocks of mix_spread_kernel a launch on the current card can take (the least over its SUMs, times the card's
+// multiprocessors), or -1 where it has no cooperative launch.  A launch's blocks wait for each other in grid_meet(),
+// so it goes out as a cooperative one, which the runtime starts with all of its blocks on the card together (beside
+// other streams' kernels, in an MPS client's or a green context's share of the card) or refuses; refused, it is the
+// one block a mix.  None on HIP: there the blocks' meetings cost more than the one block a mix did (an RX 9070 XT
+// wrote Inkling 2 Mini UD-Q2_K_XL at 74.1 tok/s spread, 80.1 in one block, after a 286-token prompt; the same bits).
+// STRATA_INKLING_MIX_SPREAD=0: none anywhere (the same bits).
 int spread_room() {
 #if defined(__HIPCC__)
     return -1;
-#endif
-    static std::mutex mu;
-    static std::vector<int> rooms;   // a device's, 0: not yet asked
+#else
+    static const bool off = [] {
+        const char* v = std::getenv("STRATA_INKLING_MIX_SPREAD");
+        return v != nullptr && std::string(v) == "0";
+    }();
+    if (off) return -1;
+    static std::atomic<int> rooms[kDevices] = {};   // a device's, 0: not yet asked
     int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess) return 0;
-    const std::lock_guard<std::mutex> lock(mu);
-    if (rooms.size() <= size_t(dev)) rooms.resize(size_t(dev) + 1, 0);
-    if (!rooms[dev]) {
-        int sms = 0, least = INT_MAX;
-        for (const void* k : {(const void*) mix_spread_kernel<0>, (const void*) mix_spread_kernel<128>,
-                              (const void*) mix_spread_kernel<256>, (const void*) mix_spread_kernel<512>,
-                              (const void*) mix_spread_kernel<1024>}) {
-            int per_sm = 0;
-            if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k, MIX_SPREAD, 0) != cudaSuccess) per_sm = 0;
-            least = std::min(least, per_sm);
-        }
-        if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) sms = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kDevices) {
         cudaGetLastError();
-        rooms[dev] = least * sms > 0 ? least * sms : -1;   // -1: none
+        return -1;
     }
-    return rooms[dev];
+    int room = rooms[dev].load(std::memory_order_relaxed);
+    if (room) return room;
+    int sms = 0, coop = 0, least = INT_MAX;
+    for (const void* k : {(const void*) mix_spread_kernel<0>, (const void*) mix_spread_kernel<128>,
+                          (const void*) mix_spread_kernel<256>, (const void*) mix_spread_kernel<512>,
+                          (const void*) mix_spread_kernel<1024>}) {
+        int per_sm = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k, MIX_SPREAD, 0) != cudaSuccess) per_sm = 0;
+        least = std::min(least, per_sm);
+    }
+    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) sms = 0;
+    if (cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev) != cudaSuccess) coop = 0;
+    cudaGetLastError();
+    room = coop && least * sms > 0 ? least * sms : -1;
+    rooms[dev].store(room, std::memory_order_relaxed);
+    return room;
+#endif
 }
 }  // namespace
 
@@ -3084,21 +3094,28 @@ void inkling_mix_conv(const InklingMix* mixes, int count, const InklingConvIn* c
     }
     const cudaStream_t st = cs(stream);
     const int blocks = (threads + MIX_SPREAD - 1) / MIX_SPREAD;   // a mix's, spread
-    if (work && count * blocks <= spread_room()) {
+    // the norms' sums read every block's states after the outputs are written: spread only where no output is a state
+    bool apart = true;
+    for (int k = 0; k < count; ++k)
+        for (int q = 0; q < mixes[k].n_query; ++q)
+            for (int j = 0; j < count; ++j)
+                for (int i = 0; i < mixes[j].n_state; ++i) apart = apart && mixes[k].out[q] != mixes[j].state[i];
+    if (work && apart && count * blocks <= spread_room()) {
         auto* wk = static_cast<MixSpreadWork*>(work);
-        const auto spread = [&](auto kernel) {
-            kernel<<<count * blocks, MIX_SPREAD, 0, st>>>(mp, c, nr, n, eps, blocks, wk);
-        };
+        const void* kernel = nullptr;
         switch (norm ? norm->threads : 0) {
-            case 0: spread(mix_spread_kernel<0>); break;
-            case 128: spread(mix_spread_kernel<128>); break;
-            case 256: spread(mix_spread_kernel<256>); break;
-            case 512: spread(mix_spread_kernel<512>); break;
-            case 1024: spread(mix_spread_kernel<1024>); break;
+            case 0: kernel = (const void*) mix_spread_kernel<0>; break;
+            case 128: kernel = (const void*) mix_spread_kernel<128>; break;
+            case 256: kernel = (const void*) mix_spread_kernel<256>; break;
+            case 512: kernel = (const void*) mix_spread_kernel<512>; break;
+            case 1024: kernel = (const void*) mix_spread_kernel<1024>; break;
             default: throw std::invalid_argument("inkling_mix_conv: norms of 128, 256, 512 or 1024 threads");
         }
-        check_launch("inkling_mix_conv");
-        return;
+        int blocks0 = blocks;
+        void* args[] = {&mp, (void*) &c, &nr, &n, &eps, &blocks0, &wk};
+        if (cudaLaunchCooperativeKernel(kernel, dim3(count * blocks), dim3(MIX_SPREAD), args, 0, st) == cudaSuccess)
+            return;
+        cudaGetLastError();   // not all of its blocks at once: the one block a mix
     }
     switch (norm ? norm->threads : 0) {
         case 0: mix_conv_kernel<0><<<count, threads, 0, st>>>(mp, c, nr, n, eps); break;

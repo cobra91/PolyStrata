@@ -1643,8 +1643,9 @@ void test_norm_rows(int count) {
 
 // One token's mixes with a post-convolution before them (inkling_mix_conv(), inkling_conv_in()) against
 // moe_sum() into a zeroed buffer, the copy, inkling_conv() / inkling_conv_acc() and inkling_mix() of each; and the
-// launch with its work spread over many blocks against the one block a mix.  Each runs `reps` tokens in a row
-// (the convolution's state and the stream carried on, the spread launches' meeting place reused).
+// launch with its work spread over many blocks against the one block a mix, and the spread launch recorded in a graph
+// as the engine's whole-token graph records it.  Each runs `reps` tokens in a row (the convolution's state and the
+// stream carried on, the spread launches' meeting place reused).
 // nb: the blocks before the stream in the first mix; the stream (acc) is its last state.
 struct MixConvCase {
     const char* name;
@@ -1686,7 +1687,7 @@ void test_mix_conv(const MixConvCase& tc) {
         std::vector<float*> s;
         float *state, *fo, *out[8], *ny[4];
         void* nq[4];
-    } side[3];   // the calls, the one-block launch, the spread one
+    } side[4];   // the calls, the one-block launch, the spread one, the spread one recorded
     for (Side& d : side) {
         for (const auto& h : hs) d.s.push_back(up(h));
         d.state = up(hst);
@@ -1749,12 +1750,39 @@ void test_mix_conv(const MixConvCase& tc) {
             inkling_mix_conv(m, count, tc.conv ? &c : nullptr, n, 1e-6f, st, tc.norm ? &nm : nullptr, work);
         }
     };
+    cudaGraphExec_t rec = nullptr;
+    const char* recorded = "";
+    {
+        cudaGraph_t made;
+        ck(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "capture");
+        fused(side[3], mix_work);
+        ck(cudaStreamEndCapture(st, &made), "capture");
+#if !defined(__HIPCC__)
+        // whether the recording holds the spread launch (MIX_SPREAD threads a block, more blocks than mixes)
+        size_t count = 0;
+        ck(cudaGraphGetNodes(made, nullptr, &count), "nodes");
+        std::vector<cudaGraphNode_t> nodes(count);
+        ck(cudaGraphGetNodes(made, nodes.data(), &count), "nodes");
+        recorded = ", recorded one block a mix";
+        for (cudaGraphNode_t node : nodes) {
+            cudaGraphNodeType type;
+            cudaKernelNodeParams kp{};
+            if (cudaGraphNodeGetType(node, &type) == cudaSuccess && type == cudaGraphNodeTypeKernel &&
+                cudaGraphKernelNodeGetParams(node, &kp) == cudaSuccess && kp.blockDim.x == 32 && kp.gridDim.x > 2)
+                recorded = ", recorded spread";
+        }
+#endif
+        ck(cudaGraphInstantiateWithFlags(&rec, made, 0), "instantiate");
+        cudaGraphDestroy(made);
+    }
     for (int r = 0; r < tc.reps; ++r) {
         calls(side[0]);
         fused(side[1], nullptr);
         fused(side[2], mix_work);
+        ck(cudaGraphLaunch(rec, st), "replay");
     }
     ck(cudaStreamSynchronize(st), "mix conv");
+    cudaGraphExecDestroy(rec);
     const auto differ = [&](const Side& a, const Side& b) {
         size_t diff = bytes_differ(a.state, b.state, size_t(n) * 12);
         for (size_t k = 0; k < hs.size(); ++k) diff += bytes_differ(a.s[k], b.s[k], size_t(n) * 4);
@@ -1766,11 +1794,11 @@ void test_mix_conv(const MixConvCase& tc) {
         }
         return diff;
     };
-    const size_t one = differ(side[0], side[1]), spread = differ(side[1], side[2]);
-    std::printf("%-58s %zu | %zu bytes differ  %s\n",
-                (std::string("mix conv ") + tc.name + ", n " + std::to_string(n)).c_str(), one, spread,
-                one + spread ? "FAIL" : "ok");
-    if (one + spread) ++failures;
+    const size_t one = differ(side[0], side[1]), spread = differ(side[1], side[2]), rd = differ(side[2], side[3]);
+    std::printf("%-58s %zu | %zu | %zu bytes differ  %s%s\n",
+                (std::string("mix conv ") + tc.name + ", n " + std::to_string(n)).c_str(), one, spread, rd,
+                one + spread + rd ? "FAIL" : "ok", tc.alone ? "" : recorded);
+    if (one + spread + rd) ++failures;
     for (Side& d : side) {
         for (float* p : d.s) cudaFree(p);
         cudaFree(d.state), cudaFree(d.fo);

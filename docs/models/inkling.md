@@ -90,7 +90,9 @@ that holds only some of the experts, as the 8 GB one above, runs as before.
 A token's launches are fewer too, on every card: a visit's norms and Q8_1 copies, the cache store and its clip, the
 attention's gate and the mixes around it go in fewer kernels that write the same bits as the separate ones (the
 kernel test compares them). With UD-Q2_K_XL on the RTX 3090 a token took 890 kernels on the card instead of 1,391
-(nsys, every expert in VRAM).
+(nsys, every expert in VRAM). On CUDA a token's mixes are spread over many blocks in a cooperative launch, which the
+runtime starts with all of its blocks on the card together, or else they run one block a mix;
+`STRATA_INKLING_MIX_SPREAD=0` keeps them one block a mix, with the same bits.
 
 IQ4_NL's speed depends on its expert profile (`--expert-profile`, which the server keeps up to date): it chooses the
 experts the card holds. On 100 questions (50 GSM8K, 50 MMLU-Pro, greedy, medium reasoning) IQ4_NL got 49 and 44
