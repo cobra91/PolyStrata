@@ -2151,6 +2151,20 @@ void Engine::fill_expert_cache() {
         L.slot[e] = s;
         ++cached_;
     }
+    // With the split held still for a comparison (STRATA_FREEZE_EXPERTS, STRATA_GPU_EXPERTS): which experts the cache
+    // holds, an FNV-1a hash of its (layer, expert) pairs.  Experts of several sizes are taken past one that does not
+    // fit, so two runs can cache the same number of experts but not the same ones, and their sums then differ.
+    if (freeze_experts_asked_) {
+        uint64_t h = 14695981039346656037ULL;
+        int n = 0;
+        for (size_t il = 0; il < layers_.size(); ++il)
+            for (size_t e = 0; e < layers_[il].slot.size(); ++e)
+                if (layers_[il].slot[e]) {
+                    for (const size_t v : {il, e}) h = (h ^ (uint32_t) v) * 1099511628211ULL;
+                    ++n;
+                }
+        std::fprintf(stderr, "strata-poly: cache set %d experts fnv %016llx\n", n, (unsigned long long) h);
+    }
 #if defined(STRATA_GPU_METAL)
     if (opt_.metal_balanced) {
         if (arena + 256 > exp_at_) {

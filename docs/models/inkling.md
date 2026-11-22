@@ -399,7 +399,11 @@ To compare two builds byte for byte with the experts on the card, give both the 
 same copy of the expert profile: each build's cache holds the same N experts for the whole run, frozen, whatever VRAM
 the build leaves free. Without it the two builds' caches often differ by a few experts (a build that records more
 launches leaves less VRAM), and so do their logits. Pick an N a little below what the smaller build caches on its own
-(`poly_logits_dump`'s `N of 3072 experts cached` line, `strata-poly`'s `N of 3072 routed experts in VRAM`); one that does not fit stops the load with an error.
+(`poly_logits_dump`'s `N of 3072 experts cached` line, `strata-poly`'s `N of 3072 routed experts in VRAM`); one that
+does not fit stops the load with an error. With either knob set the load also logs `cache set N experts fnv <hash>`,
+which experts the cache holds: equal counts are not equal sets (UD-Q2_K_XL's experts come in seven sizes and the cache
+takes smaller ones past one that does not fit: 1,640 of them can be any of three sets within 2.5 MiB of cache), so
+compare the hash, not the count.
 
 ## Known differences
 
