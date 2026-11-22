@@ -1744,6 +1744,9 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
 #if !defined(STRATA_GPU_METAL)
         if (inkling) Inkling::split_layers(file, n_layer, keep_lo, keep_hi);
 #endif
+        // its drafter reads visits of every card's (Inkling::drafter_rows())
+        if (inkling && !o.draft_model.empty() && o.draft && o.window != 1)
+            throw std::runtime_error("Inkling 2: the DSpark drafter (--draft-model) is not for --layer-split");
         int was = 0;
         ck(cudaGetDevice(&was), "cudaGetDevice");
         starts = layer_starts(o.layer_split, file, n_layer, cards, keep_lo, keep_hi);
@@ -3295,7 +3298,8 @@ void Engine::alloc() {
         hn_ = state_ + rec_n_;
         h_guess_ = (Likeliest*) hmalloc(sizeof(Likeliest), "pinned memory");   // likeliest() writes it
     }
-    if (block_guess_) h_block_ = (Likeliest*) hmalloc((size_t) opt_.window * sizeof(Likeliest), "pinned memory");
+    if (block_guess_ || block_drafter_)
+        h_block_ = (Likeliest*) hmalloc((size_t) std::max(opt_.window, 1) * sizeof(Likeliest), "pinned memory");
     // window(): the state after tokens of it, for keep(), and every token's logits
     snap_places_ = snaps_spread() ? std::min(opt_.window - 1, kSnapPlaces) : opt_.window - 1;
     if (snap_places_ > 0)
@@ -3515,13 +3519,13 @@ void Engine::save_state(uint8_t* dst) {
     ck(cudaStreamSynchronize(cs(st_)), "save state");
     for (int il = 0; il < (int) layers_.size(); ++il)
         if (runs(il)) save_layer(il, pos_, dst);
-    save_last(dst);
+    save_last(dst, pos_);
     if (next_) next_->save_state(dst + card_state_bytes());
 }
 
 // What the state has that is no layer's: the model's output for the last token, which the draft block pairs the
 // next one with.  It lies behind the layers' state.
-void Engine::save_last(uint8_t* dst) {
+void Engine::save_last(uint8_t* dst, int64_t) {
     if (!draft_) return;
     ck(cudaMemcpy(dst + rec_n_ * sizeof(float), hn_, (size_t) n_embd_ * sizeof(float), cudaMemcpyDeviceToHost),
        "save state");
@@ -5803,7 +5807,10 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
         if (want_logits) ck(cudaStreamSynchronize(cs(st_)), "eval");
     }
     // behind the logits: the caller has them while the card does this
-    if (draft_) draft_rows(tokens, ahead_pos_ == pos_ && tokens[0] == ahead_tok_ ? 1 : 0, n);
+    if (draft_) {
+        drafter_rows(pos_, n, hn_ + n_embd_);
+        draft_rows(tokens, ahead_pos_ == pos_ && tokens[0] == ahead_tok_ ? 1 : 0, n);
+    }
     pos_ += n;
     stats_.tokens += n;
 }
@@ -5980,6 +5987,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
                     layer(il, call.m);
                 } else {
                     output_rows(0, call.m, hn_ + n_embd_);
+                    drafter_rows(pos_, call.m, hn_ + n_embd_);
                     draft_rows(tokens + call.at, ahead_pos_ == pos_ && tokens[call.at] == ahead_tok_ ? 1 : 0, call.m);
                     ++read_draft_calls_;
                 }
@@ -5989,7 +5997,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
                     if (il < n_layer_) save_layer(il, pos, state);
                     if (k == turns - 1) {   // what no turn is for: a layer behind the model's, the last output
                         for (int j = n_layer_; j < (int) layers_.size(); ++j) save_layer(j, pos, state);
-                        save_last(state);
+                        save_last(state, pos);
                     }
                 }
                 // The card's work on the next call starts now.  This call's rows leave beside it, unless this was
@@ -6093,6 +6101,7 @@ void Engine::window(const int32_t* tokens, int t) {
     }
     float* h = draft_ ? hn_ + n_embd_ : xn_;
     output_rows(0, t, h);
+    if (draft_) drafter_rows(pos_, t, h);
     lin(output_, h, wlogits_, t);
     finish_logits(wlogits_, t);
     ck(cudaMemcpyAsync(h_wlogits_, wlogits_, (size_t) t * n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost, cs(st_)),
@@ -6261,6 +6270,11 @@ int32_t Engine::draft(int32_t token, int i, float* prob) {
     if (!draft_ && !block_guess_) throw std::logic_error("draft: this model has no block that guesses ahead");
     if (token < 0 || token >= n_vocab_) throw std::runtime_error("a token id is outside the vocabulary");
     if (i < 0 || pos_ + i >= opt_.max_context) throw std::logic_error("draft: the position is outside the context");
+    if (block_drafter_) {
+        if (i == 0) block_n_ = draft_block(token, opt_.window - 1, h_block_);
+        *prob = i < block_n_ ? h_block_[i].prob : 0.f;
+        return i < block_n_ ? h_block_[i].token : 0;
+    }
     if (block_guess_) {
         if (i == 0) guess_block(token);
         *prob = i < block_n_ ? h_block_[i].prob : 0.f;

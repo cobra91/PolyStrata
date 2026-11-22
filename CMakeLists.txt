@@ -2209,6 +2209,18 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   target_link_libraries(poly_logits_dump PRIVATE strata_poly_mmq strata_poly_cpu strata_kernels strata_spec
                                                 ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target}
                                                 ${_strata_poly_driver})
+  # Inkling 2 Mini's DSpark drafter against llama.cpp's on llama.cpp's own inputs (a record of its run); needs the
+  # model files and a card, so it is run by hand: poly_dspark_parity MODEL.gguf DRAFTER.gguf RECORD
+  add_executable(poly_dspark_parity src/poly/dspark_parity.cpp src/poly/engine.cpp src/poly/glm5next.cpp
+                                    src/poly/qwen35.cpp src/poly/gemma4.cpp src/poly/deepseek4.cpp
+                                    src/poly/lfm2moe.cpp src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/inkling.cpp
+                                    src/poly/kernels.cu src/poly/kernels_dsv4.cu src/poly/kernels_inkling.cu
+                                    src/core/conversation_memory.cpp)
+  target_include_directories(poly_dspark_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                                       ${_strata_gpu_include_directories})
+  target_link_libraries(poly_dspark_parity PRIVATE strata_poly_mmq strata_poly_cpu strata_kernels strata_spec
+                                                  ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target}
+                                                  ${_strata_poly_driver})
   # a prompt batch's routing on the card against the hosts' routing; needs a card, so it is run by hand
   add_executable(poly_route_test src/poly/route_test.cu src/poly/kernels.cu)
   target_include_directories(poly_route_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include

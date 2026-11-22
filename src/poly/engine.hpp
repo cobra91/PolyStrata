@@ -317,7 +317,9 @@ public:
     /// saved (Clover on an 8 GB laptop wrote 57.7 tokens/s after a 32K prompt with its guesses, 61.6 without).
     bool drafts() const { return next_ ? next_->drafts() : draft_ || (block_guess_ && all_cached()); }
     /// The guesses of a window come out of draft(token, 0, &p) together: asking for one more costs nothing.
-    bool guesses_at_once() const { return next_ ? next_->guesses_at_once() : block_guess_; }
+    bool guesses_at_once() const {
+        return next_ ? next_->guesses_at_once() : block_guess_ || block_drafter_;
+    }
     /// Test only: the calls read()'s layer-major path gave the draft block's rows (draft_rows()) on the card that has
     /// the block, since load.  Two or more in one read are back-to-back refills of its pinned input rows.
     int64_t read_draft_calls_for_test() const { return next_ ? next_->read_draft_calls_for_test() : read_draft_calls_; }
@@ -421,6 +423,15 @@ protected:
     /// model's output for the token before pos(); the second is this step's to leave and the next step's to read.
     /// The engine's own runs the draft block.
     virtual void draft_step(int32_t token, int i);
+    /// A drafter that guesses a window's tokens in one pass (block_drafter_): up to `most` guesses after `token` at
+    /// pos() into out, and how many it made.
+    virtual int draft_block(int32_t token, int most, Likeliest* out) {
+        (void) token, (void) most, (void) out;
+        return 0;
+    }
+    /// After a call of the model: its n rows from position pos are in r_, and h holds their outputs, normed.  A
+    /// drafter that reads the model's rows takes them here.
+    virtual void drafter_rows(int64_t pos, int n, const float* h) { (void) pos, (void) n, (void) h; }
     /// The floats of every recurrent layer's state together.  They are state_'s first.
     virtual size_t recurrent_floats() const = 0;
     /// Whether the recurrent layers leave their state after any tokens of a call, and not only after its first
@@ -613,7 +624,9 @@ protected:
     bool pick_way(int t);
     void took_way(int t, double ms);
     void layer(int il, int n);
-    void save_last(uint8_t* dst);
+    /// After the layers' state at position pos: what is no layer's (the model's output for the last token, with a
+    /// draft block).
+    virtual void save_last(uint8_t* dst, int64_t pos);
     /// L: the layer as it runs (for a layer with Layer::alias its own, not its experts' layer).
     void moe_router(const Layer& L, int n);
     /// The routed experts of layer il as it runs: its Layer::alias's when it has one.
@@ -812,6 +825,7 @@ protected:
     bool draft_ = false;
     bool block_layer_ = false;    ///< what guesses ahead is a block after the model's layers (layers_' last)
     bool block_guess_ = false;    ///< the model guesses a window's tokens itself, in a block (block_mask())
+    bool block_drafter_ = false;  ///< the architecture's drafter guesses a window's tokens in one pass (draft_block())
     bool block_pass_ = false;     ///< the call under way is that block: its tokens see each other, no state changes
     Likeliest* h_block_ = nullptr;   ///< the block's guesses and their probabilities, pinned
     int block_n_ = 0;                ///< how many it holds

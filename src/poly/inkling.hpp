@@ -60,8 +60,8 @@ protected:
     /// A window of guesses is routed on the card (Engine::moe_card()) with every expert in VRAM, so that it is
     /// recorded as one too: --window 5 to 8 have more rows than kSumRows.
     bool windows_on_card() const override { return true; }
-    int widest() const override { return std::max(n_head_ * head_dim_, 2 * n_embd_); }
-    int streams() const override { return kStreams; }
+    int widest() const override { return std::max({n_head_ * head_dim_, 2 * n_embd_, s_ff_}); }
+    int streams() const override { return kStreams + (spark_ ? kTaps : 0); }
     void layer_head(Layer& L, int il, int n) override;
     void layer_tail(Layer& L, int il, int n) override;
     void output_rows(int first, int rows, float* h) override;
@@ -76,8 +76,12 @@ protected:
     void finish_logits(float* logits, int rows) override;
     void shift_rows(ptrdiff_t by) override;
     size_t extra_bytes() const override;
+    void load_drafter() override;
+    void drafter_rows(int64_t pos, int n, const float* h) override;
+    int draft_block(int32_t token, int most, Likeliest* out) override;
     void save_layer(int il, int64_t pos, uint8_t* dst) override;
     void load_extra(const uint8_t* src, int64_t pos) override;
+    void save_last(uint8_t* dst, int64_t pos) override;
     const Names* tensor_alias(const char* name) const override;
     const Names* meta_alias(const char* key) const override;
     int physical(int v) const override { return phys_of(v); }
@@ -86,7 +90,8 @@ private:
     /// The residual streams of a token in r_, n_embd_ floats each: the stream itself, the four blocks' starts
     /// (the normed embedding, layer 5's output, layer 11's of this pass, layer 17's of the last pass), and what
     /// the pass before left for the messages (its layer 11's and 17's outputs).
-    enum Stream { kCur = 0, kBlock0 = 1, kBank = 5, kBankOut = 6, kStreams = 7 };
+    /// With the drafter, three more: the streams entering the visits it reads (kTap0 on).
+    enum Stream { kCur = 0, kBlock0 = 1, kBank = 5, kBankOut = 6, kStreams = 7, kTap0 = 7, kTaps = 3 };
 
     /// A visit's weights (its physical layer's: a later visit has the first one's pointers) and its caches.
     struct Block {
@@ -183,6 +188,51 @@ private:
     bool unsloth_ = false;
     void* msg_mem_ = nullptr;              ///< that layout's message queries, a core layer's [2304, 4] each
     static constexpr int kFusedRows = 16;  ///< the most tokens the controllers' and the router's fused kernels take
+
+    // ---- the DSpark drafter: --draft-model, a "dflash" file (inkling.cpp) ----
+    /// A layer of the drafter: dense, pre-norm, its attention's keys and values of the model's rows (k_ctx, v_ctx)
+    /// and of the block's own in one cache, a row a position (a ring of d_ring_ rows in a window layer).
+    struct SparkLayer {
+        bool swa = false;
+        Dev attn_norm, wq, wk, wv, wo, q_norm, k_norm, k_ctx, v_ctx, k_ctx_norm, ctx_norm, ffn_norm, gate, up, down;
+        uint16_t* k = nullptr;
+        uint16_t* v = nullptr;
+    };
+    void load_spark_shape();
+    size_t spark_row() const { return (size_t) s_kv_ * s_dim_ * sizeof(uint16_t); }   ///< a key's or a value's row
+    size_t spark_extra() const;
+    template <class F>
+    void spark_window(int64_t pos, F&& f) const;
+    void spark_store(const SparkLayer& D, const float* k, const float* v, int64_t pos, int n);
+    void spark_rows(int64_t pos, int n, const float* const* x, const int64_t* stride);
+    int spark_block(int32_t token, int64_t pos0, int most, Likeliest* out);
+    bool spark_ = false;
+    std::vector<SparkLayer> spark_layers_;
+    int taps_[kTaps] = {};        ///< the visits whose input streams it reads; the model's output is its fourth input
+    int s_head_ = 0, s_kv_ = 0, s_dim_ = 0, s_ff_ = 0, s_rank_ = 0, s_block_ = 0, s_window_ = 0, s_ring_ = 0;
+    float s_eps_ = 0, s_theta_ = 0, s_cap_ = 0;
+    float fuse_[4][4] = {};       ///< softmax(dspark_fuse): a row for each layer's context and one for the head's
+    Dev s_out_norm_, s_mask_, s_ctx_norm_, s_joint_, s_joint_b_, s_hout_, s_hout_b_;
+    const uint16_t* markov_ = nullptr;   ///< markov_w1 (BF16, rank a token), read in the file
+    float* s_ctx_[4] = {};               ///< a call's rows fused: each layer's context and the head's
+    float* s_rnn_ = nullptr;             ///< the head's context of the last s_block_ + 1 positions, a ring (seq_alloc)
+    float *s_x_ = nullptr, *s_xn_ = nullptr, *s_q_ = nullptr, *s_k_ = nullptr, *s_v_ = nullptr, *s_qr_ = nullptr,
+          *s_kr_ = nullptr, *s_att_ = nullptr, *s_g_ = nullptr, *s_u_ = nullptr, *s_cur_ = nullptr,
+          *s_base_ = nullptr, *s_bias_ = nullptr, *s_in_ = nullptr, *s_jo_ = nullptr, *s_state_ = nullptr,
+          *s_latent_ = nullptr, *s_corr_ = nullptr, *s_work_ = nullptr;
+    float* h_w1_ = nullptr;              ///< pinned: a markov_w1 row as floats, then a token's embedding
+    Likeliest* h_pick_ = nullptr;        ///< pinned: a slot's guess
+
+public:
+    /// Test only (poly_dspark_parity): the drafter takes n rows of the model from position pos as features (host,
+    /// a row the four inputs of inkling_dspark_fuse() one after the other), then guesses `most` tokens after
+    /// `token` at pos0 into tokens; logits gets each guess's scores (most rows of n_vocab_real() floats, host).
+    void spark_rows_for_test(int64_t pos, int n, const float* features);
+    int spark_block_for_test(int32_t token, int64_t pos0, int most, int32_t* tokens, float* logits);
+    /// Test only: a conversation's state at pos and its rows before pos saved (save_state(), save_rows()), the
+    /// drafter's caches zeroed, and the two loaded back, as a conversation cache's turn does.
+    void spark_reload_for_test(int64_t pos);
+    int n_vocab_real() const { return n_vocab_real_; }
 };
 
 }  // namespace strata::poly

@@ -26,6 +26,8 @@ int64_t of_layer(const MetaValue& v, int il) {
 
 const char* const kCtrl[4] = {"q", "k", "v", "ffn"};
 
+constexpr int kSparkRows = 256;   // the model's rows the DSpark drafter takes in a launch
+
 // Unsloth's files (architecture "inkling2", the loop in its metadata) name the loop's parts otherwise; byte for byte
 // they are the ggml-org file's: attn = q, mlp = ffn.
 const Names kTensorNames[] = {
@@ -129,6 +131,9 @@ void Inkling::split_layers(const Shards& file, int& n_layer, int& keep_lo, int& 
 }
 
 void Inkling::load_geometry() {
+    // --draft-model is the DSpark drafter here, a model of its own, not a file of this one with a block in it,
+    // which is what load_shape() would look for
+    std::unique_ptr<Shards> spark = std::move(dg_);
     load_shape();
     auto find = [&](const char* key) { return meta_in(*gg_, key); };
     auto need = [](bool ok, const char* what) {
@@ -204,8 +209,6 @@ void Inkling::load_geometry() {
     clamp_exp_.assign((size_t) n_layer_ + 1, INFINITY);
     clamp_shexp_ = clamp_exp_;
 
-    // Not supported yet: a draft model.
-    if (!opt_.draft_model.empty()) throw std::runtime_error("Inkling 2: --draft-model is not supported yet");
     // step()'s rows are a sequence's each, and the _seqs kernels take kInklingSeqRows of them a launch
     if (opt_.batch + 1 > kInklingSeqRows)
         throw std::runtime_error("Inkling 2: --batch takes at most " + std::to_string(kInklingSeqRows - 1));
@@ -218,10 +221,18 @@ void Inkling::load_geometry() {
     };
     lo_ = visit(lo_);
     if (end_ >= 0) end_ = visit(end_);
-    // The file has no block that guesses ahead, so a window's guesses come from the conversation's repeats
-    // (--lookup) only: opt-in with --window, a token at a time by default.
-    if (opt_.window == 0) opt_.window = 1;
+    // The file has no block that guesses ahead.  With the DSpark drafter (--draft-model) a window is the token and three
+    // of its guesses; without, the guesses come from the conversation's repeats (--lookup) only: opt-in with --window,
+    // a token at a time by default.
+    if (opt_.window == 0) opt_.window = spark ? 4 : 1;
     opt_.draft = false;
+    if (spark) {
+        if (opt_.batch > 0) throw std::runtime_error("Inkling 2: the DSpark drafter (--draft-model) is not for --batch");
+        dg_ = std::move(spark);
+        block_ = dg_.get();   // the file its tensors are read from (home())
+        load_spark_shape();
+        spark_ = draft_ = block_drafter_ = true;
+    }
     std::fprintf(stderr, "strata-poly: %s: %d layers, %d to %d run %d times: %d visits\n",
                  unsloth_ ? "inkling2 (looped)" : "inkling2_loop", n_phys_, core_start_, core_end_ - 1, n_passes_,
                  n_layer_);
@@ -382,6 +393,20 @@ void Inkling::alloc_caches() {
         mix_work_ = dmalloc(inkling_mix_conv_work_bytes(), "scratch");
         ck(cudaMemset(mix_work_, 0, inkling_mix_conv_work_bytes()), "scratch");
     }
+    // the drafter's: its window layers' rings, its other layer's rows, and the head's context of the last positions
+    if (spark_) {
+        const size_t row = (size_t) s_kv_ * s_dim_ * sizeof(uint16_t);
+        for (SparkLayer& D : spark_layers_) {
+            if (D.swa) {
+                D.k = (uint16_t*) seq_alloc((size_t) s_ring_ * row, "the drafter's cache");
+                D.v = (uint16_t*) seq_alloc((size_t) s_ring_ * row, "the drafter's cache");
+            } else {
+                D.k = (uint16_t*) kv_alloc(row, 1);
+                D.v = (uint16_t*) kv_alloc(row, 1);
+            }
+        }
+        s_rnn_ = (float*) seq_alloc((size_t) (s_block_ + 1) * n_embd_ * sizeof(float), "the drafter's cache");
+    }
     // the padded vocabulary's scores, which finish_logits() puts out of reach
     if (!neg_inf_ && n_vocab_ > n_vocab_real_) {
         const size_t pad_n = (size_t) (n_vocab_ - n_vocab_real_);
@@ -420,24 +445,50 @@ void Inkling::assign_scratch() {
     o_ = fbuf(e);
     awork_n_ = inkling_attend_work_floats(n_head_, head_dim_);
     awork_ = awork_n_ ? fbuf(awork_n_) : nullptr;
+    if (!spark_) return;
+    if (rows_ < s_block_)
+        throw std::runtime_error("Inkling 2: the DSpark drafter takes a block of " + std::to_string(s_block_) +
+                                 " rows: a prompt batch of fewer cannot hold it");
+    const size_t c = (size_t) std::min(rows_, kSparkRows), b = (size_t) s_block_, E = (size_t) n_embd_;
+    const size_t sq = (size_t) s_head_ * s_dim_, sk = std::max(b, c) * s_kv_ * s_dim_, r = (size_t) s_rank_;
+    for (float*& x : s_ctx_) x = fbuf(c * E);
+    s_x_ = fbuf(b * E);
+    s_xn_ = fbuf(b * E);
+    s_q_ = fbuf(b * sq);
+    s_qr_ = fbuf(b * sq);
+    s_k_ = fbuf(sk);
+    s_kr_ = fbuf(sk);
+    s_v_ = fbuf(sk);
+    s_att_ = fbuf(b * sq);
+    s_g_ = fbuf(b * s_ff_);
+    s_u_ = fbuf(b * s_ff_);
+    s_cur_ = fbuf(b * E);
+    s_base_ = fbuf((b - 1) * n_vocab_);
+    s_bias_ = fbuf((size_t) n_vocab_);
+    s_in_ = fbuf(2 * r + 2 * E);
+    s_jo_ = fbuf(3 * r);
+    s_state_ = fbuf(r);
+    s_latent_ = fbuf(r);
+    s_corr_ = fbuf(E);
+    s_work_ = fbuf(inkling_block_attend_work_floats(s_block_, s_head_, s_dim_));
 }
 
 // ---- the streams in r_ -----------------------------------------------------------------------------------------
 
 void Inkling::gather(int k, float* dst, int n, int first) {
-    const size_t e = (size_t) n_embd_ * sizeof(float), rs = e * kStreams;
-    ck(cudaMemcpy2DAsync(dst, e, r_ + (size_t) first * kStreams * n_embd_ + (size_t) k * n_embd_, rs, e, (size_t) n,
+    const size_t e = (size_t) n_embd_ * sizeof(float), rs = e * streams();
+    ck(cudaMemcpy2DAsync(dst, e, r_ + (size_t) first * streams() * n_embd_ + (size_t) k * n_embd_, rs, e, (size_t) n,
                          cudaMemcpyDeviceToDevice, cs(st_)),
        "streams");
 }
 
 void Inkling::scatter(int k, const float* src, int n) {
-    const size_t e = (size_t) n_embd_ * sizeof(float), rs = e * kStreams;
+    const size_t e = (size_t) n_embd_ * sizeof(float), rs = e * streams();
     ck(cudaMemcpy2DAsync(stream(k), rs, src, e, e, (size_t) n, cudaMemcpyDeviceToDevice, cs(st_)), "streams");
 }
 
 void Inkling::copy_stream(int from, int to, int n) {
-    const size_t e = (size_t) n_embd_ * sizeof(float), rs = e * kStreams;
+    const size_t e = (size_t) n_embd_ * sizeof(float), rs = e * streams();
     ck(cudaMemcpy2DAsync(stream(to), rs, stream(from), rs, e, (size_t) n, cudaMemcpyDeviceToDevice, cs(st_)),
        "streams");
 }
@@ -603,6 +654,15 @@ void Inkling::layer_head(Layer& L, int v, int n) {
         if (!direct) gather(kCur, res_, n);
     }
     dump("l_in", v, cres, n_embd_, n);
+    if (spark_)   // the drafter reads the stream entering this visit (drafter_rows()), the visit before's tail in it
+        for (int k = 0; k < kTaps; ++k) {
+            if (taps_[k] != v) continue;
+            flush();
+            if (direct) ck(cudaMemcpyAsync(stream(kTap0 + k), cres, e * sizeof(float), cudaMemcpyDeviceToDevice,
+                                           cs(st_)),
+                           "streams");
+            else scatter(kTap0 + k, res_, n);
+        }
     const int nb = blocks_before(ip);
     const float* bp[4];   // the blocks' starts
     for (int k = 0; k < nb; ++k) {
@@ -910,7 +970,10 @@ size_t Inkling::card_row_bytes() const {
     size_t layers = 0;
     for (const Block& B : blocks_)
         if (B.plane[0] && !B.swa) ++layers;
-    return layers * one;
+    size_t spark = 0;   // the drafter's: its full layers' keys and values
+    for (const SparkLayer& D : spark_layers_)
+        if (!D.swa) spark += 2 * spark_row();
+    return layers * one + spark;
 }
 
 void Inkling::save_card_rows(int64_t first, int64_t n, uint8_t* dst) {
@@ -926,6 +989,17 @@ void Inkling::save_card_rows(int64_t first, int64_t n, uint8_t* dst) {
             dst += (size_t) n * row;
         }
     }
+    // on st_: the drafter writes its rows of a call behind the call's logits (Engine::eval())
+    for (const SparkLayer& D : spark_layers_) {
+        if (D.swa || n == 0) continue;
+        for (const uint16_t* plane : {D.k, D.v}) {
+            ck(cudaMemcpyAsync(dst, (const uint8_t*) plane + (size_t) first * spark_row(), (size_t) n * spark_row(),
+                               cudaMemcpyDeviceToHost, cs(st_)),
+               "save rows");
+            dst += (size_t) n * spark_row();
+        }
+    }
+    if (spark_) ck(cudaStreamSynchronize(cs(st_)), "save rows");
 }
 
 void Inkling::load_card_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) {
@@ -941,6 +1015,14 @@ void Inkling::load_card_rows(const uint8_t* src, int64_t from, int64_t count, in
             src += (size_t) count * row;
         }
     }
+    for (const SparkLayer& D : spark_layers_) {
+        if (D.swa || n == 0) continue;
+        for (uint16_t* plane : {D.k, D.v}) {
+            h2d((uint8_t*) plane + (size_t) first * spark_row(), src + (size_t) (first - from) * spark_row(),
+                (size_t) n * spark_row());
+            src += (size_t) count * spark_row();
+        }
+    }
 }
 
 // What a window visit has of the sequence: the rows the next token attends, its planes one after the other.
@@ -950,7 +1032,7 @@ size_t Inkling::extra_bytes() const {
     size_t layers = 0;
     for (const Block& B : blocks_)
         if (B.swa) ++layers;
-    return layers * (size_t) keep_ * one;
+    return layers * (size_t) keep_ * one + spark_extra();
 }
 
 // A visit's convolution state at its place in state_, and a window visit's rows behind the window visits before it.
@@ -988,6 +1070,354 @@ void Inkling::load_extra(const uint8_t* src, int64_t pos) {
             src += (size_t) keep_ * one_row;
         }
     }
+    // the drafter's, behind the model's (save_last())
+    for (const SparkLayer& D : spark_layers_) {
+        if (!D.swa) continue;
+        for (uint16_t* plane : {D.k, D.v}) {
+            spark_window(pos, [&](size_t slot, size_t at, size_t m) {
+                h2d((uint8_t*) plane + at * spark_row(), src + slot * spark_row(), m * spark_row());
+            });
+            src += (size_t) s_window_ * spark_row();
+        }
+    }
+    if (spark_) h2d(s_rnn_, src, (size_t) (s_block_ + 1) * n_embd_ * sizeof(float));
+}
+
+// The drafter's part of the state: its window layers' rows of the window before pos, and the head's last contexts.
+size_t Inkling::spark_extra() const {
+    if (!spark_) return 0;
+    size_t rings = 0;
+    for (const SparkLayer& D : spark_layers_)
+        if (D.swa) rings += 2 * (size_t) s_window_ * spark_row();
+    return rings + (size_t) (s_block_ + 1) * n_embd_ * sizeof(float);
+}
+
+// The window before pos in a drafter's ring: f(place in the saved rows, row of the ring, rows) for each run.
+template <class F>
+void Inkling::spark_window(int64_t pos, F&& f) const {
+    for (int64_t p = std::max<int64_t>(0, pos - s_window_); p < pos;) {
+        const int64_t at = p % s_ring_, m = std::min<int64_t>(pos - p, s_ring_ - at);
+        f((size_t) (p - (pos - s_window_)), (size_t) at, (size_t) m);
+        p += m;
+    }
+}
+
+void Inkling::save_last(uint8_t* dst, int64_t pos) {
+    Engine::save_last(dst, pos);
+    if (!spark_) return;
+    dst += card_state_bytes() - spark_extra();
+    for (const SparkLayer& D : spark_layers_) {
+        if (!D.swa) continue;
+        for (const uint16_t* plane : {D.k, D.v}) {
+            std::memset(dst, 0, (size_t) s_window_ * spark_row());   // the places before the sequence's start
+            spark_window(pos, [&](size_t slot, size_t at, size_t m) {
+                ck(cudaMemcpyAsync(dst + slot * spark_row(), (const uint8_t*) plane + at * spark_row(),
+                                   m * spark_row(), cudaMemcpyDeviceToHost, cs(st_)),
+                   "save state");
+            });
+            dst += (size_t) s_window_ * spark_row();
+        }
+    }
+    ck(cudaMemcpyAsync(dst, s_rnn_, (size_t) (s_block_ + 1) * n_embd_ * sizeof(float), cudaMemcpyDeviceToHost,
+                       cs(st_)),
+       "save state");
+    ck(cudaStreamSynchronize(cs(st_)), "save state");
+}
+
+
+// ---- the DSpark drafter ----------------------------------------------------------------------------------------
+//
+// Inkling 2 Mini's own block drafter (unsloth/Inkling-2-Mini-GGUF's dspark-Inkling-2-Mini-*.gguf, architecture
+// "dflash"), as llama.cpp runs it in PR 32218 (88025eb): src/models/dspark.cpp graph_inkling2 and
+// common/speculative.cpp's draft-dspark.
+//
+// Every row the model computes - a prompt's, a token's, a window's with its wrong guesses - goes in at its position:
+// the streams entering visits 5, 23 and 41 and the normed output are mixed, a mix for each of the drafter's three
+// layers and one for its head (inkling_dspark_fuse()), and each layer keeps its mix's keys and values in its cache
+// at the row's position.  A wrong guess's row is written again when its position gets its real token, or by the
+// block, before anything reads it: the block reads its own positions and the ones before them.
+//
+// To guess, a block of eight rows at pos() .. pos() + 7 goes through the three layers: the token at pos() (picked
+// and not fed yet) as the model norms its embeddings, then seven copies of mask_embd.  Every row sees every row of
+// the block and the cached rows before it, a window layer's from pos() - 1024 on (the first row's window, for all).
+// The rows' outputs take the model's output matrix.  The guesses are rows 1, 2, ... in turn (row 0's is none): a
+// small recurrent state takes the guess before (its markov_w1 row), the row's output and the head's mix of the row
+// before pos(), and its correction goes through the output matrix again and onto the row's scores, which are capped
+// as the model's.  Each guess costs a product with the output matrix, and the block one more.
+
+void Inkling::load_spark_shape() {
+    const Shards& g = *dg_;
+    auto need = [&](bool ok, const std::string& what) {
+        if (!ok) throw std::runtime_error(opt_.draft_model + " is not a DSpark drafter of this model: " + what);
+    };
+    const MetaValue* arch = g.get("general.architecture");
+    need(arch && arch->s == "dflash" && g.find("dspark_hidden_out.weight"),
+         "not a dflash file with dspark_hidden_out.weight");
+    auto get = [&](const char* key) -> const MetaValue& {
+        const MetaValue* v = meta_in(g, key);
+        need(v != nullptr, std::string("no dflash.") + key);
+        return *v;
+    };
+    const int n = (int) get("block_count").u;
+    need(n > 0 && n <= 8 && (int) get("embedding_length").u == n_embd_, "its layers or width");
+    s_head_ = (int) get("attention.head_count").u;
+    s_kv_ = (int) get("attention.head_count_kv").u;
+    s_dim_ = (int) get("attention.key_length").u;
+    s_ff_ = (int) get("feed_forward_length").u;
+    need(s_dim_ == 128 && (int) get("attention.value_length").u == s_dim_ &&
+             (int) get("rope.dimension_count").u == s_dim_ && s_kv_ > 0 && s_head_ % s_kv_ == 0 && s_ff_ > 0,
+         "attention other than heads of 128 values, rotated whole");
+    s_block_ = (int) get("block_size").u;
+    // a block's queries of a key head go to inkling_block_attend() together
+    need(s_block_ >= 2 && s_block_ * (s_head_ / s_kv_) <= 32,
+         "a block of " + std::to_string(s_block_) + " rows");
+    need(get("attention.causal").u == 0 && get("sample_from_anchor").u == 0,
+         "a causal block, or one whose first row is a guess");
+    need((int) get("vocab_size").u == n_vocab_ && (int) get("vocab_size_unpadded").u == n_vocab_real_,
+         "another vocabulary");
+    s_eps_ = (float) get("attention.layer_norm_rms_epsilon").f;
+    s_cap_ = (float) get("final_logit_softcapping").f;
+    s_window_ = (int) get("attention.sliding_window").u;
+    s_theta_ = std::pow((float) get("rope.freq_base").f, -2.f / (float) s_dim_);
+    need(s_eps_ > 0.f && s_cap_ > 0.f && s_window_ > 0, "its norms' epsilon, softcap or window");
+    const MetaValue& targets = get("target_layers");
+    need(targets.items.size() == kTaps + 1 && (int) targets.items[kTaps].u == n_layer_,
+         "it reads other layers than three visits and the output");
+    for (int k = 0; k < kTaps; ++k) {
+        taps_[k] = (int) targets.items[(size_t) k].u;
+        need(taps_[k] > 0 && taps_[k] < n_layer_ && (k == 0 || taps_[k] > taps_[k - 1]), "its target layers");
+    }
+    const MetaValue& pattern = get("attention.sliding_window_pattern");
+    spark_layers_.assign((size_t) n, SparkLayer{});
+    for (int il = 0; il < n; ++il) spark_layers_[(size_t) il].swa = of_layer(pattern, il) != 0;
+    const TensorInfo* w1 = g.find("markov_w1.weight");
+    need(w1 && w1->type == kTypeBF16 && w1->shape.size() == 2 && (int64_t) w1->shape[1] == n_vocab_,
+         "markov_w1.weight is not BF16 [rank, vocabulary]");
+    s_rank_ = (int) w1->shape[0];
+    need(s_rank_ > 0 && s_rank_ <= n_embd_, "its recurrent rank");
+    markov_ = (const uint16_t*) g.data(*w1);
+    // softmax(dspark_fuse): a row of the four inputs' weights for each layer's mix and one for the head's
+    const TensorInfo* fuse = g.find("dspark_fuse.weight");
+    need(fuse && fuse->type == kTypeF32 && fuse->elements() == (uint64_t) (kTaps + 1) * (n + 1) && n + 1 == 4,
+         "dspark_fuse.weight is not F32 [4, 4]");
+    const float* f = (const float*) g.data(*fuse);
+    for (int j = 0; j < 4; ++j) {
+        const float* row = f + (size_t) j * (kTaps + 1);
+        const float mx = *std::max_element(row, row + kTaps + 1);
+        double sum = 0.0;
+        for (int k = 0; k <= kTaps; ++k) sum += fuse_[j][k] = std::exp(row[k] - mx);
+        for (int k = 0; k <= kTaps; ++k) fuse_[j][k] = (float) (fuse_[j][k] / sum);
+    }
+    s_ring_ = s_window_ + s_block_;
+    std::fprintf(stderr, "strata-poly: DSpark drafter: %d layers, a block of %d, reads visits %d, %d, %d\n", n,
+                 s_block_, taps_[0], taps_[1], taps_[2]);
+}
+
+// Twice, like the model's weights: the first time adds up the arena.
+void Inkling::load_drafter() {
+    const Shards& g = *dg_;
+    auto up = [&](const std::string& name, int64_t a, int64_t b, Want w) { return upload(g.find(name), name, a, b, w); };
+    const int64_t E = n_embd_, hq = (int64_t) s_head_ * s_dim_, hk = (int64_t) s_kv_ * s_dim_, r = s_rank_;
+    s_out_norm_ = up("output_norm.weight", E, 1, kF32);
+    s_mask_ = up("mask_embd.weight", E, 1, kF32);
+    s_ctx_norm_ = up("dspark_norm.weight", E, 1, kF32);
+    // the head's two products take one token: as floats, so that no BF16 matrix asks for lin()'s scratch
+    s_joint_ = up("joint_proj.weight", 2 * r + 2 * E, 3 * r, kF32);
+    s_joint_b_ = up("joint_proj.bias", 3 * r, 1, kF32);
+    s_hout_ = up("dspark_hidden_out.weight", r, E, kF32);
+    s_hout_b_ = up("dspark_hidden_out.bias", E, 1, kF32);
+    for (int il = 0; il < (int) spark_layers_.size(); ++il) {
+        SparkLayer& D = spark_layers_[(size_t) il];
+        auto f32 = [&](const char* n, int64_t a) { return up(blk(il, n), a, 1, kF32); };
+        auto mat = [&](const char* n, int64_t a, int64_t b) { return up(blk(il, n), a, b, kAnyMat); };
+        D.attn_norm = f32("attn_norm.weight", E);
+        D.ffn_norm = f32("ffn_norm.weight", E);
+        D.ctx_norm = f32("dflare_norm.weight", E);
+        D.q_norm = f32("attn_q_norm.weight", s_dim_);
+        D.k_norm = f32("attn_k_norm.weight", s_dim_);
+        D.k_ctx_norm = f32("attn_k_ctx_norm.weight", s_dim_);
+        D.wq = mat("attn_q.weight", E, hq);
+        D.wk = mat("attn_k.weight", E, hk);
+        D.wv = mat("attn_v.weight", E, hk);
+        D.wo = mat("attn_output.weight", hq, E);
+        D.k_ctx = mat("attn_k_ctx.weight", E, hk);
+        D.v_ctx = mat("attn_v_ctx.weight", E, hk);
+        D.gate = mat("ffn_gate.weight", E, s_ff_);
+        D.up = mat("ffn_up.weight", E, s_ff_);
+        D.down = mat("ffn_down.weight", s_ff_, E);
+    }
+}
+
+// n rows of keys and values from position pos into a layer's cache, around its ring in a window layer.
+void Inkling::spark_store(const SparkLayer& D, const float* k, const float* v, int64_t pos, int n) {
+    const int hk = s_kv_ * s_dim_;
+    for (int at = 0; at < n;) {
+        const int64_t row = D.swa ? (pos + at) % s_ring_ : pos + at;
+        const int m = D.swa ? (int) std::min<int64_t>(n - at, s_ring_ - row) : n - at;
+        store_f16(k + (size_t) at * hk, D.k, hk, row, m, st_);
+        store_f16(v + (size_t) at * hk, D.v, hk, row, m, st_);
+        at += m;
+    }
+}
+
+// The model's n rows from position pos into the drafter: input k's row r at x[k] + r * stride[k].
+void Inkling::spark_rows(int64_t pos, int n, const float* const* x, const int64_t* stride) {
+    const int E = n_embd_;
+    const int64_t last = pos + n - 1, ring = s_block_ + 1;
+    for (int c0 = 0; c0 < n; c0 += kSparkRows) {
+        const int m = std::min(kSparkRows, n - c0);
+        InklingFuse f;
+        for (int k = 0; k < 4; ++k) {
+            f.x[k] = x[k] + (size_t) c0 * stride[k];
+            f.stride[k] = stride[k];
+            for (int j = 0; j < 4; ++j) f.w[j][k] = fuse_[j][k];
+        }
+        for (int j = 0; j < 4; ++j) {
+            f.norm[j] = fp(j < 3 ? spark_layers_[(size_t) j].ctx_norm : s_ctx_norm_);
+            f.out[j] = s_ctx_[j];
+        }
+        inkling_dspark_fuse(f, E, m, s_eps_, st_);
+        for (int il = 0; il < (int) spark_layers_.size(); ++il) {
+            const SparkLayer& D = spark_layers_[(size_t) il];
+            lin(D.k_ctx, s_ctx_[il], s_k_, m);
+            lin(D.v_ctx, s_ctx_[il], s_v_, m);
+            head_norm_rope(s_k_, s_dim_, fp(D.k_ctx_norm), s_kr_, s_dim_, s_kv_, s_dim_, s_theta_, pos + c0, m, s_eps_,
+                           st_);
+            spark_store(D, s_kr_, s_v_, pos + c0, m);
+        }
+        // the head reads the mix of the row before a block's first: the last positions' are kept
+        for (int t = std::max(0, (int) (last - s_block_ - pos) - c0); t < m; ++t)
+            ck(cudaMemcpyAsync(s_rnn_ + (size_t) ((pos + c0 + t) % ring) * E, s_ctx_[3] + (size_t) t * E,
+                               (size_t) E * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
+               "drafter");
+    }
+}
+
+void Inkling::drafter_rows(int64_t pos, int n, const float* h) {
+    const int64_t rs = (int64_t) streams() * n_embd_;
+    const float* x[4] = {r_ + (size_t) kTap0 * n_embd_, r_ + (size_t) (kTap0 + 1) * n_embd_,
+                         r_ + (size_t) (kTap0 + 2) * n_embd_, h};
+    const int64_t stride[4] = {rs, rs, rs, n_embd_};
+    spark_rows(pos, n, x, stride);
+}
+
+int Inkling::draft_block(int32_t token, int most, Likeliest* out) { return spark_block(token, pos_, most, out); }
+
+// Up to `most` guesses after `token` at pos0 (see above), into out.
+int Inkling::spark_block(int32_t token, int64_t pos0, int most, Likeliest* out) {
+    const int B = s_block_, E = n_embd_, r = s_rank_;
+    most = std::min(most, B - 1);
+    if (most <= 0 || pos0 < 1 || pos0 + B > opt_.max_context) return 0;
+    cover(pos0 + B);
+    if (!h_w1_) {
+        h_w1_ = (float*) hmalloc((size_t) (r + E) * sizeof(float), "pinned memory");
+        h_pick_ = (Likeliest*) hmalloc(sizeof(Likeliest), "pinned memory");
+    }
+    ck(cudaStreamSynchronize(cs(st_)), "drafter");   // h_w1_ is free
+    // the block's rows: the token as the model norms its embeddings, then the masks.  The embedding goes behind the
+    // markov_w1 row, which the head's first guess writes while the card may not have copied the embedding yet.
+    float* const h_embd = h_w1_ + r;
+    embed(token, h_embd);
+    h2d(s_xn_, h_embd, (size_t) E * sizeof(float));
+    rms_norm(s_xn_, fp(tok_norm_), s_x_, E, 1, rms_eps_, st_);
+    for (int i = 1; i < B; ++i)
+        ck(cudaMemcpyAsync(s_x_ + (size_t) i * E, fp(s_mask_), (size_t) E * sizeof(float), cudaMemcpyDeviceToDevice,
+                           cs(st_)),
+           "drafter");
+    const float scale = 1.f / std::sqrt((float) s_dim_);
+    for (const SparkLayer& D : spark_layers_) {
+        rms_norm(s_x_, fp(D.attn_norm), s_xn_, E, B, s_eps_, st_);
+        lin(D.wq, s_xn_, s_q_, B);
+        lin(D.wk, s_xn_, s_k_, B);
+        lin(D.wv, s_xn_, s_v_, B);
+        head_norm_rope(s_q_, s_dim_, fp(D.q_norm), s_qr_, s_dim_, s_head_, s_dim_, s_theta_, pos0, B, s_eps_, st_);
+        head_norm_rope(s_k_, s_dim_, fp(D.k_norm), s_kr_, s_dim_, s_kv_, s_dim_, s_theta_, pos0, B, s_eps_, st_);
+        spark_store(D, s_kr_, s_v_, pos0, B);
+        const int64_t lo = D.swa ? std::max<int64_t>(0, pos0 - s_window_) : 0;
+        inkling_block_attend(s_qr_, D.k, D.v, lo, pos0 + B - 1, D.swa ? s_ring_ : 0, B, s_att_, s_dim_, s_head_,
+                             s_kv_, scale, s_work_, st_);
+        lin(D.wo, s_att_, s_xn_, B);
+        axpy(s_xn_, 1.f, s_x_, B * E, true, st_);
+        rms_norm(s_x_, fp(D.ffn_norm), s_xn_, E, B, s_eps_, st_);
+        lin(D.gate, s_xn_, s_g_, B);
+        lin(D.up, s_xn_, s_u_, B);
+        swiglu_clamp(s_g_, s_u_, s_g_, B * s_ff_, INFINITY, st_);
+        lin(D.down, s_g_, s_xn_, B);
+        axpy(s_xn_, 1.f, s_x_, B * E, true, st_);
+    }
+    rms_norm(s_x_, fp(s_out_norm_), s_cur_, E, B, s_eps_, st_);
+    lin(output_, s_cur_ + E, s_base_, most);   // the guesses' rows' scores
+    // the head, a guess at a time from the one before
+    ck(cudaMemsetAsync(s_state_, 0, (size_t) r * sizeof(float), cs(st_)), "drafter");
+    const float* context = s_rnn_ + (size_t) ((pos0 - 1) % (B + 1)) * E;
+    int32_t prev = token;
+    for (int i = 1; i <= most; ++i) {
+        const uint16_t* w1 = markov_ + (size_t) prev * r;
+        for (int j = 0; j < r; ++j) {
+            const uint32_t bits = (uint32_t) w1[j] << 16;
+            std::memcpy(h_w1_ + j, &bits, sizeof(float));
+        }
+        copy2(s_state_, s_in_, r, s_cur_ + (size_t) i * E, s_in_ + 2 * r, E, st_);
+        h2d(s_in_ + r, h_w1_, (size_t) r * sizeof(float));
+        ck(cudaMemcpyAsync(s_in_ + 2 * r + E, context, (size_t) E * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
+           "drafter");
+        lin(s_joint_, s_in_, s_jo_, 1);
+        add_bias(fp(s_joint_b_), s_jo_, 3 * r, 1, st_);
+        inkling_dspark_gru(s_jo_, s_state_, s_latent_, r, st_);
+        lin(s_hout_, s_latent_, s_corr_, 1);
+        add_bias(fp(s_hout_b_), s_corr_, E, 1, st_);
+        lin(output_, s_corr_, s_bias_, 1);
+        float* logits = s_base_ + (size_t) (i - 1) * n_vocab_;
+        axpy(s_bias_, 1.f, logits, n_vocab_, true, st_);
+        softcap(logits, (size_t) n_vocab_, s_cap_, st_);
+        likeliest(logits, n_vocab_real_, h_pick_, st_);
+        ck(cudaStreamSynchronize(cs(st_)), "drafter");
+        out[i - 1] = *h_pick_;
+        prev = h_pick_->token;
+    }
+    return most;
+}
+
+void Inkling::spark_rows_for_test(int64_t pos, int n, const float* features) {
+    if (!spark_) throw std::logic_error("spark_rows_for_test: no drafter");
+    cover(pos + n);
+    const size_t row = (size_t) 4 * n_embd_;
+    float* d = nullptr;
+    ck(cudaMalloc(&d, (size_t) n * row * sizeof(float)), "test");
+    // on st_: a cudaMemcpy() from pageable memory can return before its copy lands, and st_ does not wait for it
+    h2d(d, features, (size_t) n * row * sizeof(float));
+    const float* x[4] = {d, d + n_embd_, d + 2 * (size_t) n_embd_, d + 3 * (size_t) n_embd_};
+    const int64_t stride[4] = {(int64_t) row, (int64_t) row, (int64_t) row, (int64_t) row};
+    spark_rows(pos, n, x, stride);
+    ck(cudaStreamSynchronize(cs(st_)), "test");
+    cudaFree(d);
+}
+
+void Inkling::spark_reload_for_test(int64_t pos) {
+    if (!spark_) throw std::logic_error("spark_reload_for_test: no drafter");
+    pos_ = pos;
+    std::vector<uint8_t> state(state_bytes()), rows((size_t) pos * row_bytes());
+    save_state(state.data());
+    save_rows(0, pos, rows.data());
+    for (const SparkLayer& D : spark_layers_)
+        for (uint16_t* plane : {D.k, D.v}) zero_vram(plane, (size_t) (D.swa ? s_ring_ : pos) * spark_row());
+    zero_vram(s_rnn_, (size_t) (s_block_ + 1) * n_embd_ * sizeof(float));
+    load_rows(rows.data(), 0, pos, 0, pos);
+    load_state(state.data(), pos);
+    ck(cudaStreamSynchronize(cs(st_)), "test");
+    pos_ = 0;
+}
+
+int Inkling::spark_block_for_test(int32_t token, int64_t pos0, int most, int32_t* tokens, float* logits) {
+    if (!spark_) throw std::logic_error("spark_block_for_test: no drafter");
+    std::vector<Likeliest> out((size_t) s_block_);
+    const int n = spark_block(token, pos0, most, out.data());
+    for (int i = 0; i < n; ++i) tokens[i] = out[(size_t) i].token;
+    ck(cudaMemcpy2DAsync(logits, (size_t) n_vocab_real_ * sizeof(float), s_base_, (size_t) n_vocab_ * sizeof(float),
+                         (size_t) n_vocab_real_ * sizeof(float), (size_t) n, cudaMemcpyDeviceToHost, cs(st_)),
+       "test");
+    ck(cudaStreamSynchronize(cs(st_)), "test");
+    return n;
 }
 
 }  // namespace strata::poly
