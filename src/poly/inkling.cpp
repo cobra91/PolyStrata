@@ -375,6 +375,10 @@ void Inkling::alloc_caches() {
             }
         }
     }
+    if (!mix_work_) {   // inkling_mix_conv()'s meeting place
+        mix_work_ = dmalloc(inkling_mix_conv_work_bytes(), "scratch");
+        ck(cudaMemset(mix_work_, 0, inkling_mix_conv_work_bytes()), "scratch");
+    }
     // the padded vocabulary's scores, which finish_logits() puts out of reach
     if (!neg_inf_ && n_vocab_ > n_vocab_real_) {
         const size_t pad_n = (size_t) (n_vocab_ - n_vocab_real_);
@@ -646,7 +650,7 @@ void Inkling::layer_head(Layer& L, int v, int n) {
             nm.y[j] = in_[j], nm.y_q8_1[j] = inq_[j];
         }
         nm.eps = rms_eps_, nm.threads = threads;
-        inkling_mix_conv(mixes, n_mix, last, n_embd_, norm_eps_, st_, normed ? &nm : nullptr);
+        inkling_mix_conv(mixes, n_mix, last, n_embd_, norm_eps_, st_, normed ? &nm : nullptr, mix_work_);
         last = nullptr;
     } else {
         flush();
@@ -736,7 +740,7 @@ void Inkling::layer_head(Layer& L, int v, int n) {
     m.out[0] = mix_[0];
     InklingMixNorm nm;   // the first pass's FFN input, normed in the mix's launch
     nm.w[0] = fp(L.ffn_norm), nm.y[0] = xn_, nm.y_q8_1[0] = xq_, nm.eps = rms_eps_, nm.threads = threads;
-    if (fuse) inkling_mix_conv(&m, 1, &conv, n_embd_, norm_eps_, st_, B.pass == 0 ? &nm : nullptr);
+    if (fuse) inkling_mix_conv(&m, 1, &conv, n_embd_, norm_eps_, st_, B.pass == 0 ? &nm : nullptr, mix_work_);
     else inkling_mix(m, n_embd_, n, norm_eps_, st_);
     float* f = mix_[0];
     if (B.pass > 0) {

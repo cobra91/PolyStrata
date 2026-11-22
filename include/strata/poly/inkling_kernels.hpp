@@ -356,9 +356,13 @@ struct InklingMixNorm {
 /// done first by the first mix's block, whose threads keep their part of it for the mix, and `norm` (null: none) of
 /// the first mix's outputs after it: the same bits as inkling_conv_in(*conv), inkling_mix() of each and the norms.
 /// conv->acc and conv->save may be states of the first mix, not of the second.  Mixes of more than 5 states or
-/// unaligned buffers take those calls one after the other.
+/// unaligned buffers take those calls one after the other.  With `work` (inkling_mix_conv_work_bytes() of device
+/// memory, zeroed once and then left to these calls, one at a time) a mix's work is spread over n / 128 blocks that
+/// meet in it, where the card holds all of them at once: each value the same operations in the same order as in the
+/// one block, the same bits.
 void inkling_mix_conv(const InklingMix* mixes, int count, const InklingConvIn* conv, int n, float eps, void* stream,
-                      const InklingMixNorm* norm = nullptr);
+                      const InklingMixNorm* norm = nullptr, void* work = nullptr);
+size_t inkling_mix_conv_work_bytes();
 
 // ---- a token of each of several sequences --------------------------------------------------------------------
 //

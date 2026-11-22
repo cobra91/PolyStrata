@@ -169,6 +169,7 @@ private:
     void* inq_[3] = {};                    ///< in_'s Q8_1 copies
     void* attq_ = nullptr;                 ///< a token's gated attention output's Q8_1 copy (fused())
     float* neg_inf_ = nullptr;             ///< -inf for the padded vocabulary's scores
+    void* mix_work_ = nullptr;             ///< inkling_mix_conv()'s blocks' meeting place
     float *q_ = nullptr, *kraw_ = nullptr, *k_ = nullptr, *vraw_ = nullptr, *v_ = nullptr, *rel_ = nullptr,
           *sink_ = nullptr, *gate_ = nullptr, *ktap_ = nullptr, *vtap_ = nullptr, *att_ = nullptr, *o_ = nullptr;
     float* awork_ = nullptr;

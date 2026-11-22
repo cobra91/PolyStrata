@@ -9,11 +9,14 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <cmath>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 namespace strata::poly {
 namespace {
@@ -1407,6 +1410,55 @@ struct Mix4Smem {
     float wts[4][kInklingMaxStates];
 };
 
+// mix4_body()'s sums of a thread's float4 of each state: its square, then its products with the queries'.
+template <int NS>
+__device__ __forceinline__ void mix4_sums(const float4* xs, const float4* qv, float* acc) {
+#pragma unroll
+    for (int k = 0; k < NS; ++k) {
+        const float4 x = xs[k];
+        acc[k * 5] = x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w;
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+            acc[k * 5 + 1 + q] = x.x * qv[q].x + x.y * qv[q].y + x.z * qv[q].z + x.w * qv[q].w;
+    }
+}
+
+// Query q's weights w[NS] from the block's sums tot: the softmax of the normed states' scores, times their norms, so
+// that the output's sum reads the raw states.
+template <int NS>
+__device__ __forceinline__ void mix4_weights(const float* tot, int q, int n, float eps, float* w) {
+    const float scale = 1.0f / sqrtf((float) n);
+    float sc[NS], inv[NS], mx = -INFINITY;
+#pragma unroll
+    for (int k = 0; k < NS; ++k) {
+        inv[k] = 1.0f / sqrtf(tot[k * 5] / float(n) + eps);
+        sc[k] = tot[k * 5 + 1 + q] * inv[k] * scale;
+        mx = fmaxf(mx, sc[k]);
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (int k = 0; k < NS; ++k) sum += (sc[k] = expf(sc[k] - mx));
+#pragma unroll
+    for (int k = 0; k < NS; ++k) w[k] = sc[k] / sum * inv[k];
+}
+
+// An output value from the states' values x there.
+template <int NS>
+__device__ __forceinline__ float mix4_one(const float* w, const float* x) {
+    float y = 0.0f;
+#pragma unroll
+    for (int k = 0; k < NS; ++k) y += w[k] * x[k];
+    return y;
+}
+
+template <int NS>
+__device__ __forceinline__ float4 mix4_out(const float* w, const float4* xs) {
+    float x[NS], y[NS], z[NS], v[NS];
+#pragma unroll
+    for (int k = 0; k < NS; ++k) x[k] = xs[k].x, y[k] = xs[k].y, z[k] = xs[k].z, v[k] = xs[k].w;
+    return make_float4(mix4_one<NS>(w, x), mix4_one<NS>(w, y), mix4_one<NS>(w, z), mix4_one<NS>(w, v));
+}
+
 // mix4_kernel's token t; `given` only for one token (t 0).
 template <int NS>
 __device__ __forceinline__ void mix4_body(const InklingMix& m, int n, float eps, size_t t, const Given& given,
@@ -1429,14 +1481,7 @@ __device__ __forceinline__ void mix4_body(const InklingMix& m, int n, float eps,
             qv[q] = q < nq ? reinterpret_cast<const float4*>(m.query + size_t(q) * n)[i] : make_float4(0, 0, 0, 0);
 #pragma unroll
         for (int k = 0; k < NS; ++k) xs[k] = given.at(m.state[k] + t * n, i);
-#pragma unroll
-        for (int k = 0; k < NS; ++k) {
-            const float4 x = xs[k];
-            acc[k * 5] = x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w;
-#pragma unroll
-            for (int q = 0; q < 4; ++q)
-                acc[k * 5 + 1 + q] = x.x * qv[q].x + x.y * qv[q].y + x.z * qv[q].z + x.w * qv[q].w;
-        }
+        mix4_sums<NS>(xs, qv, acc);
     }
 #pragma unroll
     for (int j = 0; j < SUMS; ++j) {
@@ -1451,35 +1496,13 @@ __device__ __forceinline__ void mix4_body(const InklingMix& m, int n, float eps,
         tot[j] = v;
     }
     __syncthreads();
-    if (threadIdx.x < nq) {
-        const int q = threadIdx.x;
-        const float scale = 1.0f / sqrtf((float) n);
-        float sc[NS], inv[NS], mx = -INFINITY;
-#pragma unroll
-        for (int k = 0; k < NS; ++k) {
-            inv[k] = 1.0f / sqrtf(tot[k * 5] / float(n) + eps);
-            sc[k] = tot[k * 5 + 1 + q] * inv[k] * scale;
-            mx = fmaxf(mx, sc[k]);
-        }
-        float sum = 0.0f;
-#pragma unroll
-        for (int k = 0; k < NS; ++k) sum += (sc[k] = expf(sc[k] - mx));
-        // the weights times the states' norms, so that the sum below reads the raw states
-#pragma unroll
-        for (int k = 0; k < NS; ++k) wts[q][k] = sc[k] / sum * inv[k];
-    }
+    if (threadIdx.x < nq) mix4_weights<NS>(tot, threadIdx.x, n, eps, wts[threadIdx.x]);
     __syncthreads();
     if (!own) return;
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
         if (q >= nq) break;
-        float4 y = make_float4(0, 0, 0, 0);
-#pragma unroll
-        for (int k = 0; k < NS; ++k) {
-            const float w = wts[q][k];
-            y.x += w * xs[k].x, y.y += w * xs[k].y, y.z += w * xs[k].z, y.w += w * xs[k].w;
-        }
-        reinterpret_cast<float4*>(m.out[q] + t * n)[i] = y;
+        reinterpret_cast<float4*>(m.out[q] + t * n)[i] = mix4_out<NS>(wts[q], xs);
     }
 }
 
@@ -1593,6 +1616,195 @@ __global__ void __launch_bounds__(MIX4_MAX) mix_conv_kernel(MixPair mp, ConvIn c
     }
 }
 static_assert(MIX_CONV_STATES == 5, "mix_conv_kernel's cases");
+
+// ---- one token's mixes over many blocks ------------------------------------------------------------------------
+//
+// mix_conv_kernel's work in blocks of MIX_SPREAD threads, thread g of a mix's blocks doing what thread g of its block
+// does there (the same float4 of the same states and the same warp's sums), so that every value is the same
+// operations in the same order.  A mix's blocks meet in device memory (grid_meet()) after their warps' sums, which
+// each block then adds up as mix4_body() does for the weights; with norms, the first mix's blocks meet again after
+// the norms' warps' sums, a norm's warp recomputing the outputs it reads from the states.
+
+constexpr int MIX_SPREAD = 32;
+
+struct MixSpreadWork {
+    unsigned meet[8];   // a counter a mix (grid_meet())
+    float part[2][MIX4_MAX / WARP][MIX_CONV_STATES * 5];
+    float norm[4][1024 / WARP];
+};
+
+struct MixSpreadSmem {
+    float tot[MIX_CONV_STATES * 5];
+    float wts[4][MIX_CONV_STATES];
+    __align__(16) float outs[4][4 * MIX_SPREAD];   // the norms' inputs, the block's part of them
+};
+
+// A load past the SM's cache, of what other blocks of the launch wrote before a grid_meet().
+__device__ __forceinline__ float load_peer(const float* p) { return *(volatile const float*) p; }
+
+// The `blocks` blocks of a group past this point together, their stores before it seen by their load_peer()s after
+// it.  The arrivals add 2^31 to the counter in all, which flips its top bit with the last one: from 0, it is 0 or
+// 2^31 between meetings.
+__device__ __forceinline__ void grid_meet(unsigned* count, int blocks, bool first) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        const unsigned old = atomicAdd(count, first ? 0x80000000u - unsigned(blocks - 1) : 1u);
+        while (((old ^ *(volatile unsigned*) count) & 0x80000000u) == 0) {
+        }
+        __threadfence();
+    }
+    __syncthreads();
+}
+
+// conv_in_one() of channels 4i .. 4i + 3, all their loads before their stores; g gets acc's and save's float4.
+__device__ __forceinline__ void conv_in4(const ConvIn& c, int n, int i, Given& g) {
+    float4* a4 = reinterpret_cast<float4*>(c.acc) + i;
+    const float4 old = *a4;
+    const float o[4] = {old.x, old.y, old.z, old.w};
+    float v[4];
+    if (c.parts) {
+        float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll 4
+        for (int k = 0; k < c.n_parts; ++k) {
+            const float wk = c.wts[k];
+            const float* p = c.parts + size_t(k) * n + 4 * size_t(i);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) s[j] += wk * p[j];
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j) v[j] = __fadd_rn(0.0f, s[j]);
+    } else {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) v[j] = c.x[4 * i + j];
+    }
+    float* st = c.state + size_t(i) * 12;
+    float s0[4], s1[4], s2[4], y[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) s0[j] = st[3 * j], s1[j] = st[3 * j + 1], s2[j] = st[3 * j + 2];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        y[j] = conv_one(s0[j], s1[j], s2[j], v[j], c.w + 16 * size_t(i) + 4 * j, nullptr, c.scale);
+        y[j] = c.fresh ? y[j] : __fadd_rn(o[j], y[j]);
+    }
+    if (c.save) reinterpret_cast<float4*>(c.save)[i] = old;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) st[3 * j] = s1[j], st[3 * j + 1] = s2[j], st[3 * j + 2] = v[j];
+    const float4 y4 = make_float4(y[0], y[1], y[2], y[3]);
+    *a4 = y4;
+    g.p[0] = c.acc, g.v[0] = y4;
+    g.p[1] = c.save, g.v[1] = old;
+}
+
+// Block b of a mix's nb; with SUM, the first mix's norms after it (fm::rms_norm_q8_1<SUM>()'s sums).
+template <int NS, int SUM>
+__device__ __forceinline__ void mix_spread_body(const InklingMix& m, const MixNorms& nr, int n, float eps,
+                                                const Given& given, int mi, int b, int nb, MixSpreadWork* wk,
+                                                MixSpreadSmem& sm) {
+    constexpr int SUMS = NS * 5;
+    auto& tot = sm.tot;
+    auto& wts = sm.wts;
+    auto& outs = sm.outs;
+    const int nq = m.n_query, lane = threadIdx.x % WARP, n4 = n / 4;
+    const int i = b * MIX_SPREAD + threadIdx.x, warp = i / WARP;   // mix4_body()'s thread and warp
+    const bool own = i < n4;
+    float4 xs[NS];
+    float acc[SUMS];
+#pragma unroll
+    for (int j = 0; j < SUMS; ++j) acc[j] = 0.0f;
+    if (own) {
+        float4 qv[4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+            qv[q] = q < nq ? reinterpret_cast<const float4*>(m.query + size_t(q) * n)[i] : make_float4(0, 0, 0, 0);
+#pragma unroll
+        for (int k = 0; k < NS; ++k) xs[k] = given.at(m.state[k], i);
+        mix4_sums<NS>(xs, qv, acc);
+    }
+#pragma unroll
+    for (int j = 0; j < SUMS; ++j) {
+        const float v = warp_sum(acc[j]);
+        if (lane == 0) wk->part[mi][warp][j] = v;
+    }
+    grid_meet(&wk->meet[mi], nb, b == 0);
+    const int warps = (n4 + WARP - 1) / WARP;
+    for (int j = threadIdx.x; j < SUMS; j += blockDim.x) {
+        float v = 0.0f;
+        for (int w = 0; w < warps; ++w) v += load_peer(&wk->part[mi][w][j]);
+        tot[j] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < nq) mix4_weights<NS>(tot, threadIdx.x, n, eps, wts[threadIdx.x]);
+    __syncthreads();
+    if (own) {
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            if (q >= nq) break;
+            const float4 y = mix4_out<NS>(wts[q], xs);
+            reinterpret_cast<float4*>(m.out[q])[i] = y;
+            if constexpr (SUM > 0) reinterpret_cast<float4*>(outs[q])[threadIdx.x] = y;
+        }
+    }
+    if constexpr (SUM > 0) {
+        if (mi != 0) return;
+        // the norms' sums: their thread t (warp t / 32) of each output's values t, t + SUM, ...
+        const int nw = nb * MIX_SPREAD / WARP;
+        for (int k = warp; k < SUM / WARP; k += nw) {
+            const int t = k * WARP + lane;
+            float ss[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (int e = t; e < n; e += SUM) {
+                float x[NS];
+#pragma unroll
+                for (int s = 0; s < NS; ++s) x[s] = load_peer(m.state[s] + e);
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    if (q >= nq) break;
+                    const float v = mix4_one<NS>(wts[q], x);
+                    ss[q] = fm::fma_rn(v, v, ss[q]);
+                }
+            }
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                if (q >= nq) break;
+                const float v = fm::warp_sum(ss[q]);
+                if (lane == 0) wk->norm[q][k] = v;
+            }
+        }
+        grid_meet(&wk->meet[0], nb, b == 0);
+        const int base = 4 * MIX_SPREAD * b, count = min(4 * MIX_SPREAD, n - base);   // a multiple of 32
+        for (int q = 0; q < nq; ++q) {
+            float sum = 0.0f;
+            for (int k = 0; k < SUM / WARP; ++k) sum = fm::add_rn(sum, load_peer(&wk->norm[q][k]));
+            const float scale = fm::div_rn(1.0f, fm::sqrt_rn(fm::add_rn(fm::div_rn(sum, float(n)), nr.eps)));
+            for (int e = threadIdx.x; e < count; e += blockDim.x) {
+                const int j = base + e;
+                const float xi = fm::mul_rn(fm::mul_rn(outs[q][e], scale), nr.w[q][j]);
+                nr.y[q][j] = xi;
+                fm::q8_1(xi, nr.yq[q] + j / 32);
+            }
+        }
+    }
+}
+
+// grid: the first mix's blocks (blocks0), then the second's.
+template <int SUM>
+__global__ void __launch_bounds__(MIX_SPREAD) mix_spread_kernel(MixPair mp, ConvIn c, MixNorms nr, int n, float eps,
+                                                                int blocks0, MixSpreadWork* wk) {
+    const int mi = blockIdx.x < blocks0 ? 0 : 1;
+    const int b = blockIdx.x - mi * blocks0, nb = mi ? gridDim.x - blocks0 : blocks0;
+    const InklingMix& m = mp.m[mi];
+    const int i = b * MIX_SPREAD + threadIdx.x;
+    __shared__ MixSpreadSmem sm;
+    Given g;
+    if (mi == 0 && c.acc && i < n / 4) conv_in4(c, n, i, g);
+    switch (m.n_state) {
+        case 1: mix_spread_body<1, SUM>(m, nr, n, eps, g, mi, b, nb, wk, sm); break;
+        case 2: mix_spread_body<2, SUM>(m, nr, n, eps, g, mi, b, nb, wk, sm); break;
+        case 3: mix_spread_body<3, SUM>(m, nr, n, eps, g, mi, b, nb, wk, sm); break;
+        case 4: mix_spread_body<4, SUM>(m, nr, n, eps, g, mi, b, nb, wk, sm); break;
+        default: mix_spread_body<5, SUM>(m, nr, n, eps, g, mi, b, nb, wk, sm); break;
+    }
+}
 
 // ---- controller, SiTU ------------------------------------------------------------------------------------------
 
@@ -2089,8 +2301,38 @@ void inkling_conv_in(const InklingConvIn& c, int n, void* stream) {
     check_launch("inkling_conv_in");
 }
 
+size_t inkling_mix_conv_work_bytes() { return sizeof(MixSpreadWork); }
+
+namespace {
+// The blocks of mix_spread_kernel the current card holds at once (the least over its SUMs): a launch's blocks wait
+// for each other in grid_meet(), so a launch takes no more than these.  Other streams' kernels on the card can only
+// delay its blocks, as they run to their end without them.
+int spread_room() {
+    static std::mutex mu;
+    static std::vector<int> rooms;   // a device's, 0: not yet asked
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+    const std::lock_guard<std::mutex> lock(mu);
+    if (rooms.size() <= size_t(dev)) rooms.resize(size_t(dev) + 1, 0);
+    if (!rooms[dev]) {
+        int sms = 0, least = INT_MAX;
+        for (const void* k : {(const void*) mix_spread_kernel<0>, (const void*) mix_spread_kernel<128>,
+                              (const void*) mix_spread_kernel<256>, (const void*) mix_spread_kernel<512>,
+                              (const void*) mix_spread_kernel<1024>}) {
+            int per_sm = 0;
+            if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k, MIX_SPREAD, 0) != cudaSuccess) per_sm = 0;
+            least = std::min(least, per_sm);
+        }
+        if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) sms = 0;
+        cudaGetLastError();
+        rooms[dev] = least * sms > 0 ? least * sms : -1;   // -1: none
+    }
+    return rooms[dev];
+}
+}  // namespace
+
 void inkling_mix_conv(const InklingMix* mixes, int count, const InklingConvIn* conv, int n, float eps, void* stream,
-                      const InklingMixNorm* norm) {
+                      const InklingMixNorm* norm, void* work) {
     if (count < 1 || count > 2) throw std::invalid_argument("inkling_mix_conv: 1 or 2 mixes");
     bool fits = n % 4 == 0 && n / 4 <= MIX4_MAX;
     MixPair mp{};
@@ -2122,6 +2364,23 @@ void inkling_mix_conv(const InklingMix* mixes, int count, const InklingConvIn* c
         nr.eps = norm->eps;
     }
     const cudaStream_t st = cs(stream);
+    const int blocks = (threads + MIX_SPREAD - 1) / MIX_SPREAD;   // a mix's, spread
+    if (work && count * blocks <= spread_room()) {
+        auto* wk = static_cast<MixSpreadWork*>(work);
+        const auto spread = [&](auto kernel) {
+            kernel<<<count * blocks, MIX_SPREAD, 0, st>>>(mp, c, nr, n, eps, blocks, wk);
+        };
+        switch (norm ? norm->threads : 0) {
+            case 0: spread(mix_spread_kernel<0>); break;
+            case 128: spread(mix_spread_kernel<128>); break;
+            case 256: spread(mix_spread_kernel<256>); break;
+            case 512: spread(mix_spread_kernel<512>); break;
+            case 1024: spread(mix_spread_kernel<1024>); break;
+            default: throw std::invalid_argument("inkling_mix_conv: norms of 128, 256, 512 or 1024 threads");
+        }
+        check_launch("inkling_mix_conv");
+        return;
+    }
     switch (norm ? norm->threads : 0) {
         case 0: mix_conv_kernel<0><<<count, threads, 0, st>>>(mp, c, nr, n, eps); break;
         case 128: mix_conv_kernel<128><<<count, threads, 0, st>>>(mp, c, nr, n, eps); break;

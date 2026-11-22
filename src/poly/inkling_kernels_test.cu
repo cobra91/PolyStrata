@@ -1539,7 +1539,9 @@ void test_norm_rows(int count) {
 }
 
 // One token's mixes with a post-convolution before them (inkling_mix_conv(), inkling_conv_in()) against
-// moe_sum() into a zeroed buffer, the copy, inkling_conv() / inkling_conv_acc() and inkling_mix() of each.
+// moe_sum() into a zeroed buffer, the copy, inkling_conv() / inkling_conv_acc() and inkling_mix() of each; and the
+// launch with its work spread over many blocks against the one block a mix.  Each runs `reps` tokens in a row
+// (the convolution's state and the stream carried on, the spread launches' meeting place reused).
 // nb: the blocks before the stream in the first mix; the stream (acc) is its last state.
 struct MixConvCase {
     const char* name;
@@ -1550,10 +1552,17 @@ struct MixConvCase {
     int save_k;
     bool alone;            // inkling_conv_in() only, no mix
     bool norm = false;     // the first mix's outputs normed in the launch (native_add_rms_norm_q8_1())
+    int n = 2304;
+    int reps = 3;
 };
+void* mix_work = nullptr;   // inkling_mix_conv()'s meeting place, shared by every case as an engine's is
 void test_mix_conv(const MixConvCase& tc) {
     const cudaStream_t st = test_stream();
-    const int n = 2304, parts = 8;
+    const int n = tc.n, parts = 8;
+    if (!mix_work) {
+        ck(cudaMalloc(&mix_work, inkling_mix_conv_work_bytes()), "malloc");
+        ck(cudaMemset(mix_work, 0, inkling_mix_conv_work_bytes()), "memset");
+    }
     std::vector<std::vector<float>> hs;   // the first mix's states (the stream last), then the second's
     for (int k = 0; k <= tc.nb; ++k) hs.push_back(randv(n, 0.5f + k, 0.1f * k));
     for (int k = 0; k < 2; ++k) hs.push_back(randv(n, 1.f + k));
@@ -1562,7 +1571,7 @@ void test_mix_conv(const MixConvCase& tc) {
                hcw = randv(size_t(n) * 4, 0.4f);
     float *dq1 = up(q1), *dq2 = up(q2), *dx = up(hx), *dp = up(hp), *dw = up(hw), *dcw = up(hcw);
     namespace kk = strata::kernels;
-    const size_t qb = kk::native_q8_1_bytes(n);
+    const size_t qb = tc.norm ? kk::native_q8_1_bytes(n) : 36;   // native_q8_1_bytes() takes multiples of 256
     const int threads = sum_threads(n);
     std::vector<float*> nw;
     for (int j = 0; j < tc.nq; ++j) {
@@ -1574,7 +1583,7 @@ void test_mix_conv(const MixConvCase& tc) {
         std::vector<float*> s;
         float *state, *fo, *out[8], *ny[4];
         void* nq[4];
-    } side[2];
+    } side[3];   // the calls, the one-block launch, the spread one
     for (Side& d : side) {
         for (const auto& h : hs) d.s.push_back(up(h));
         d.state = up(hst);
@@ -1601,8 +1610,7 @@ void test_mix_conv(const MixConvCase& tc) {
         if (tc.fresh) c.save = d.s[tc.save_k];
         return c;
     };
-    {   // the calls
-        Side& d = side[0];
+    const auto calls = [&](Side& d) {
         if (tc.conv) {
             const float* x = dx;
             if (tc.conv == 2) {
@@ -1624,9 +1632,8 @@ void test_mix_conv(const MixConvCase& tc) {
             for (int j = 0; j < tc.nq && tc.norm; ++j)
                 kk::native_add_rms_norm_q8_1(d.out[j], nullptr, nw[j], d.ny[j], d.nq[j], n, 1, 1e-5f, threads, st);
         }
-    }
-    {   // fused
-        Side& d = side[1];
+    };
+    const auto fused = [&](Side& d, void* work) {
         const InklingConvIn c = conv_of(d);
         if (tc.alone) {
             inkling_conv_in(c, n, st);
@@ -1636,21 +1643,31 @@ void test_mix_conv(const MixConvCase& tc) {
             InklingMixNorm nm;
             for (int j = 0; j < tc.nq; ++j) nm.w[j] = nw[j], nm.y[j] = d.ny[j], nm.y_q8_1[j] = d.nq[j];
             nm.eps = 1e-5f, nm.threads = threads;
-            inkling_mix_conv(m, count, tc.conv ? &c : nullptr, n, 1e-6f, st, tc.norm ? &nm : nullptr);
+            inkling_mix_conv(m, count, tc.conv ? &c : nullptr, n, 1e-6f, st, tc.norm ? &nm : nullptr, work);
         }
+    };
+    for (int r = 0; r < tc.reps; ++r) {
+        calls(side[0]);
+        fused(side[1], nullptr);
+        fused(side[2], mix_work);
     }
-    size_t diff = bytes_differ(side[0].state, side[1].state, size_t(n) * 12);
-    for (size_t k = 0; k < hs.size(); ++k) diff += bytes_differ(side[0].s[k], side[1].s[k], size_t(n) * 4);
-    if (!tc.alone) {
-        for (int j = 0; j < tc.nq; ++j) diff += bytes_differ(side[0].out[j], side[1].out[j], size_t(n) * 4);
-        for (int j = 0; j < 4 && tc.msg; ++j) diff += bytes_differ(side[0].out[4 + j], side[1].out[4 + j], size_t(n) * 4);
-        for (int j = 0; j < tc.nq && tc.norm; ++j)
-            diff += bytes_differ(side[0].ny[j], side[1].ny[j], size_t(n) * 4) +
-                    bytes_differ(side[0].nq[j], side[1].nq[j], qb);
-    }
-    std::printf("%-58s %zu bytes differ  %s\n", (std::string("mix conv ") + tc.name).c_str(), diff,
-                diff ? "FAIL" : "ok");
-    if (diff) ++failures;
+    ck(cudaStreamSynchronize(st), "mix conv");
+    const auto differ = [&](const Side& a, const Side& b) {
+        size_t diff = bytes_differ(a.state, b.state, size_t(n) * 12);
+        for (size_t k = 0; k < hs.size(); ++k) diff += bytes_differ(a.s[k], b.s[k], size_t(n) * 4);
+        if (!tc.alone) {
+            for (int j = 0; j < tc.nq; ++j) diff += bytes_differ(a.out[j], b.out[j], size_t(n) * 4);
+            for (int j = 0; j < 4 && tc.msg; ++j) diff += bytes_differ(a.out[4 + j], b.out[4 + j], size_t(n) * 4);
+            for (int j = 0; j < tc.nq && tc.norm; ++j)
+                diff += bytes_differ(a.ny[j], b.ny[j], size_t(n) * 4) + bytes_differ(a.nq[j], b.nq[j], qb);
+        }
+        return diff;
+    };
+    const size_t one = differ(side[0], side[1]), spread = differ(side[1], side[2]);
+    std::printf("%-58s %zu | %zu bytes differ  %s\n",
+                (std::string("mix conv ") + tc.name + ", n " + std::to_string(n)).c_str(), one, spread,
+                one + spread ? "FAIL" : "ok");
+    if (one + spread) ++failures;
     for (Side& d : side) {
         for (float* p : d.s) cudaFree(p);
         cudaFree(d.state), cudaFree(d.fo);
@@ -1857,6 +1874,57 @@ void bench_decode(const std::vector<float>& table, float* dtable) {
         time_us("conv 2304, 1 token", [&] { inkling_conv(x, state, w, nullptr, 0, y, 2304, 1, bs); });
         cudaFree(x), cudaFree(y), cudaFree(sc), cudaFree(state), cudaFree(w), cudaFree(taps);
     }
+    // inkling_mix_conv() at the engine's shapes: one block a mix against the spread launch
+    {
+        std::vector<float*> fr;
+        auto mk = [&](size_t count, float sd) { float* p = up(randv(count, sd)); fr.push_back(p); return p; };
+        float *qd = mk(size_t(4) * n, 1.f), *parts = mk(size_t(8) * n, 1.f), *pw = mk(8, 0.3f),
+              *state = mk(size_t(3) * n, 1.f), *cw = mk(size_t(4) * n, 0.3f), *x = mk(n, 1.f);
+        float* s[7];
+        float *out[8], *ny[4];
+        void* yq[4];
+        for (float*& p : s) p = mk(n, 1.f);
+        for (float*& p : out) p = mk(n, 0.f);
+        for (float*& p : ny) p = mk(n, 0.f);
+        for (void*& p : yq) p = mk(strata::kernels::native_q8_1_bytes(n) / 4 + 1, 0.f);
+        float* nw[3] = {mk(n, 1.f), mk(n, 1.f), mk(n, 1.f)};
+        void* work = nullptr;
+        ck(cudaMalloc(&work, inkling_mix_conv_work_bytes()), "malloc");
+        ck(cudaMemset(work, 0, inkling_mix_conv_work_bytes()), "memset");
+        struct Shape {
+            const char* name;
+            int states, nq;
+            bool msg, sum, norm;
+        };
+        for (const Shape& sh : {Shape{"window, tail sum, norm", 3, 1, false, true, true},
+                                Shape{"full, tail sum, 3 norms", 4, 3, false, true, true},
+                                Shape{"full, tail sum, messages", 4, 3, true, true, false},
+                                Shape{"ffn 5 states, conv, norm", 5, 1, false, false, true},
+                                Shape{"ffn 5 states, conv", 5, 1, false, false, false}}) {
+            InklingMix m[2];
+            for (int k = 0; k < sh.states; ++k) m[0].state[k] = s[k];
+            m[0].n_state = sh.states, m[0].query = qd, m[0].n_query = sh.nq;
+            for (int q = 0; q < sh.nq; ++q) m[0].out[q] = out[q];
+            m[1].state[0] = s[5], m[1].state[1] = s[6], m[1].n_state = 2, m[1].query = qd, m[1].n_query = 4;
+            for (int q = 0; q < 4; ++q) m[1].out[q] = out[4 + q];
+            InklingConvIn c;
+            if (sh.sum) c.parts = parts, c.weights = pw, c.n_parts = 8;
+            else c.x = x;
+            c.state = state, c.w = cw, c.acc = s[sh.states - 1];
+            InklingMixNorm nm;
+            for (int q = 0; q < sh.nq; ++q) nm.w[q] = nw[q], nm.y[q] = ny[q], nm.y_q8_1[q] = yq[q];
+            nm.eps = 1e-5f, nm.threads = sum_threads(n);
+            for (void* wk : {(void*) nullptr, work}) {
+                const std::string w = std::string("mix conv ") + sh.name + (wk ? ": spread" : ": one block a mix");
+                time_us(w.c_str(), [&] {
+                    inkling_mix_conv(m, sh.msg ? 2 : 1, &c, n, 1e-6f, bs, sh.norm ? &nm : nullptr, wk);
+                });
+            }
+        }
+        ck(cudaDeviceSynchronize(), "mix conv bench");
+        cudaFree(work);
+        for (float* p : fr) cudaFree(p);
+    }
     // the fused steps against the launches they replace, one token
     {
         const int rank = 64;
@@ -2001,6 +2069,16 @@ void bench_decode(const std::vector<float>& table, float* dtable) {
 }
 
 }  // namespace
+
+// f(), a group of checks: an exception out of it is its failure, not the end of the run.
+template <class F> void guarded(F&& f) {
+    try {
+        f();
+    } catch (const std::exception& e) {
+        std::printf("%-58s %s  FAIL\n", "(a check threw)", e.what());
+        ++failures;
+    }
+}
 
 int main(int argc, char** argv) {
     const bool bench = argc > 1 && std::string(argv[1]) == "bench";
@@ -2167,56 +2245,69 @@ int main(int argc, char** argv) {
              {"conv alone, block start", 3, 1, false, 1, true, 1, true},
              {"window, tail sum, norm", 2, 1, false, 2, false, 0, false, true},
              {"full, tail x, 3 norms", 3, 3, false, 1, false, 0, false, true},
-             {"ffn, block start, norm", 2, 1, false, 1, true, 1, false, true}})
-        test_mix_conv(tc);
+             {"ffn, block start, norm", 2, 1, false, 1, true, 1, false, true},
+             {"first visit, norm", 0, 1, false, 0, false, 0, false, true},
+             {"full, tail sum, 3 norms", 3, 3, false, 2, false, 0, false, true},
+             {"window, 1 state, tail sum, messages", 0, 1, true, 2, false, 0, false},
+             {"ffn, 5 states, block start", 4, 1, false, 1, true, 3, false},
+             {"ffn, 5 states, norm", 4, 1, false, 1, false, 0, false, true},
+             {"window, tail sum, norm", 2, 1, false, 2, false, 0, false, true, 512},
+             {"full, tail x, 3 norms", 3, 3, false, 1, false, 0, false, true, 1024},
+             {"window, tail x, norm", 1, 1, false, 1, false, 0, false, true, 2048},
+             {"full, tail sum, a part block", 3, 3, false, 2, false, 0, false, false, 2336},
+             {"full, tail sum, messages, a part warp", 4, 3, true, 2, false, 0, false, false, 2312},
+             {"ffn, block start, norm, widest", 2, 1, false, 1, true, 1, false, true, 3072},
+             {"full, tail sum, 3 norms, 40 tokens", 3, 3, false, 2, false, 0, false, true, 2304, 40}}) {
+        guarded([&] { test_mix_conv(tc); });
+    }
     for (int rows : {1, 2, 4, 8}) {
-        test_mmvq_jobs(8, "Q8_0", 2304, 8, rows);
-        test_mmvq_jobs(12, "Q4_K", 2304, 8, rows);
-        test_mmvq_jobs(13, "Q5_K", 2304, 8, rows);
-        test_mmvq_jobs(14, "Q6_K", 2304, 8, rows);
+        guarded([&] { test_mmvq_jobs(8, "Q8_0", 2304, 8, rows); });
+        guarded([&] { test_mmvq_jobs(12, "Q4_K", 2304, 8, rows); });
+        guarded([&] { test_mmvq_jobs(13, "Q5_K", 2304, 8, rows); });
+        guarded([&] { test_mmvq_jobs(14, "Q6_K", 2304, 8, rows); });
     }
     for (int rows : {1, 3}) {   // 2 rows a block; fewer matrices
         for (int count : {3, 8}) {
-            test_mmvq_jobs(8, "Q8_0", 512, count, rows);
-            test_mmvq_jobs(12, "Q4_K", 512, count, rows);
-            test_mmvq_jobs(13, "Q5_K", 512, count, rows);
-            test_mmvq_jobs(14, "Q6_K", 512, count, rows);
+            guarded([&] { test_mmvq_jobs(8, "Q8_0", 512, count, rows); });
+            guarded([&] { test_mmvq_jobs(12, "Q4_K", 512, count, rows); });
+            guarded([&] { test_mmvq_jobs(13, "Q5_K", 512, count, rows); });
+            guarded([&] { test_mmvq_jobs(14, "Q6_K", 512, count, rows); });
         }
     }
-    test_mmvq_jobs(8, "Q8_0", 2304, 2, 1);
-    for (int count : {2, 5, 8}) test_mmvq_jobs_mixed(2304, count);
-    test_mmvq_jobs_mixed(512, 8);   // 2 rows a block for every format
+    guarded([&] { test_mmvq_jobs(8, "Q8_0", 2304, 2, 1); });
+    for (int count : {2, 5, 8}) guarded([&] { test_mmvq_jobs_mixed(2304, count); });
+    guarded([&] { test_mmvq_jobs_mixed(512, 8); });   // 2 rows a block for every format
     // Inkling 2's experts: IQ4_NL and Q8_0 (IQ4_NL's file), Q2_0 (UD-Q2_K_XL's downs); a tail of rows
     for (int count : {1, 8}) {
-        test_slots_lanes(20, "IQ4_NL", 2304, 2304, count);
-        test_slots_lanes(20, "IQ4_NL", 1152, 2304, count);
-        test_slots_lanes(8, "Q8_0", 2304, 2304, count);
-        test_slots_lanes(8, "Q8_0", 1152, 2304, count);
-        test_slots_lanes(42, "Q2_0", 1152, 2304, count);
+        guarded([&] { test_slots_lanes(20, "IQ4_NL", 2304, 2304, count); });
+        guarded([&] { test_slots_lanes(20, "IQ4_NL", 1152, 2304, count); });
+        guarded([&] { test_slots_lanes(8, "Q8_0", 2304, 2304, count); });
+        guarded([&] { test_slots_lanes(8, "Q8_0", 1152, 2304, count); });
+        guarded([&] { test_slots_lanes(42, "Q2_0", 1152, 2304, count); });
     }
-    test_slots_lanes(20, "IQ4_NL", 2304, 2301, 8);
-    test_slots_lanes(8, "Q8_0", 1152, 37, 3);
+    guarded([&] { test_slots_lanes(20, "IQ4_NL", 2304, 2301, 8); });
+    guarded([&] { test_slots_lanes(8, "Q8_0", 1152, 37, 3); });
     // UD-Q2_K_XL's gate and up, and IQ1_M: iq_kernels.cu's, the grid staged; 8 rows a warp and its tails
     for (int count : {1, 8}) {
-        test_slots_lanes(19, "IQ1_S", 2304, 2304, count);
-        test_slots_lanes(16, "IQ2_XXS", 2304, 2304, count);
-        test_slots_lanes(17, "IQ2_XS", 2304, 2304, count);
-        test_slots_lanes(22, "IQ2_S", 2304, 2304, count);
-        test_slots_lanes(29, "IQ1_M", 2304, 2304, count);
+        guarded([&] { test_slots_lanes(19, "IQ1_S", 2304, 2304, count); });
+        guarded([&] { test_slots_lanes(16, "IQ2_XXS", 2304, 2304, count); });
+        guarded([&] { test_slots_lanes(17, "IQ2_XS", 2304, 2304, count); });
+        guarded([&] { test_slots_lanes(22, "IQ2_S", 2304, 2304, count); });
+        guarded([&] { test_slots_lanes(29, "IQ1_M", 2304, 2304, count); });
     }
-    test_slots_lanes(19, "IQ1_S", 2304, 2301, 8);
-    test_slots_lanes(29, "IQ1_M", 1024, 37, 3);
-    test_slots_lanes(22, "IQ2_S", 1024, 37, 3);
+    guarded([&] { test_slots_lanes(19, "IQ1_S", 2304, 2301, 8); });
+    guarded([&] { test_slots_lanes(29, "IQ1_M", 1024, 37, 3); });
+    guarded([&] { test_slots_lanes(22, "IQ2_S", 1024, 37, 3); });
     // the other formats of native_mmvq.cu's lanes kernel
-    test_slots_lanes(2, "Q4_0", 2304, 1152, 3);
-    test_slots_lanes(6, "Q5_0", 1152, 37, 3);
-    test_slots_lanes(39, "MXFP4", 2880, 2880, 3);
-    test_slots_lanes(10, "Q2_K", 2304, 1152, 3);
-    test_slots_lanes(11, "Q3_K", 2304, 37, 3);
-    test_slots_lanes(12, "Q4_K", 2304, 1152, 3);
-    test_slots_lanes(13, "Q5_K", 1280, 512, 3);
-    test_slots_lanes(14, "Q6_K", 2304, 1152, 3);
-    test_slots_lanes(23, "IQ4_XS", 1536, 2301, 8);
+    guarded([&] { test_slots_lanes(2, "Q4_0", 2304, 1152, 3); });
+    guarded([&] { test_slots_lanes(6, "Q5_0", 1152, 37, 3); });
+    guarded([&] { test_slots_lanes(39, "MXFP4", 2880, 2880, 3); });
+    guarded([&] { test_slots_lanes(10, "Q2_K", 2304, 1152, 3); });
+    guarded([&] { test_slots_lanes(11, "Q3_K", 2304, 37, 3); });
+    guarded([&] { test_slots_lanes(12, "Q4_K", 2304, 1152, 3); });
+    guarded([&] { test_slots_lanes(13, "Q5_K", 1280, 512, 3); });
+    guarded([&] { test_slots_lanes(14, "Q6_K", 2304, 1152, 3); });
+    guarded([&] { test_slots_lanes(23, "IQ4_XS", 1536, 2301, 8); });
     if (bench) bench_attend(table, dtable), bench_decode(table, dtable);
     cudaFree(dtable);
 
