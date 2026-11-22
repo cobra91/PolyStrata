@@ -7,7 +7,8 @@ layers. Layers 6 to 17 run three times for each token, so a token goes through 4
 layers in six look back only 1,024 tokens. PolyStrata runs [ggml-org's GGUF files](https://huggingface.co/ggml-org/Inkling-2-Mini-GGUF)
 and [Unsloth's UD-Q2_K_XL](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) on the strata-poly engine.
 
-**It is experimental and new.** Support was added on 2026-11-21. It has run on one PC so far (below). Its logits were
+**It is experimental and new.** Support was added on 2026-11-21. Its speeds below are from one PC with an RTX 2070 Super
+8 GB unless a row names a rented card. Its logits were
 checked against llama.cpp's on the same files (below): the same most likely next token after each of the prompts, and
 the same at 29 to 32 of 32 steps with llama.cpp's own answer fed in.
 
@@ -77,6 +78,11 @@ writing went from 62.5-62.8 to 69.8-70.2 tokens/s with IQ4_NL after a 302-token 
 67.4-67.8 after 8,192 tokens, and from 71.8-72.6 to 82.1-82.6 (+14%) and 69.6-70.2 to 78.7-79.4 with UD-Q2_K_XL. A card
 that holds only some of the experts, as the 8 GB one above, runs as before.
 
+A token's launches are fewer too, on every card: a visit's norms and Q8_1 copies, the cache store and its clip, the
+attention's gate and the mixes around it go in fewer kernels that write the same bits as the separate ones (the
+kernel test compares them). With UD-Q2_K_XL on the RTX 3090 a token took 890 kernels on the card instead of 1,391
+(nsys, every expert in VRAM).
+
 IQ4_NL's speed depends on its expert profile (`--expert-profile`, which the server keeps up to date): it chooses the
 experts the card holds. On 100 questions (50 GSM8K, 50 MMLU-Pro, greedy, medium reasoning) IQ4_NL got 49 and 44
 right, UD-Q2_K_XL 48 and 41; the two gave the same answer to 92 of the 100.
@@ -93,15 +99,19 @@ About 4.6 GiB of experts fit on the 8 GB card. At most 7.5 GiB of VRAM was in us
 | **Disk** | 17.6, 9.1 or 27.8 GB for the model file. |
 | **System** | Linux and a current NVIDIA driver. Setup asks before it installs it on Windows: it was not built or run there. |
 
-It is not offered on AMD or Intel cards or on a Mac: the engine code for it was written for NVIDIA cards only. Two or
+Setup does not offer it on AMD or Intel cards or on a Mac. The engine builds and runs it on AMD cards with HIP (an
+RX 9070 XT with ROCm 7.2.4, and an RX 9060 XT), but its prompt speed there is not tuned yet. Two or
 more NVIDIA cards can split its layers ([Two or more cards](#two-or-more-cards)). It can answer several requests at once
 (`--parallel`, see [Several requests at once](#several-requests-at-once)). Its attention caches are fp16, or q8_0 with
 `--kv q8_0`, which halves them: a 128K context then takes about 2.3 GiB of VRAM when it is full, in fp16 4.3 GiB. On an
 8 GB card, use q8_0 for contexts past 32K. The file allows 1,048,576 tokens and the engine sets no limit of its own, but
-the cache stays in VRAM (about 17 KiB a token in q8_0; the engine's KV streaming is not wired up for this model), and it
-was tried up to a 128K context, with prompts of up to 35K tokens. Pictures are optional: see [Images](#images). It has
-no draft model, so it writes one token at a time unless you let it guess from the conversation (`--window`, see
-[Guesses from the conversation](#guesses-from-the-conversation)).
+the cache stays in VRAM (about 17 KiB a token in q8_0; the engine's KV streaming is not wired up for this model).
+Prompts were tried up to 131,008 tokens on the RTX 2070 Super 8 GB (a 128K context, q8_0 caches) and up to 1,048,576
+on a rented A100 40 GB (UD-Q2_K_XL, every expert in VRAM, q8_0 caches, an earlier build: read in 1,782 s, then 17.8
+tokens/s writing, 27.7 GB of VRAM at most). Pictures are optional: see [Images](#images). It writes one token at a
+time unless it guesses from the conversation (`--window`, see
+[Guesses from the conversation](#guesses-from-the-conversation)) or with its drafter (see
+[Guesses from its DSpark drafter](#guesses-from-its-dspark-drafter)).
 
 ## Install
 
@@ -347,25 +357,27 @@ the next one is a token's residual streams, the four blocks' starts and the loop
 A card that holds every expert of its own layers runs a token's layers there as one CUDA graph, as a single card that
 holds them all does ([How fast is it?](#how-fast-is-it)); the others run theirs launch by launch.
 
-Two RTX 3070 8 GB split at 18 wrote faster than one of them, by how much depending on the model and the prompt.
-Split at 6, both models wrote slower than at 18.
+Two RTX 3070 8 GB split at 18 wrote 12% to 21% faster than one of them. Split at 6, both models wrote slower than
+at 18 (an earlier build on another box).
 
-> **Measured on:** 2 x RTX 3070 8 GB (rented; no P2P, so the hand-off goes through host memory), 2 x Xeon E5-2699 v3
-> (36 cores, 34 CPU threads), q8_0 caches, the experts each card holds in VRAM, greedy answers of 256 tokens, two runs
-> each, with the split's code on inkling2 791be9e. The CPU is much faster than a desktop's, so the one-card numbers,
-> and with them what a second card adds, are not those of a PC with fewer cores. HIP and Metal were not built.
+> **Measured on:** 2 x RTX 3070 8 GB (rented; PCIe 3.0 x16, no P2P, so the hand-off goes through host memory), a Xeon
+> E5-2650 v4 (24 threads), q8_0 caches, the experts each card holds in VRAM, greedy answers of 256 tokens, two runs
+> each, inkling2 6e61054. The CPU has more cores than a desktop's, so the one-card numbers, and with them what a
+> second card adds, are not those of a PC with fewer cores.
 
 | | One card | Split at 18 |
 | --- | ---: | ---: |
-| IQ4_NL, after 302 tokens | 46.8-47.0 tokens/s | 53.6-54.7 (+15%) |
-| IQ4_NL, after 1,500 tokens | 47.7 | 49.5-52.6 (+4% to +10%) |
-| UD-Q2_K_XL, after 302 tokens | 61.2-61.6 | 68.5-68.9 (+12%) |
-| UD-Q2_K_XL, after 1,500 tokens | 58.3-59.8 | 66.8-67.1 (+13% to +15%) |
+| IQ4_NL, after 302 tokens | 44.9-45.1 tokens/s | 52.7-52.8 (+17%) |
+| IQ4_NL, after 1,500 tokens | 44.9 | 50.2-50.4 (+12%) |
+| UD-Q2_K_XL, after 302 tokens | 56.6-56.9 | 68.0-68.2 (+20%) |
+| UD-Q2_K_XL, after 1,500 tokens | 54.3-54.5 | 65.6-65.7 (+21%) |
 
-At 18 the IQ4_NL cards held 1,176 of layers 0 to 17's 2,304 experts and 694 of layers 18 to 23's 768; UD-Q2_K_XL's
-2,195 and all 768. The IQ4_NL prompts read faster too (264 and 499 tokens/s on one card, 305 and 651 split); the
-UD-Q2_K_XL prompt of 1,500 tokens read about as fast (804 and 793 tokens/s). With every expert on the CPU the split
-gave the same logits as one card to the byte, both sizes, split at 18, 6 and 3.
+At 18 the IQ4_NL cards held 1,175 of layers 0 to 17's 2,304 experts and 694 of layers 18 to 23's 768; UD-Q2_K_XL's
+2,194 and all 768. `"auto"` chose 18 too. The prompts read faster split, except UD-Q2_K_XL's of 1,500 tokens: IQ4_NL
+221-226 and 640-650 tokens/s on one card, 257-269 and 989-990 split; UD-Q2_K_XL 363-374 and 1,084-1,093 on one card,
+493-503 and 1,089-1,096 split. With every expert on the CPU the split gave the same logits as one card to the byte
+(both sizes, fp16 and q8_0, split at 18 and `"auto"`; an earlier build at 6 and 3 too), and with the experts in VRAM
+held still the split gave the same logits and greedy answers with and without `--no-graphs`.
 
 ## Images
 
