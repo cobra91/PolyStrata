@@ -1,6 +1,6 @@
 """Tests for setup.py's Inkling 2 Mini (docs/models/inkling.md): its pinned files, the estimates for an 8 GB card, the
 install by GLM's steps with no draft model unless its DSpark drafter is asked for (offered only where the card holds
-most experts), the model's sampling defaults in the run config, NVIDIA only, and its image encoder: opt-in, built from
+every expert), the model's sampling defaults in the run config, NVIDIA only, and its image encoder: opt-in, built from
 its own llama.cpp pin into a folder of its own (the other families' encoder and its stamp are left alone).  Mocked
 like tools/test_setup_glm.py, whose harness this uses.
 

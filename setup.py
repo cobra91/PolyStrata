@@ -8105,7 +8105,7 @@ def main() -> int:
                     help="let the model read images (yes = the encoder on the GPU)")
     ap.add_argument("--dspark", choices=["yes", "no"],
                     help="Inkling 2 Mini: speculative decoding with its own DSpark drafter (a 0.4 GB download; "
-                         "offered by default only where the card holds most of the experts)")
+                         "offered by default only where the card holds every expert)")
     ap.add_argument("--vision-tokens", type=int, metavar="N",
                     help="the most image tokens a picture becomes (default 1024 with the encoder on the GPU, 300 on "
                          "the CPU): more reads small text and charts better, and takes longer to encode; remembered "
