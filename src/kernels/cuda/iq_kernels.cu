@@ -3602,6 +3602,14 @@ __global__ void __launch_bounds__(128) mmvq_slots_staged_kernel(S slots, size_t 
     }
 }
 
+// On HIP the cached experts' launches keep mmvq_slots_kernel even where the engine asks for lanes: an RX 9070 XT read
+// IQ1_S, IQ2_XXS and IQ2_S experts at 208 / 159 / 177 GB/s through it and 177 / 146 / 166 staged (the same bits).
+#if defined(__HIPCC__)
+#define STRATA_STAGED_SLOTS(T) false
+#else
+#define STRATA_STAGED_SLOTS(T) kStageIqGrid<T>
+#endif
+
 template<typename S>
 void slots_of(int t, const S& slots, int count, int n_in, int n_out, void* stream) {
     const size_t rb = iq_row_bytes(t, n_in);
@@ -3610,7 +3618,7 @@ void slots_of(int t, const S& slots, int count, int n_in, int n_out, void* strea
     switch (t) {
 #define STRATA_MMVQ(T)                                                                                              \
     case T:                                                                                                         \
-        if constexpr (kStageIqGrid<T>) {                                                                            \
+        if constexpr (STRATA_STAGED_SLOTS(T)) {                                                                     \
             if (slots.lanes && !g_old_kernels && g_stage_grid) {                                                    \
                 mmvq_slots_staged_kernel<T, S><<<staged, block, 0, (cudaStream_t) stream>>>(slots, rb, n_in, n_out); \
                 break;                                                                                              \
@@ -3622,6 +3630,7 @@ void slots_of(int t, const S& slots, int count, int n_in, int n_out, void* strea
 #undef STRATA_MMVQ
         default: std::fprintf(stderr, "iq_mmvq_slots: type %d is not supported\n", t); std::exit(1);
     }
+#undef STRATA_STAGED_SLOTS
     check("iq_mmvq_slots");
 }
 }  // namespace
