@@ -1,7 +1,8 @@
 // metal/src/poly/unported.cpp - the entry points of the shared strata-poly host code that have no Metal kernel yet.
 // None of them is on a Mac family's default path: llama.cpp's flash attention (which falls back to attend() and
 // attend_batch() by its own contract), Gemma 4's opt-in int8 attention caches, Clover's block guesses and coreset
-// routing, the half-sum guard of Flint's MMQ, and Inkling 2's SiTU (the engine does not run Inkling 2 on Metal).
+// routing, the half-sum guard of Flint's MMQ, and Inkling 2's SiTU and tables of MMQ tiles (the engine does not run
+// Inkling 2 on Metal).
 // A call that would need a kernel says what is missing instead of computing something else.
 #include "fattn.hpp"
 #include "mmq.hpp"
@@ -73,6 +74,15 @@ void scale_rows(float*, int64_t, int, int, const int32_t*, const float*, bool, v
 
 // Metal's tiles take no stream-k scratch: nothing to take ahead (Inkling 2's, which Metal does not run)
 void Mmq::reserve_fixup() {}
+// the tables of tiles of Inkling 2's prompt experts (Engine::expert_tiles_): false keeps the engine on mul()
+bool Mmq::tiles_fit(int, int64_t, int64_t, bool) { return false; }
+void Mmq::plan_tiles(int, const int32_t*, const int32_t*, const int32_t*, int, std::vector<Tile>&) {
+    unported("tables of MMQ tiles (Inkling 2)");
+}
+void Mmq::mul_tiles(const void*, const int64_t*, int, int64_t, int64_t, const void*, int64_t, int64_t, const Tile*,
+                    const Tile*, int, const int32_t*, float*, int64_t, void*) {
+    unported("tables of MMQ tiles (Inkling 2)");
+}
 void situ_rows(const float*, float*, int, int, float, float, void*, const ExpertScales*) {
     unported("SiTU (Inkling 2)");
 }
