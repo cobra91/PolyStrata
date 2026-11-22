@@ -159,6 +159,18 @@ TURN_OPENERS = {"function": ("<|im_start|>",), "gemma": ("<|turn>",),
 # number from 0 to 0.99) for the levels effort_kwargs() makes.  A client's "high" arrives as "xhigh" there
 # (frontend.EFFORT), which is Inkling's "high"; thinking off is its "none".
 INKLING_EFFORT = {"xhigh": "high"}
+
+
+def inkling_kwargs(kwargs: dict) -> dict:
+    """The template arguments of an Inkling prompt (render_prompt(), and resolve_prefix()'s head of it): its template
+    reads only reasoning_effort, so thinking off is its "none" and a level its own name (INKLING_EFFORT)."""
+    out = {k: v for k, v in kwargs.items() if k != "enable_thinking"}
+    effort = kwargs.get("reasoning_effort")
+    if kwargs.get("enable_thinking") is False:
+        out["reasoning_effort"] = "none"
+    elif effort not in (None, ""):
+        out["reasoning_effort"] = INKLING_EFFORT.get(effort, effort)
+    return out
 WARM_MIN_TOKENS = 2048           # a shorter prompt start is quick to read again: not kept
 # #606: a reply that repeats one token this many times in a row is ended there ("length"): a model in a loop, or a
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
@@ -4518,12 +4530,7 @@ class Service:
             # Inkling's template reads only reasoning_effort, and writes it in a system block before the first
             # message that is not a system one: effort_end's turn at the end is not its form.  Its prompt ends on a
             # closed block; the model writes the header of its reply itself, as with llama.cpp.
-            kwargs.pop("enable_thinking", None)
-            if off:
-                kwargs["reasoning_effort"] = "none"
-            elif effort not in (None, ""):
-                kwargs["reasoning_effort"] = INKLING_EFFORT.get(effort, effort)
-            return self.template.render(messages, tools=tools, **kwargs)
+            return self.template.render(messages, tools=tools, **inkling_kwargs(kwargs))
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
             prompt = self.template.render(messages, tools=tools, **kwargs)
             if self.call_format == "gemma":
@@ -4805,8 +4812,11 @@ class Service:
             marked, marked_tools, changed = mark_think_literals(msgs, tools, self.literals)
             effort = kwargs.get("reasoning_effort")
             off = kwargs.get("enable_thinking") is False        # render_prompt's rule for #458's effort_end
-            kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
-                  if self.effort_end and (off or effort not in (None, "", "xhigh", "high")) else dict(kwargs))
+            if self.call_format == "inkling":                   # render_prompt's arguments for its template
+                kw = inkling_kwargs(kwargs)
+            else:
+                kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
+                      if self.effort_end and (off or effort not in (None, "", "xhigh", "high")) else dict(kwargs))
             kw["add_generation_prompt"] = False
             text = self.template.render(marked, tools=marked_tools, **kw)
             cut = text.find(self.PREFIX_END)

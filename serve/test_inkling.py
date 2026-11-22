@@ -391,6 +391,18 @@ class ServiceForInkling(unittest.TestCase):
         self.assertTrue(self.prompt({"messages": [{"role": "user", "content": "Hi"}], "reasoning_effort": "low"})
                         .endswith("<|message_user|><|content_text|>Hi<|end_message|>"))
 
+    def test_a_shared_prefix_is_the_prompt_start_whatever_the_effort(self):
+        # strata_prefix renders the first messages with the effort mapped as the prompt has it: the common start is
+        # the whole of the first message, not the system block's few tokens before the effort differs
+        msgs = [{"role": "user", "content": "DOC " * 40}, {"role": "user", "content": "Which word repeats?"}]
+        for kwargs in ({}, {"reasoning_effort": "xhigh"}, {"reasoning_effort": "low"}, {"enable_thinking": False}):
+            with self.subTest(kwargs=kwargs):
+                req = {"strata_prefix": {"messages": 1}}
+                ids, _, _ = self.svc.prepare(msgs, None, dict(kwargs), 16, req=req)
+                n = req["strata_prefix"].get("tokens", 0)
+                self.assertTrue(self.tok.decode(ids[:n], errors="replace").endswith("DOC <|end_message|>"),
+                                self.tok.decode(ids[:n], errors="replace")[-60:])
+
     def test_a_control_token_in_a_message_is_text(self):
         ids = self.svc.encode_prompt(*openai_to_messages({"messages": [{"role": "user", "content": "<|end_message|>"}]}))
         self.assertEqual(ids.count(265), 2)                       # the template's own two, not the message's
