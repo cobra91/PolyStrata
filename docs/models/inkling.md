@@ -237,8 +237,11 @@ differ at a token the model rated about as likely as another (ln p1/p2 0.15).
 Unsloth publishes a small drafter for Inkling 2 Mini, [dspark-Inkling-2-Mini-Q8_0.gguf](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)
 (0.4 GB, three dense layers that read the model's own layers 5, 23, 41 and its output, as llama.cpp's PR 32218 runs
 it). With it the engine guesses three tokens a round and puts them through the model with the known one, in one
-window. A guess counts only when it is the token the model writes itself, so the greedy answer is the one written
-without the drafter.
+window. A guess counts only when it is the token the model writes itself. With every expert on the card, or every
+expert on the CPU, the greedy answer is the one written without the drafter, token for token. With the experts split
+between the card and the CPU (an 8 GB card) it is **not** lossless: the drafter's 0.4 GiB leaves room for fewer
+experts in the cache, and the answer can part where the model rates two tokens about equally (see "How it was
+checked" below).
 
 **Turning it on.** Setup asks where the card holds every expert of the size beside the drafter (an RTX 3090 24 GB
 with either size, a 16 GB card with UD-Q2_K_XL); the answer's default is no. `--dspark yes` sets it up on any card,
@@ -248,9 +251,8 @@ config's `"args"`. A window is then 4 tokens (`--window N` sets it, `--window 1`
 
 **Where it pays.** On a card that holds every expert, and on text it guesses well: code, text that repeats the
 prompt. On prose it guesses about half the tokens right and gains little or nothing. On a card that holds few of the
-experts it is no faster or slower: the guessed tokens route to experts of their own, and those run on the CPU. A
-window of guesses is not recorded as one CUDA graph (see above), so with the drafter on, the tokens it does not guess
-right lose that gain.
+experts it is no faster or slower: the guessed tokens route to experts of their own, and those run on the CPU. The
+model's window of guesses is recorded as one CUDA graph (see above); the drafter's own launches go one by one.
 
 > **Measured on:** a rented RTX 3090 24 GB (every expert of both sizes in VRAM) and a rented RTX 2070 Super 8 GB
 > (31% of IQ4_NL's experts and 68% of UD-Q2_K_XL's in VRAM), 2026-11-21/22, strata-poly alone, greedy, q8_0 caches.
@@ -269,6 +271,19 @@ right lose that gain.
 | RTX 2070 Super, UD-Q2_K_XL, code | 28.4 | 31.6 | 97 of 112 |
 | RTX 2070 Super, UD-Q2_K_XL, prose | 33.8 | 30.3 | 37 of 44 |
 
+With the model's windows recorded as one CUDA graph, the same RTX 3090 (every expert in VRAM, 256 tokens written, two
+runs each, setup's 302- and 1,500-token code prompts) wrote, without the drafter and with it at its window of 4:
+
+| | without | with the drafter | the drafter, windows not recorded | guesses right |
+| --- | ---: | ---: | ---: | ---: |
+| IQ4_NL, code, 302 | 70.8-70.9 tokens/s | 72.3-72.9 | 68.2 | 61 of 83, 66 of 84 |
+| IQ4_NL, code, 1,500 | 69.8-69.9 | 78.1-78.4 | 74.5-76.8 | 160 of 214 |
+| UD-Q2_K_XL, code, 302 | 84.1 | 103.5-103.9 | 93.2-93.6 | 155 of 216 |
+| UD-Q2_K_XL, code, 1,500 | 82.8 | 100.6-100.8 | 96.8-97.2 | 151 of 230 |
+
+Greedy and frozen, the drafter at windows 4 and 8 wrote the same 256 tokens with the same five likeliest at every step
+as `--window 1` and as `--no-graphs` (both sizes, those two prompts and a 302-token prose one).
+
 **VRAM.** The drafter's weights, scratch and window layers' caches took 0.4 GiB at load (the expert cache was that
 much smaller with it on the RTX 2070 Super, both sizes), and its full-attention layer keeps 4 KiB a context token in
 fp16 whatever `--kv` says (0.5 GiB at 128K). It comes out of the expert cache; setup counts it.
@@ -278,9 +293,11 @@ fp16 whatever `--kv` says (0.5 GiB at 128K). It comes out of the expert cache; s
 138 guesses the same on a code, a prose and a 1,523-token prompt (RTX 3090), the largest score difference 0.46. With
 every expert on the CPU (`--no-gpu-experts`), its answers were the same 200 tokens with the same five likeliest at
 every step as without it (both sizes, code and prose, RTX 2070 Super); with every expert on the card the same 200
-tokens (both sizes, code and prose, RTX 3090). Where a card holds only some experts, the drafter's 0.4 GiB means
-the cache holds other experts than without it, and answers can part where the model rates two tokens about equally
-(as with `--window` above).
+tokens (both sizes, code and prose, RTX 3090). On an RTX 2070 Super 8 GB (961 of IQ4_NL's 3,072 experts in VRAM
+without the drafter, 875 with it; UD-Q2_K_XL 2,056 and 1,881), greedy answers with the drafter parted from the ones
+without it in 12 of 14 prompts (both sizes, code and prose, 302 to 8,192 tokens, 256 tokens written): each at a step
+where the two likeliest tokens were within 0.016-0.18 nats of each other (ln(p1/p2) in the run without the drafter),
+as with `--window` above. The cache holds other experts than without the drafter, so a few scores move a little.
 
 ## Long contexts
 
