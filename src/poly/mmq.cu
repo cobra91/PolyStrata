@@ -6,11 +6,26 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 
+#if STRATA_POLY_MMQ_TILES
+#include "mmq_tiles.cuh"
+#endif
+
+#include <algorithm>
 #include <cstdlib>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 
 namespace strata::poly {
+
+#if STRATA_POLY_MMQ_TILES
+// The types with mul_tiles() kernels: Inkling 2 Mini's experts in its GGUFs (one instance TU each in CMakeLists.txt,
+// mmq_tiles_instance.cu.in)
+#define STRATA_POLY_MMQ_TILE_TYPES(X) X(Q8_0) X(IQ1_S) X(IQ2_XXS) X(IQ2_XS) X(IQ2_S) X(IQ4_NL) X(Q2_0)
+#define X(T) extern template void mul_mat_q_tiles_case<GGML_TYPE_##T>(const MmqTilesArgs&, int, size_t, cudaStream_t);
+STRATA_POLY_MMQ_TILE_TYPES(X)
+#undef X
+#endif
 
 #if STRATA_POLY_NVFP4
 // mmq_nvfp4.cu
@@ -189,6 +204,115 @@ void Mmq::mul(const void* w, int type, int64_t w_rows, int64_t w_cols, size_t st
         default: throw std::runtime_error("mmq: tensor type " + std::to_string(type) + " is not built");
     }
     ck("mmq product");
+}
+
+bool Mmq::tiles_fit(int type, int64_t w_rows, int64_t w_cols, bool q2_0) {
+#if STRATA_POLY_MMQ_TILES
+    const ggml_type t = (ggml_type) type;
+    if (t == GGML_TYPE_Q2_0 && !q2_0) return false;
+    switch (t) {
+#define X(T) case GGML_TYPE_##T:
+        STRATA_POLY_MMQ_TILE_TYPES(X)
+#undef X
+        break;
+        default: return false;
+    }
+    const auto& dev = ggml_cuda_info().devices[ggml_cuda_get_device()];
+    int anchor_of[mmq_tiles::kNWidths];
+    size_t shared_of[mmq_tiles::kNWidths];
+    if (mmq_tiles::widths(t, dev.cc, dev.smpbo, anchor_of, shared_of) == 0 || anchor_of[mmq_tiles::kNWidths - 1] == 0)
+        return false;
+    for (int k = 0; k < mmq_tiles::kNWidths; ++k)   // every launch's row tiles cover the matrix
+        if (anchor_of[k] && w_rows % ggml_cuda_mmq_get_config(t, anchor_of[k], false, dev.cc).I != 0) return false;
+    return w_cols % ggml_blck_size(t) == 0;
+#else
+    (void) type;
+    (void) w_rows;
+    (void) w_cols;
+    (void) q2_0;
+    return false;
+#endif
+}
+
+void Mmq::plan_tiles(int type, const int32_t* first, const int32_t* rows, const int32_t* mat, int n,
+                     std::vector<Tile>& out) {
+#if STRATA_POLY_MMQ_TILES
+    const auto& dev = ggml_cuda_info().devices[ggml_cuda_get_device()];
+    int anchor_of[mmq_tiles::kNWidths];
+    size_t shared_of[mmq_tiles::kNWidths];
+    mmq_tiles::widths((ggml_type) type, dev.cc, dev.smpbo, anchor_of, shared_of);
+    constexpr int widest = mmq_tiles::kWidths[mmq_tiles::kNWidths - 1];
+    if (anchor_of[mmq_tiles::kNWidths - 1] == 0)
+        throw std::runtime_error("mmq: no tiles for tensor type " + std::to_string(type));
+    std::vector<int> order((size_t) n);
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return rows[a] > rows[b]; });
+    // the tiles of each anchor's launch, the widest anchor's first
+    std::vector<Tile> other;
+    for (const int i : order) {
+        int at = first[i];
+        const int end = first[i] + rows[i];
+        for (; end - at >= widest; at += widest) out.push_back({at, widest, mat[i], widest});
+        if (at < end) {
+            int k = 0;
+            while (anchor_of[k] == 0 || mmq_tiles::kWidths[k] < end - at) ++k;
+            const Tile t = {at, end - at, mat[i], mmq_tiles::kWidths[k]};
+            (anchor_of[k] == widest ? out : other).push_back(t);
+        }
+    }
+    std::stable_sort(other.begin(), other.end(), [&](const Tile& a, const Tile& b) {
+        const auto anc = [&](const Tile& t) {
+            return anchor_of[std::find(mmq_tiles::kWidths, mmq_tiles::kWidths + mmq_tiles::kNWidths, t.width) -
+                             mmq_tiles::kWidths];
+        };
+        return anc(a) > anc(b);
+    });
+    out.insert(out.end(), other.begin(), other.end());
+#else
+    (void) type;
+    (void) first;
+    (void) rows;
+    (void) mat;
+    (void) n;
+    (void) out;
+    throw std::runtime_error("mmq: this build has no tiles");
+#endif
+}
+
+void Mmq::mul_tiles(const void* w, const int64_t* at, int type, int64_t w_rows, int64_t w_cols, const void* xq,
+                    int64_t row0, int64_t xq_rows, const Tile* tiles, const Tile* host_tiles, int n_tiles,
+                    const int32_t* ids, float* dst, int64_t ld_dst, void* stream) {
+    if (n_tiles <= 0) return;
+#if STRATA_POLY_MMQ_TILES
+    const ggml_type t = (ggml_type) type;
+    const auto& dev = ggml_cuda_info().devices[ggml_cuda_get_device()];
+    const MmqTilesArgs a = {(const char*) w, at, (const int*) xq, ids, tiles, host_tiles, dst, n_tiles, (int) w_rows,
+                            (int) w_cols, (int) xq_rows, (int) ld_dst, (int) row0};
+    const cudaStream_t s = (cudaStream_t) stream;
+    switch (t) {
+#define X(T) case GGML_TYPE_##T: mul_mat_q_tiles_case<GGML_TYPE_##T>(a, dev.cc, dev.smpbo, s); break;
+        STRATA_POLY_MMQ_TILE_TYPES(X)
+#undef X
+        default: throw std::runtime_error("mmq: tensor type " + std::to_string(type) + " has no tiles");
+    }
+    ck("mmq tiles");
+#else
+    (void) w;
+    (void) at;
+    (void) type;
+    (void) w_rows;
+    (void) w_cols;
+    (void) xq;
+    (void) row0;
+    (void) xq_rows;
+    (void) tiles;
+    (void) host_tiles;
+    (void) ids;
+    (void) dst;
+    (void) ld_dst;
+    (void) stream;
+    throw std::runtime_error("mmq: this build has no tiles");
+#endif
 }
 
 }  // namespace strata::poly

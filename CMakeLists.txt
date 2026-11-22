@@ -2107,6 +2107,13 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
       target_compile_options(strata_poly_mmq_mxfp4 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
     endif()
     list(APPEND _strata_poly_mmq_instances $<TARGET_OBJECTS:strata_poly_mmq_mxfp4>)
+    # Mmq::mul_tiles() (src/poly/mmq_tiles.cuh, STRATA_POLY_EXPERT_TILES): a kernel for each type of Inkling 2 Mini's
+    # experts in its GGUFs, each in its own TU
+    foreach(_t q8_0 iq1_s iq2_xxs iq2_xs iq2_s iq4_nl q2_0)
+      string(TOUPPER ${_t} _strata_tiles_T)
+      configure_file(src/poly/mmq_tiles_instance.cu.in ${CMAKE_BINARY_DIR}/poly_mmq_tiles/mmq-tiles-${_t}.cu @ONLY)
+      list(APPEND _strata_poly_mmq_instances ${CMAKE_BINARY_DIR}/poly_mmq_tiles/mmq-tiles-${_t}.cu)
+    endforeach()
   endif()
   if(STRATA_ENABLE_HIP)
     # CMake does not infer HIP from the .cu suffixes outside src/ (and drops a .cu source it has no language
@@ -2117,7 +2124,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   add_library(strata_poly_mmq STATIC src/poly/mmq.cu src/poly/fattn.cu src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu
               ${_strata_poly_mmq_instances})
   target_include_directories(strata_poly_mmq PRIVATE ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq}
-                                                    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+                                                    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/poly)
   target_compile_options(strata_poly_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
   if(MSVC)
     target_compile_options(strata_poly_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
@@ -2126,7 +2133,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
     target_compile_definitions(strata_poly_mmq PRIVATE GGML_USE_HIP=1)
     target_link_libraries(strata_poly_mmq PUBLIC ggml-base hip::host)
   else()
-    target_compile_definitions(strata_poly_mmq PRIVATE STRATA_POLY_NVFP4=1)
+    target_compile_definitions(strata_poly_mmq PRIVATE STRATA_POLY_NVFP4=1 STRATA_POLY_MMQ_TILES=1)
     target_link_libraries(strata_poly_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target})
   endif()
 

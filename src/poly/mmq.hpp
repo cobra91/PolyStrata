@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace strata::poly {
 
@@ -47,6 +48,30 @@ public:
     void mul(const void* w, int ggml_type, int64_t w_rows, int64_t w_cols, size_t stride, int n, const void* xq,
              const int32_t* bounds, const int32_t* ids, int64_t total_rows, int64_t max_rows, float* dst,
              int64_t ld_dst, void* stream);
+
+    /// A tile of mul_tiles(): rows [row, row + rows) of the call's rows times matrix `mat`, in a tile `width`
+    /// columns wide (a width plan_tiles() chose, rows <= width).
+    struct alignas(16) Tile {
+        int32_t row, rows, mat, width;
+    };
+    /// mul_tiles() has kernels for ggml_type on this card, and a matrix of [w_rows, w_cols] of it takes them.  Q2_0
+    /// only when `q2_0`, as fits().  CUDA builds only.
+    static bool tiles_fit(int ggml_type, int64_t w_rows, int64_t w_cols, bool q2_0 = false);
+    /// Appends to `out` the tiles of matrix mat[i] times the rows [first[i], first[i] + rows[i]), for each i < n with
+    /// rows: as many 128 rows wide as it fills, then one of the narrowest width that holds the rest; the matrices
+    /// with the most rows first, a matrix's tiles one after the other (they read the same weights).  On a card whose
+    /// narrow tiles take another block shape (RDNA4), those come after the others, a launch of their own.
+    static void plan_tiles(int ggml_type, const int32_t* first, const int32_t* rows, const int32_t* mat, int n,
+                           std::vector<Tile>& out);
+    /// The product over a table of n_tiles tiles, on the device and here (one launch, or one for each block shape
+    /// the table has: see plan_tiles()): matrix m is [w_rows, w_cols] at w + at[m] bytes (at
+    /// on the device); a tile's rows are rows of xq counted from row0, which quantize() wrote with xq_rows rows, and
+    /// row i's product goes to row ids[i - row0] of dst, ld_dst floats a row.  Each output is one block's sum over
+    /// the whole of K, in the order llama.cpp's MMQ adds a tile it does not split (stream-k): the same to the bit
+    /// whatever the tiles' widths and however the tiles are shared out between launches.  Throws std::runtime_error.
+    void mul_tiles(const void* w, const int64_t* at, int ggml_type, int64_t w_rows, int64_t w_cols, const void* xq,
+                   int64_t row0, int64_t xq_rows, const Tile* tiles, const Tile* host_tiles, int n_tiles,
+                   const int32_t* ids, float* dst, int64_t ld_dst, void* stream);
 
 private:
     void* ctx_ = nullptr;   ///< llama.cpp's launch context: a small scratch pool
