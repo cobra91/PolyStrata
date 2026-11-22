@@ -222,9 +222,9 @@ FALLBACK_FAMILIES = {
                              "Q8_0": {"about": "8-bit throughout: the closest to the model as trained",
                                       "download_gb": 132.6, "ram_gb": 119, "arena_gb": 125.8}}},
     "inkling": {"title": "Inkling 2 Mini",
-                "about": "on the strata-poly engine: one NVIDIA card, Linux; an 18 GB file, ~22 GB of RAM beside an "
-                         "8 GB card (16.5 GiB measured for the engine); a 2-bit and an 8-bit size too, no images",
-                "tag": "inkling2-", "engine": "poly", "vision": False, "experimental": True,
+                "about": "on the strata-poly engine: NVIDIA, Linux; an 18 GB file, ~22 GB of RAM beside an "
+                         "8 GB card (16.5 GiB measured for the engine); a 2-bit and an 8-bit size too, images optional",
+                "tag": "inkling2-", "engine": "poly", "vision": True, "experimental": True,
                 "models": {"IQ4_NL": {"about": "4-bit experts in layers 0-19 (imatrix), 8-bit everywhere else",
                                       "download_gb": 17.6, "ram_gb": 22, "arena_gb": 15.8},
                            "UD-Q2_K_XL": {"about": "Unsloth's 2-bit experts, higher where it matters: the fastest and "
@@ -1148,7 +1148,7 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
                                        "Tiel Coder 35B-A3B (GLM's engine: one NVIDIA card, an 11-25 GB download, "
                                        "15-31 GB of RAM beside an 8 GB card by setup's estimate; images with "
                                        "vision except LFM2.5 and Flint), inkling = Inkling 2 Mini (experimental: "
-                                       "one NVIDIA card, Linux, a 9, 18 or 28 GB download, no images)"},
+                                       "NVIDIA, Linux, a 9, 18 or 28 GB download, images optional)"},
              "model": {"type": "string", "enum": list(dict.fromkeys(
                            [*models, *(m for f in families.values() for m in f.get("models", ()))])),
                        "description": "the size (quantization): see strata_models"},
