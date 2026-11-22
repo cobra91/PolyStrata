@@ -5,6 +5,9 @@
 #include "strata/poly/inkling_kernels.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#if defined(__HIPCC__)
+#include "strata/kernels/gfx_arch.hpp"
+#endif
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -660,15 +663,32 @@ __global__ void __launch_bounds__(AT_THREADS) attn_wmma_kernel(AttnArgs a) {
 #endif
 }
 
-// Whether attn_wmma_kernel runs here: asked for (STRATA_INKLING_WMMA=1).  The arch macros are the device pass's
-// alone, so the host asks the switch only: the kernel itself is a trap on a card without the instruction.
+// Whether attn_wmma_kernel runs here: asked for (STRATA_INKLING_WMMA=1), on a card the kernel has its instructions
+// for (INKLING_WMMA's archs; the macros are the device pass's alone, so the host asks the card's name), elsewhere
+// the kernel being a trap.
 bool wmma_attention() {
 #if defined(__HIPCC__)
-    static const bool on = [] {
+    static const bool asked = [] {
         const char* v = std::getenv("STRATA_INKLING_WMMA");
         return v != nullptr && *v != '\0' && std::string(v) != "0";
     }();
-    return on;
+    if (!asked) return false;
+    static std::atomic<int> cards[kDevices] = {};   // a device's: 1 gfx12, 2 not, 0 not yet asked
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kDevices) {
+        cudaGetLastError();
+        return false;
+    }
+    int card = cards[dev].load(std::memory_order_relaxed);
+    if (!card) {
+        cudaDeviceProp p{};
+        const bool gfx12 = cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                           kernels::gfx_arch_is_gfx12_wmma(p.gcnArchName);
+        card = gfx12 ? 1 : 2;
+        cudaGetLastError();
+        cards[dev].store(card, std::memory_order_relaxed);
+    }
+    return card == 1;
 #else
     return false;
 #endif
@@ -677,10 +697,16 @@ bool wmma_attention() {
 void launch_attn_wmma(const AttnArgs& a, int kv_heads, int rows, cudaStream_t st) {
     constexpr size_t smem = attn_wmma_smem();
     if constexpr (smem > 48 * 1024) {
-        const cudaError_t e =
-            cudaFuncSetAttribute(attn_wmma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
-        if (e != cudaSuccess)
-            throw std::runtime_error(std::string("inkling_attend: shared memory: ") + cudaGetErrorString(e));
+        static std::atomic<bool> set[kDevices] = {};   // the device's own setting: once on each card the calls are for
+        int dev = 0;
+        const bool known = cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < kDevices;
+        if (!known || !set[dev].load(std::memory_order_relaxed)) {
+            const cudaError_t e =
+                cudaFuncSetAttribute(attn_wmma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+            if (e != cudaSuccess)
+                throw std::runtime_error(std::string("inkling_attend: shared memory: ") + cudaGetErrorString(e));
+            if (known) set[dev].store(true, std::memory_order_relaxed);
+        }
     }
     const dim3 g(grid(rows, WMMA_TOKENS), kv_heads);
     attn_wmma_kernel<<<g, AT_THREADS, smem, st>>>(a);
@@ -2850,8 +2876,9 @@ void inkling_attend(const float* q, const uint16_t* kcache, const uint16_t* vcac
         }
     }
     if (at) throw std::invalid_argument("inkling_attend: the position on the card takes the split path and a room");
-    // a block is WMMA_TOKENS tokens of a visit: below that the decode and split paths are the ones to use
-    if (wmma_attention() && !kq && !vq && rows >= WMMA_TOKENS) {
+    // a block is WMMA_TOKENS tokens of a visit: below that the decode and split paths are the ones to use; its bias
+    // reads the table and R four values at a time
+    if (!kq && !vq && rows >= WMMA_TOKENS && rel.n_rel % 4 == 0 && wmma_attention()) {
         launch_attn_wmma(a, kv_heads, rows, st);
         if (gate) mul_sigmoid(out, gate, n_head * dim, rows, n_head * dim, false, stream);
         if (out_q8_1) kernels::native_quantize_q8_1(out, out_q8_1, n_head * dim * rows, 1, stream);
