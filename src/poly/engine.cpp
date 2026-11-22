@@ -1764,7 +1764,8 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
 #if defined(STRATA_GPU_METAL)
         if (inkling) throw std::runtime_error(o.model + " is an Inkling 2 model, which the Metal engine does not run yet");
 #elif defined(STRATA_USE_HIP)
-        if (inkling) return std::make_unique<Inkling>();   // the HIP backend runs it: 3,072 of 3,072 experts, 1.8 s
+        // HIP runs it as CUDA does (an RX 9060 XT loaded UD-Q2_K_XL with all 3,072 experts in VRAM in 1.8 s)
+        if (inkling) return std::make_unique<Inkling>();
 #else
         if (inkling) return std::make_unique<Inkling>();
 #endif
