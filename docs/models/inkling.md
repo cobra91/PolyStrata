@@ -68,9 +68,10 @@ tokens more, and after a 32,765-token prompt read in four reads that followed a 
 
 On a card that holds every expert, a token written on its own runs as one CUDA graph: its 48 layer runs and their
 experts are recorded once (again when the context outgrows the size they were recorded for) and replayed, so the CPU
-hands the card 4 launches a token instead of 1,059 (IQ4_NL) or 1,167 (UD-Q2_K_XL). Not recorded: several requests at
-once (`--parallel`), a window of guesses (`--window` above 1), a picture's tokens and `--dump-layers`. `--no-graphs`
-turns it off; the output is the same to the bit either way. On a rented RTX 3090 24 GB (every expert in VRAM,
+hands the card 4 launches a token instead of 1,059 (IQ4_NL) or 1,167 (UD-Q2_K_XL). A window of guesses (`--window`
+above 1) is recorded the same way, once for each number of tokens it puts through the model, and its guesses are
+checked between windows as before. Not recorded: several requests at once (`--parallel`), a picture's tokens and
+`--dump-layers`. `--no-graphs` turns it off; the output is the same to the bit either way. On a rented RTX 3090 24 GB (every expert in VRAM,
 strata-poly alone, a 16K context, q8_0 caches, 256 tokens written, the build before and this one in turn, two runs each)
 writing went from 62.5-62.8 to 69.8-70.2 tokens/s with IQ4_NL after a 302-token prompt (+11%), from 60.8-61.3 to
 67.4-67.8 after 8,192 tokens, and from 71.8-72.6 to 82.1-82.6 (+14%) and 69.6-70.2 to 78.7-79.4 with UD-Q2_K_XL. A card
@@ -176,10 +177,8 @@ rarely and costs about nothing. On a card that holds few of the experts it gains
 tokens run on the CPU, which takes about as long for a guessed token as for one alone.
 
 > **Measured on:** RTX 2070 Super 8 GB (Ryzen 5 3600XT, 62 GB DDR4), 128K context, q8_0 caches, the model's expert
-> profile; an RTX 3090 24 GB (rented, every expert of both sizes in VRAM), the same context and caches. Greedy answers
-> of 300 tokens, two runs each. "Code": a 373-token prompt that asks for a 25-line Python file back with a function
-> renamed; "text": a 37-token question on hash tables. The RTX 3090 rows are from an earlier build: the same window
-> code on an earlier revision of the batch slots.
+> profile. Greedy answers of 300 tokens, two runs each. "Code": a 373-token prompt that asks for a 25-line Python
+> file back with a function renamed; "text": a 37-token question on hash tables.
 
 | | `--window 1` | `--window 4` | Guesses right |
 | --- | ---: | ---: | ---: |
@@ -187,10 +186,35 @@ tokens run on the CPU, which takes about as long for a guessed token as for one 
 | RTX 2070 Super, IQ4_NL, text | 36.7-37.8 | 36.7-37.2 | 2 of 12, 4 of 14 |
 | RTX 2070 Super, UD-Q2_K_XL, code | 47.1-47.4 | 47.9-48.1 | 40 of 60, 40 of 60 |
 | RTX 2070 Super, UD-Q2_K_XL, text | 48.2-48.4 | 48.8-48.8 | 14 of 19, 13 of 19 |
-| RTX 3090, IQ4_NL, code | 59.4-59.8 | 64.3-64.4 | 56 of 99 |
-| RTX 3090, IQ4_NL, text | 58.0-59.8 | 59.9-60.1 | 7 of 16 |
-| RTX 3090, UD-Q2_K_XL, code | 68.1-68.2 | 74.6-75.2 | 64 of 128 |
-| RTX 3090, UD-Q2_K_XL, text | 68.2-68.5 | 70.1-70.2 | 16 of 25 |
+
+On a card that holds every expert a window goes through the model as one CUDA graph, as a token alone does (see
+above), so the guesses gain on top of the graph's gain. With `--window 4` on a rented RTX 3090 the host handed the card
+5.6 launches a window instead of 787 (IQ4_NL) and 24 instead of 921 (UD-Q2_K_XL; nsys, the 128 tokens between a 32-
+and a 160-token answer to the 302-token code prompt).
+
+> **Measured on:** a rented RTX 3090 24 GB, every expert of both sizes in VRAM, strata-poly alone, a 16K context,
+> q8_0 caches, 256 tokens written, two runs each, the build before (inkling2-final 6e61054, whose windows were not
+> recorded) and this one in turn. "Code": setup's 302- and 1,500-token code prompts; "prose": a 302-token prose
+> prompt. Guesses right: this build's `--window 4`.
+
+| | `--window 1` | `--window 4`, the build before | `--window 4` | `--window 8` | Guesses right |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| IQ4_NL, code, 302 | 70.8-70.9 tokens/s | 67.2-67.9 | 72.8 (+8%) | 71.5-71.7 | 31 of 50 |
+| IQ4_NL, code, 1,500 | 69.8-69.9 | 68.7-69.3 | 73.3 (+6%) | 71.7-71.8 | 54 of 93 |
+| IQ4_NL, prose, 302 | 70.7-70.8 | 65.0-65.1 | 69.9-70.0 (+8%) | 69.9-70.0 | 4 of 9 |
+| UD-Q2_K_XL, code, 302 | 84.1 | 81.4-82.2 | 89.4-89.5 (+9%) | 88.3-88.7 | 50 of 95 |
+| UD-Q2_K_XL, code, 1,500 | 82.8 | 85.6-86.1 | 93.8-93.9 (+9%) | 91.8-92.5 | 70 of 114 |
+| UD-Q2_K_XL, prose, 302 | 83.8-84.0 | 111.9-112.3 | 120.8-121.3 (+8%) | 127.8-128.2 | 123 of 128 |
+
+There `--window 4` and `--window 8` wrote the same 256 tokens as `--window 1`, with the same five likeliest tokens at
+every step, and the same with `--no-graphs` (`STRATA_FREEZE_EXPERTS=1`, both sizes, the three prompts). A window of 5
+to 8 tokens has its experts routed on the card now, as a shorter one's are: the build before routed it on the host,
+whose weights differ in their last bits, and its `--window 8` answers to the code prompts parted from its own
+`--window 1` ones (from token 24 to 62), so its `--window 8` speeds there are of other text with other guesses
+(UD-Q2_K_XL, code, 1,500: 140 of 180 right, 108.2-108.3 tokens/s) and not in the table. On the prose prompt, where
+both builds wrote the same text, `--window 8` went from 65.0-65.3 to 69.9-70.0 tokens/s (IQ4_NL) and from
+111.8-111.9 to 127.8-128.2 (UD-Q2_K_XL, +14%). With the conversation's guesses alone `--window 8` gains no more than
+`--window 4` on code.
 
 With every expert on the CPU (`--no-gpu-experts`), `--window 4` wrote the same 200 tokens as `--window 1`, with the
 same five likeliest tokens and their probabilities at every step: IQ4_NL and UD-Q2_K_XL, three prompts each, greedy
