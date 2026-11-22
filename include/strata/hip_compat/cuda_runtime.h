@@ -58,6 +58,7 @@
 #define cudaGetDeviceProperties hipGetDeviceProperties
 #define cudaGetErrorString hipGetErrorString
 #define cudaGetLastError hipGetLastError
+#define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
 #define cudaGraphDestroy hipGraphDestroy
 #define cudaGraphExecDestroy hipGraphExecDestroy
 #define cudaGraphExec_t hipGraphExec_t
