@@ -280,7 +280,7 @@ public:
     bool read(const int32_t* tokens, int n, const Mark* marks = nullptr, int n_marks = 0,
               const std::function<bool(int, int)>* turn = nullptr);
     /// The prompt's reads are done: the expert cache takes back what Options::stage_read_mib lent the staging
-    /// buffer.  window() and step() do it too, if the caller has not.
+    /// buffer, and what it lent for the reads' rows.  window() and step() do it too, if the caller has not.
     void end_read() {
         if (stage_lent_) narrow_stage();
     }
@@ -698,7 +698,7 @@ protected:
     void shrink_cache(size_t bytes);
     int grow_cache(size_t bytes, bool later = false);
     void fill_now();
-    void widen_stage();
+    float* widen_stage(int calls, size_t call_bytes);
     void narrow_stage();
     void resize_card_cache(int mib);   ///< resize_cache() and mind_vram() for this engine's card
     bool mind_card_vram();
@@ -1001,7 +1001,9 @@ protected:
     size_t stage_bytes_ = 0, chunk_bytes_ = 0;
     Mapped stage_map_;                            ///< stage_'s VRAM when it can grow for a read (stage_read_mib)
     size_t stage_narrow_ = 0, stage_wide_ = 0;    ///< stage_bytes_ outside a read and inside one
-    bool stage_lent_ = false;                     ///< the expert cache has lent the buffer VRAM (widen_stage())
+    bool stage_lent_ = false;                     ///< the expert cache has lent the read VRAM (widen_stage())
+    Mapped rows_map_;                             ///< a read's rows when the cache lends it them (widen_stage())
+    bool lend_rows_ = false;                      ///< whether it can
     size_t stage_cut_ = 0;                        ///< what the cache gave up for it, which it takes back
     int stage_turn_ = 0;
     std::vector<int32_t> ids_, count_, first_, group_, round_, round_row_;

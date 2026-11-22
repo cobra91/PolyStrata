@@ -704,6 +704,7 @@ Engine::~Engine() {
     }
     vmm_free(arena_);
     vmm_free(stage_map_);
+    vmm_free(rows_map_);
     for (unsigned long long h : vpool_) cuMemRelease(h);   // the pool goes back to the card with the engine
     vpool_.clear();
     for (void* p : host_allocs_) cudaFreeHost(p);
@@ -2383,40 +2384,64 @@ bool Engine::mind_card_vram() {
 // three rounds a call.  For the read the buffer grows to stage_wide_, which holds the layer, with VRAM the
 // expert cache gives up (its least used experts) when the card has not that much free; narrow_stage() gives it
 // back.  VRAM the card does not give leaves the buffer as it was.
-void Engine::widen_stage() {
-    if (stage_lent_ || stage_wide_ <= stage_narrow_) return;
-    if (up_) ck(cudaStreamSynchronize(cs(up_)), "the expert staging buffer");
-    ck(cudaStreamSynchronize(cs(st_)), "the expert staging buffer");
-    const size_t want = up_to(stage_wide_ + 256 + kTail, pool_on_ ? pg_ : grain_) - stage_map_.mapped;
-    size_t free_b = 0, total_b = 0;
-    ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
-    if (pool_on_) free_b = vpool_bytes();   // what the card has is the pool's
-    const size_t quarter = pool_on_ ? 0 : (size_t(std::max(reserve_mib_, 0)) << 20) / 4;
-    stage_cut_ = 0;
-    if (exp_ && free_b < want + quarter) {
-        const size_t had = arena_.mapped;
-        shrink_cache(want + quarter - free_b);
-        held_is_budget();
-        stage_cut_ = had - arena_.mapped;
+//
+// A read of more calls than r_ holds keeps their rows in pinned memory, and each call's go to the card and back at
+// every layer: 25 GB each way for 8,192 tokens of Inkling 2 Mini, a third of the bus's time.  VRAM for `calls`
+// calls' rows, `call_bytes` each, comes from the cache the same way and stays until narrow_stage(); returns it, or
+// nullptr where the rows stay in pinned memory.
+float* Engine::widen_stage(int calls, size_t call_bytes) {
+    const size_t rows_bytes = (size_t) calls * call_bytes;
+    const bool stage = !stage_lent_ && stage_wide_ > stage_narrow_;
+    const size_t g = pool_on_ ? pg_ : grain_;
+    const bool rows = lend_rows_ && rows_bytes > rows_map_.mapped &&
+                      (!rows_map_.base || up_to(rows_bytes, g) <= rows_map_.reserved);
+    if (stage || rows) {
+        if (up_) ck(cudaStreamSynchronize(cs(up_)), "the expert staging buffer");
+        ck(cudaStreamSynchronize(cs(st_)), "the expert staging buffer");
+        if (rows && !rows_map_.base)   // the largest read's, without its marks
+            vmm_reserve(rows_map_, (size_t) std::max(calls, read_rows_ / rows_) * call_bytes);
+        size_t want = stage ? up_to(stage_wide_ + 256 + kTail, g) - stage_map_.mapped : 0;
+        if (rows) want += up_to(rows_bytes, g) - rows_map_.mapped;
+        size_t free_b = 0, total_b = 0;
+        ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+        if (pool_on_) free_b = vpool_bytes();   // what the card has is the pool's
+        const size_t quarter = pool_on_ ? 0 : (size_t(std::max(reserve_mib_, 0)) << 20) / 4;
+        if (!stage_lent_) stage_cut_ = 0;
+        if (exp_ && free_b < want + quarter) {
+            const size_t had = arena_.mapped;
+            shrink_cache(want + quarter - free_b);
+            held_is_budget();
+            stage_cut_ += had - arena_.mapped;
+        }
+        stage_lent_ = true;   // narrow_stage() gives back what was cut even if a map below fails
+        if (stage) {
+            try {
+                vmm_map(stage_map_, stage_wide_ + 256 + kTail, SIZE_MAX, "the expert staging buffer");
+                stage_bytes_ = stage_wide_;
+                staged_il_ = -1;
+            } catch (const std::runtime_error&) {
+                vmm_unmap(stage_map_, stage_narrow_ + 256 + kTail);
+            }
+        }
+        if (rows) {
+            try {
+                vmm_map(rows_map_, rows_bytes, SIZE_MAX, "a read's rows");
+            } catch (const std::runtime_error&) {
+                vmm_unmap(rows_map_, 0);
+            }
+        }
     }
-    stage_lent_ = true;   // narrow_stage() gives back what was cut even if the map below fails
-    try {
-        vmm_map(stage_map_, stage_wide_ + 256 + kTail, SIZE_MAX, "the expert staging buffer");
-    } catch (const std::runtime_error&) {
-        narrow_stage();
-        return;
-    }
-    stage_bytes_ = stage_wide_;
-    staged_il_ = -1;
+    return rows_bytes > 0 && rows_map_.mapped >= rows_bytes ? (float*) rows_map_.base : nullptr;
 }
 
-// The read is done: the staging buffer goes back to stage_narrow_, and the expert cache takes back what it gave
-// up for it, the most used experts it lacks.
+// The read is done: the staging buffer goes back to stage_narrow_, the rows' VRAM goes, and the expert cache takes
+// back what it gave up for them, the most used experts it lacks.
 void Engine::narrow_stage() {
     if (!stage_lent_) return;
     if (up_) ck(cudaStreamSynchronize(cs(up_)), "the expert staging buffer");
     ck(cudaStreamSynchronize(cs(st_)), "the expert staging buffer");
     vmm_unmap(stage_map_, stage_narrow_ + 256 + kTail);
+    vmm_unmap(rows_map_, 0);
     stage_bytes_ = stage_narrow_;
     staged_il_ = -1;
     stage_lent_ = false;
@@ -3487,6 +3512,7 @@ void Engine::alloc() {
 #else
         const bool lend = widens;
 #endif
+        lend_rows_ = lend;
         const int stage_mib = opt_.stage_mib > 0 ? opt_.stage_mib : lend ? 128 : 2048;
         const int read_mib = opt_.stage_read_mib >= 0 ? opt_.stage_read_mib : opt_.stage_mib > 0 || !lend ? 0 : 2048;
         stage_bytes_ = std::max(std::min((size_t) stage_mib << 20, (size_t) n_expert_ * one_expert), one_expert);
@@ -5965,19 +5991,20 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
         behind.wait();
         return true;
     }
-    widen_stage();
+    const size_t e_row = (size_t) n_embd_, r_row = (size_t) streams() * e_row, r_bytes = r_row * sizeof(float);
+    const size_t part = (size_t) std::max(streams(), draft_ ? 3 : 1) * rows_ * e_row;   // a call's rows of r_
+    // r_ holds two calls' rows; more stay on the card when it lends them the VRAM, else in pinned memory
+    float* const lent = n_calls > 2 ? widen_stage(n_calls, part * sizeof(float)) : widen_stage(0, 0);
     turn = share_to(hi_);
     if (pos_ + n > opt_.max_context)
         throw std::runtime_error("the context is full (" + std::to_string(opt_.max_context) + " tokens)");
 
     ck(cudaStreamSynchronize(cs(st_)), "read");
     if (n_swap_ > 0) follow(0);
-    const size_t e_row = (size_t) n_embd_, r_row = (size_t) streams() * e_row, r_bytes = r_row * sizeof(float);
-    const size_t part = (size_t) std::max(streams(), draft_ ? 3 : 1) * rows_ * e_row;   // a call's rows of r_
     const float scale = embed_scale();
     float* const r0 = r_;
     const int64_t pos0 = pos_;
-    const bool host = n_calls > 2;
+    const bool host = n_calls > 2 && !lent;
     if (host && h_res_rows_ < n) {   // for this read's tokens and some more, so that a longer one seldom asks again
         hfree(h_res_);
         h_res_ = nullptr;
@@ -5985,7 +6012,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
         h_res_ = (float*) hmalloc((size_t) h_res_rows_ * r_bytes, "pinned memory");
     }
     const auto home = [&](int c) { return h_res_ + (size_t) calls_[(size_t) c].at * r_row; };
-    const auto half = [&](int c) { return r0 + (size_t) (host ? c % 2 : c) * part; };
+    const auto half = [&](int c) { return (lent ? lent : r0) + (size_t) (host ? c % 2 : c) * part; };
     // call c's rows back into its half of r_, behind whatever the stream has there of the half's last call
     const auto fetch = [&](int c) {
         ck(cudaMemcpyAsync(half(c), home(c), (size_t) calls_[(size_t) c].m * r_bytes, cudaMemcpyHostToDevice,
