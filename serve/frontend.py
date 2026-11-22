@@ -1892,6 +1892,31 @@ def inkling_call_end(text: str) -> int:
     return -1
 
 
+def inkling_json_end(text: str) -> int:
+    """Where the JSON object `text` starts with closes (the index past its last brace), or -1: not JSON, or not closed
+    yet.  Braces and brackets inside strings are the strings'."""
+    if not text.lstrip().startswith("{"):
+        return -1
+    depth, in_str, esc = 0, False, False
+    for k, c in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c in "{[":
+            depth += 1
+        elif c in "}]":
+            depth -= 1
+            if depth == 0:
+                return k + 1
+    return -1
+
+
 def parse_inkling_tool_call(name: str, body: str) -> ToolCall | None:
     """A call block's body, `{"name":NAME,"args":{...}}`, -> its call; None when it is not one.  The name is the
     header's (llama.cpp's grammar makes the two the same).  A body with no "args" is the arguments alone, less the
@@ -2018,6 +2043,15 @@ class InklingParser:
                 self._emit(out, kind, self.buf[:i])
                 self.buf, self.mode = self.buf[i + len(INK_END):], "between"
             else:                                       # call
+                if INK_HEADER in self.buf:
+                    # whole JSON and then the next block's header, with no <|end_message|> between: the call ends there
+                    e = inkling_json_end(self.buf)
+                    if e >= 0 and self.buf[e:].lstrip().startswith(INK_HEADER):
+                        body, self.buf = self.buf[:e], self.buf[e:].lstrip()
+                        self.seen = 0
+                        out += self._finish_call(body)
+                        self.mode = "between"
+                        continue
                 # a long call is searched only where text came since the last look, until an <|end_message|> came
                 i = inkling_call_end(self.buf) if self.buf.find(INK_END, self.seen) >= 0 else -1
                 if i < 0:

@@ -286,6 +286,15 @@ class Blocks(unittest.TestCase):
         self.assertFalse([e for e in evs if e.kind.startswith("tool_")])
         self.assertIn('"args":{"ci', joined(evs, "content"))
 
+    def test_a_call_whose_end_tag_did_not_come_before_the_next_block(self):
+        # the JSON is whole and the next block's header follows it: the call ends there, the block after it is read
+        for step in (1, 4, 1000):
+            with self.subTest(step=step):
+                evs = events(f"{H}now{JSON_}" '{"name":"now","args":{}}' f"{H}{TEXT}Done.{END}", step, self.TOOLS)
+                self.assertEqual([(e.call.name, e.call.arguments) for e in evs if e.kind == "tool_call"],
+                                 [("now", {})])
+                self.assertEqual(joined(evs, "content"), "Done.")
+
     def test_stray_markers_are_not_shown(self):
         evs = events(f"{H}{TEXT}Hi{END}<|content_model_end_sampling|>", 1)
         self.assertEqual(joined(evs, "content"), "Hi")
