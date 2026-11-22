@@ -879,8 +879,9 @@ FAMILIES = {
     # download, less VRAM, faster (256 rows: 2.1 s against 3.3 s on 6 CPU threads, 63 against 131 ms on the GPU), and
     # the engine's prompt logits with either one's rows were as close to llama.cpp's (cosine 0.99989 or more, the same
     # greedy tokens, 2 pictures).
-    # Offered on NVIDIA cards only ("cuda_only"): the engine builds and runs it on AMD cards with HIP too (an RX 9070 XT
-    # with ROCm 7.2.4, an RX 9060 XT), but its prompt speed there is not tuned yet, so setup does not offer it there.
+    # Offered on NVIDIA cards only ("cuda_only"; "cuda_only_why" is the reason setup gives): the engine builds and runs
+    # it on AMD cards with HIP too (an RX 9070 XT with ROCm 7.2.4, an RX 9060 XT), but its prompt speed there is not
+    # tuned yet, so setup does not offer it there.
     # It was not built or run on Windows (docs/models/inkling.md, "What you need").  Several cards split its
     # layers as the other families' (the loop's twelve on one card); "parallel" (--batch) as for them too; its attention
     # caches are fp16 or q8_0 (POLY_KV).  Measured on an RTX 2070 Super 8 GB with 62 GB of RAM (IQ4_NL): about 3.1 GiB
@@ -906,6 +907,7 @@ FAMILIES = {
                 "vision_llama": INKLING_VISION_LLAMA_CPP_COMMIT, "mmproj_hf": hf("ggml-org/Inkling-2-Mini-GGUF"),
                 "mmproj": "mmproj-Inkling-2-Mini-Q8_0.gguf", "vision_gb": 0.35, "vision_vram_gb": 0.6,
                 "experimental": True, "windows": False, "cuda_only": True, "ran_on_gb": 8, "row_bytes": 32768,
+                "cuda_only_why": "its prompt speed on AMD cards is not tuned yet",
                 "laptop_tps": {32768: "28"},
                 "windows_risk": "Inkling 2 Mini has not been built or run on Windows",
                 "sampling": {"temperature": 1.0, "top_k": 50, "top_p": 1.0},
@@ -8581,7 +8583,8 @@ def main() -> int:
         return install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted)
     fam = FAMILIES[family]
     if fam.get("cuda_only") and hip:
-        fail(f"setup offers {fam['title']} on NVIDIA cards only for now: its AMD speed is not tuned yet",
+        why = fam.get("cuda_only_why")
+        fail(f"setup offers {fam['title']} on NVIDIA cards only for now" + (f": {why}" if why else ""),
              "use an NVIDIA card, or choose another model")
     if fam.get("ready") and hip:
         # not a risk the user could take: the HIP engine has no NVFP4 expert kernels at all, so it would not start
