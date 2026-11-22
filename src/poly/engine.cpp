@@ -823,11 +823,16 @@ static size_t vmm_piece(size_t reserved, size_t first, size_t bytes, size_t piec
 }
 #endif
 
-void Engine::vmm_reserve(Mapped& m, size_t bytes) {
+void Engine::vmm_reserve(Mapped& m, size_t bytes, size_t piece) {
     CUdeviceptr p = 0;
 #ifdef STRATA_VMM_EQUAL_PIECES
-    m.reserved = up_to(std::max<size_t>(bytes, 1), pool_on_ ? pg_ : vmm_unit(grain_));
+    // without the pool, a whole number of the pieces vmm_map() will be asked for (vmm_piece() takes the most units
+    // that divide the reservation: of another size it could leave every piece one unit, a descriptor each on ROCm)
+    const size_t unit = pool_on_ ? pg_ : vmm_unit(grain_);
+    bytes = std::max<size_t>(bytes, 1);
+    m.reserved = up_to(bytes, pool_on_ ? unit : up_to(std::min(piece, up_to(bytes, unit)), unit));
 #else
+    (void) piece;
     m.reserved = up_to(std::max<size_t>(bytes, 1), pool_on_ ? pg_ : grain_);   // a whole number of pool handles
 #endif
     cu_ck(cuMemAddressReserve(&p, m.reserved, 0, 0, 0), "reserving addresses for VRAM");
@@ -1256,7 +1261,7 @@ void* Engine::kv_alloc(size_t bytes, int per) {
         Kv k;
         k.bytes = bytes;
         k.per = per;
-        vmm_reserve(k, all);
+        vmm_reserve(k, all, (size_t) ((kKvGrow + per - 1) / per) * bytes);   // cover()'s pieces
         kv_.push_back(std::move(k));
         p = (void*) kv_.back().base;
     }

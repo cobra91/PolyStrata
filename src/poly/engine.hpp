@@ -685,7 +685,7 @@ protected:
         size_t bytes = 0;   ///< for every `per` rows
         int per = 1;
     };
-    void vmm_reserve(Mapped& m, size_t bytes);
+    void vmm_reserve(Mapped& m, size_t bytes, size_t piece = SIZE_MAX);
     void vmm_map(Mapped& m, size_t bytes, size_t piece, const char* what);
     void vmm_unmap(Mapped& m, size_t bytes);
     void vmm_settle();
