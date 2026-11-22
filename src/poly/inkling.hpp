@@ -51,11 +51,15 @@ protected:
     /// kernels by value, so a step is not recorded: with --batch Inkling sets no Layer::fixed, and step() records
     /// only those.
     bool batch_heads() const override { return true; }
-    /// A token's launches that take the position read it from at_ when recorded (attn()); a full visit's attention
-    /// is recorded once for each room() it is sized for, a window visit's for the context.
+    /// A call's launches that take the position read its first one from at_ when recorded (attn()), a token's and a
+    /// window's alike; a full visit's attention is recorded once for each room() it is sized for, a window visit's
+    /// for the context.
     int head_key(int il, int n) const override;
-    /// A token's visits are recorded only as one, when its routed experts are all on the card (Engine::run()).
+    /// A call's visits are recorded only as one, when its routed experts are all on the card (Engine::run()).
     bool layer_graphs() const override { return false; }
+    /// A window of guesses is routed on the card (Engine::moe_card()) with every expert in VRAM, so that it is
+    /// recorded as one too: --window 5 to 8 have more rows than kSumRows.
+    bool windows_on_card() const override { return true; }
     int widest() const override { return std::max(n_head_ * head_dim_, 2 * n_embd_); }
     int streams() const override { return kStreams; }
     void layer_head(Layer& L, int il, int n) override;

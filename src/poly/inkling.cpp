@@ -255,10 +255,10 @@ void Inkling::load_layer(int v) {
     }
     B.phys = p;
     B.pass = 0;
-    // a token alone is recorded (Engine::run()); a window's tokens, pictures and step()'s rows take the kernels'
-    // positions by value.  step() replays a fixed layer's head without asking layer_graphs(), and its recordings are
-    // keyed by row, not position: fixed must stay off with --batch.
-    L.fixed = opt_.window == 1 && opt_.batch == 0;
+    // a token alone and a window's tokens are recorded (Engine::run()), a recording for each number of tokens;
+    // pictures and step()'s rows take the kernels' positions by value.  step() replays a fixed layer's head without
+    // asking layer_graphs(), and its recordings are keyed by row, not position: fixed must stay off with --batch.
+    L.fixed = opt_.batch == 0;
     B.swa = of_layer(*meta_in(*gg_, "attention.sliding_window_pattern"), p) != 0;
     B.wq = mat("attn_q.weight", E, hq);
     B.wk = mat("attn_k.weight", E, hk);
