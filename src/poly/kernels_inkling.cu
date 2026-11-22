@@ -648,7 +648,11 @@ __global__ void __launch_bounds__(AT_THREADS) attn_wmma_kernel(AttnArgs a) {
     }
 #else
     (void) a;
+#if defined(__HIPCC__)
     __builtin_trap();
+#else
+    __trap();
+#endif
 #endif
 }
 
