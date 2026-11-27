@@ -2209,6 +2209,58 @@ def together_ok(found) -> list:
     return ok_ if len(ok_) >= 2 else []
 
 
+ASYMMETRIC_PEER_ENV = {
+    "STRATA_PEER_DIRECT_SIGNAL": "1",
+    "STRATA_PEER_AUTONOMOUS": "1",
+    "STRATA_PEER_HOT": "0.0",
+    "STRATA_ADAPT_OVERLAP": "1",
+    "STRATA_ADAPT_SIGNAL": "copy",
+}
+
+
+def asymmetric_dual_gpu_info(primary: dict, peer: dict, primary_link: dict | None = None,
+                             peer_link: dict | None = None) -> dict:
+    """Detect whether a 2-GPU CUDA pair is asymmetric (compute capability, VRAM, or PCIe link) and identify the
+    stronger primary card plus the opt-in --peer-device environment stack."""
+    def _rate(link: dict | None) -> float:
+        if not link:
+            return 0.0
+        return float(PCIE_GBPS.get(link.get("gen", 0), 0.0)) * float(link.get("width", 0) or 0)
+
+    def _strength_key(g: dict, rate: float) -> tuple:
+        return (-int(g.get("arch", 0)), -round(float(g.get("vram_gb", 0.0))), -rate, int(g.get("index", 0)))
+
+    p_arch, s_arch = int(primary.get("arch", 0)), int(peer.get("arch", 0))
+    p_vram, s_vram = float(primary.get("vram_gb", 0.0)), float(peer.get("vram_gb", 0.0))
+    p_rate, s_rate = _rate(primary_link), _rate(peer_link)
+
+    reasons = []
+    if p_arch != s_arch:
+        reasons.append(f"compute capability sm_{p_arch} vs sm_{s_arch}")
+    if abs(p_vram - s_vram) > 2.0:
+        reasons.append(f"VRAM {p_vram:.0f} GB vs {s_vram:.0f} GB")
+    if p_rate > 0 and s_rate > 0 and max(p_rate, s_rate) >= 2.0 * min(p_rate, s_rate):
+        reasons.append(
+            f"PCIe {primary_link['gen']}.0 x{primary_link['width']} (~{p_rate:.0f} GB/s) vs "
+            f"{peer_link['gen']}.0 x{peer_link['width']} (~{s_rate:.0f} GB/s)"
+        )
+
+    stronger = min([(primary, p_rate), (peer, s_rate)], key=lambda item: _strength_key(item[0], item[1]))[0]
+    return {
+        "is_asymmetric": bool(reasons),
+        "reasons": reasons,
+        "stronger_index": stronger.get("index", 0),
+        "recommended_env": dict(ASYMMETRIC_PEER_ENV) if reasons else {},
+        "optional_notes": (
+            [
+                "optional decode boost (CUDA): STRATA_ROUTE_TAIL_SKIP=7",
+                "on 32 GB RAM hosts with host-spill / page-locking: pass --ram-keep-gib 8",
+            ]
+            if reasons else []
+        ),
+    }
+
+
 def split_short(cards) -> list:
     """#448: the later cards of a split that would cap its prompt chunk below what the first card alone reads (a card
     under SPLIT_PROMPT_VRAM_GB beside one that has it).  Empty: the split is recommended as before."""
@@ -9864,10 +9916,28 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     if fam.get("license"):
         say(f"  Its license: {fam['license']}")
     peer_gpu = None
+    peer_asym = None
     if multi and len(multi) == 2 and not hip:        # the second-card expert tier (--peer-device): CUDA, two cards only so far
         peer_gpu = next(i for i in multi if i != gpu.get("index", 0))
+        peer_card = gpu_info(peer_gpu)
+        p_link = None if gpu.get("uma") else pcie_link(int(gpu.get("index", 0)))
+        s_link = None if peer_card.get("uma") else pcie_link(int(peer_gpu))
+        peer_asym = asymmetric_dual_gpu_info(gpu, peer_card, p_link, s_link)
+        if peer_asym["is_asymmetric"] and peer_asym["stronger_index"] == peer_gpu:
+            if not getattr(a, "_roles_explicit", False) and not a.gpus:
+                gpu, peer_gpu = {**peer_card, "archs": gpu.get("archs", [])}, gpu.get("index", 0)
+                ok(f"asymmetric dual-GPU: placing stronger GPU {gpu['index']} ({gpu['name']}) as primary")
+            else:
+                warn(f"asymmetric dual-GPU: GPU {peer_gpu} ({peer_card['name']}) is stronger than GPU "
+                     f"{gpu.get('index', 0)} ({gpu['name']}) and is recommended as primary")
         ok(f"{fam['title']}: GPU {gpu.get('index', 0)} ({gpu_name(gpu)}) main, GPU {peer_gpu} as a second-card expert "
            "tier (--peer-device)")
+        if peer_asym["is_asymmetric"]:
+            say(f"  Asymmetric dual-GPU pair detected ({'; '.join(peer_asym['reasons'])}).")
+            say("  Recommended opt-in --peer-device env (--peer-asymmetric-tune): "
+                + ", ".join(f"{k}={v}" for k, v in peer_asym["recommended_env"].items()))
+            for note in peer_asym["optional_notes"]:
+                say(f"  Note: {note}")
     elif multi:
         warn(f"{fam['title']} runs on one GPU, or two together with --peer-device (not {len(multi)}): using GPU "
              f"{gpu.get('index', 0)} ({gpu_name(gpu)}) only")
@@ -10028,6 +10098,14 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     if peer_gpu is not None:
         cfg["gpu"] = [gpu.get("index", 0), peer_gpu]    # both cards visible (CUDA_VISIBLE_DEVICES), the main card first: --peer-device 1 is the second
         cfg["gpus_asked"] = True
+        if peer_asym and peer_asym["is_asymmetric"]:
+            apply_asym = bool(getattr(a, "peer_asymmetric_tune", False))
+            if not apply_asym and not a.yes:
+                apply_asym = ask("Apply recommended asymmetric dual-GPU env to config?", ["y", "n"], "n", False) == "y"
+            if apply_asym:
+                cfg["env"] = {**(cfg.get("env") or {}), **peer_asym["recommended_env"]}
+                ok("asymmetric dual-GPU env written to config: "
+                   + ", ".join(f"{k}={v}" for k, v in peer_asym["recommended_env"].items()))
     elif gpu.get("count", 1) > 1 or a.gpu is not None:
         cfg["gpu"] = gpu["index"]
         cfg["gpus_asked"] = True
@@ -11628,6 +11706,10 @@ def main() -> int:
     ap.add_argument("--peer-reserve-mib", type=int, metavar="N",
                     help="Qwen3.6-35B-A3B on two GPUs (--gpus): VRAM in MiB the second-card expert tier (--peer-device) "
                          "leaves free there (the engine's default: 600)")
+    ap.add_argument("--peer-asymmetric-tune", action="store_true", default=False,
+                    help="two asymmetric GPUs (--peer-device): write the recommended asymmetric env profile "
+                         "(STRATA_PEER_DIRECT_SIGNAL=1, STRATA_PEER_AUTONOMOUS=1, STRATA_PEER_HOT=0.0, "
+                         "STRATA_ADAPT_OVERLAP=1, STRATA_ADAPT_SIGNAL=copy) into the run config (opt-in)")
     ap.add_argument("--mtp", choices=["on", "off"],
                     help="the draft layer (MTP): off starts the model without it, which frees about 1 GB of graphics memory "
                          "for the expert cache and takes less RAM, at the price of speed; it is kept in the run config "
